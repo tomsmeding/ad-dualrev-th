@@ -1,0 +1,29 @@
+cabal-version: 1.12
+name:          dualrev
+version:       0.1.0.0
+description:   Implementation of dual-numbers reverse AD for Haskell
+homepage:      https://github.com/tomsmeding/dualrev#readme
+bug-reports:   https://github.com/tomsmeding/dualrev/issues
+author:        Tom Smeding, Matthijs Vákár
+maintainer:    Tom Smeding <tom@tomsmeding.com>
+copyright:     2022 Tom Smeding, Matthijs Vákár
+license:       MIT
+build-type:    Simple
+extra-source-files:
+    README.md
+
+source-repository head
+  type: git
+  location: https://github.com/tomsmeding/dualrev
+
+library
+  exposed-modules:
+      Language.Haskell.ReverseAD
+  hs-source-dirs:
+      src
+  ghc-options: -Wall
+  build-depends:
+      base >=4.7 && <4.17
+    , containers
+    , template-haskell
+  default-language: Haskell2010
