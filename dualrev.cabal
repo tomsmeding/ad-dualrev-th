@@ -10,7 +10,7 @@ copyright:     2022 Tom Smeding, Matthijs Vákár
 license:       MIT
 build-type:    Simple
 extra-source-files:
-    README.md
+  README.md
 
 source-repository head
   type: git
@@ -18,12 +18,14 @@ source-repository head
 
 library
   exposed-modules:
-      Language.Haskell.ReverseAD
+    Data.Array.Growable
+    Language.Haskell.ReverseAD
   hs-source-dirs:
-      src
+    src
   ghc-options: -Wall
   build-depends:
       base >=4.7 && <4.17
     , containers
+    , linear-base
     , template-haskell
   default-language: Haskell2010

@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
@@ -17,6 +18,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word
 import Language.Haskell.TH
+
+import qualified Data.Array.Growable as GA
 
 
 data Structure = SDiscrete | SScalar | STuple [Structure]
@@ -62,7 +65,7 @@ reverseAD (examineCode -> inputCode) =
 transform :: Structure -> Structure -> Exp -> Q Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
   argvar <- newName "arg"
-  (idnum, inp) <- numberInput inpStruc (VarE argvar) 1
+  (inp, idnum) <- numberInput inpStruc (VarE argvar) 1
   idvar <- newName "i0"
   expr' <- ddr idvar expr
   let todo = "TODO: need to deinterleave the output and apply ResolveStaged still"
@@ -126,6 +129,17 @@ instance DiffNum Float where
   applyNum2 Mul = binaryPrimOp (*) (\x y -> (y, x))
   applyNum1 Negate = unaryPrimOp negate (\_ -> -1.0)
 
+data Scalars f = ScalarsD (f Double) | ScalarsF (f Float)
+deriving instance (Show (f Double), Show (f Float)) => Show (Scalars f)
+
+newtype ContribVec a = ContribVec [(Int, a)]
+
+data State = State { stNextId :: Name       -- ^ :: Int
+                   , stAdjArr :: Name       -- ^ :: GrowArray Adjoint
+                   , stBackpropArr :: Name  -- ^ :: GrowArray Backpropagator
+                   }
+  deriving (Show)
+
 ddr :: Name -> Exp -> Q Exp
 ddr idName = \case
   VarE name -> return (TupE [Just (VarE name), Just (VarE idName)])
@@ -153,8 +167,13 @@ ddr idName = \case
     idName1 <- newName "i1"
     e2' <- ddr idName1 e2
     idName2 <- newName "i2"
+    x1name <- newName "x"
+    x2name <- newName "y"
     case fromBinaryOperatorName opname of
-      Just numop -> return $ foldl AppE (VarE 'applyNum2) [VarE numop, e1', e2', VarE idName2]
+      Just numop -> return $
+        LetE [ValD (TupP [VarP x1name, VarP idName1]) (NormalB e1') []
+             ,ValD (TupP [VarP x2name, VarP idName2]) (NormalB e2') []]
+          (foldl AppE (VarE 'applyNum2) [ConE numop, VarE x1name, VarE x2name, VarE idName2])
       Nothing -> fail ("Unsupported infix operator " ++ show opname)
 
   e@InfixE{} -> fail $ "Unsupported operator section: " ++ show e
@@ -361,23 +380,24 @@ fromBinaryOperatorName opname
   | opname == '(*) = Just 'Mul
   | otherwise      = Nothing
 
-numberInput :: Structure -> Exp -> Integer -> Q (Integer, Exp)
+numberInput :: Structure -> Exp -> Integer -> Q (Exp, Integer)
 numberInput struc input nextid = case struc of
-  SDiscrete -> return (nextid, input)
+  SDiscrete -> return (input, nextid)
   SScalar -> return
-    (succ nextid
-    ,TupE [Just input
+    (TupE [Just input
           ,Just (ConE 'Contribs
+                 `AppE` LitE (IntegerL nextid)
                  `AppE` ListE [TupE [Just (LitE (RationalL 1.0))
-                                    ,Just (LitE (IntegerL nextid))]])])
+                                    ,Just (LitE (IntegerL nextid))]])]
+    ,succ nextid)
   STuple strucs -> do
-    names <- mapM (const (newName "x")) strucs
+    names <- mapM (const (newName "inp")) strucs
     (nextid', exps) <-
-      mapAccumLM (\nextid' (s, name) -> numberInput s (VarE name) nextid')
+      mapAccumLM (\nextid' (s, name) -> swap <$> numberInput s (VarE name) nextid')
                  nextid (zip strucs names)
-    return (nextid'
-           ,LetE [ValD (TupP (map VarP names)) (NormalB input) []]
-                 (TupE (map Just exps)))
+    return (LetE [ValD (TupP (map VarP names)) (NormalB input) []]
+                 (TupE (map Just exps))
+           ,nextid')
 
 mapAccumLM :: Monad m => (s -> a -> m (s, b)) -> s -> [a] -> m (s, [b])
 mapAccumLM = go id
@@ -389,3 +409,6 @@ mapAccumLM = go id
 
 zipWithM3 :: Applicative m => (a -> b -> c -> m d) -> [a] -> [b] -> [c] -> m [d]
 zipWithM3 f a b c = traverse (\(x,y,z) -> f x y z) (zip3 a b c)
+
+swap :: (a, b) -> (b, a)
+swap (a, b) = (b, a)
