@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LinearTypes #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -7,7 +8,9 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# OPTIONS -Wno-incomplete-uni-patterns #-}
 module Language.Haskell.ReverseAD where
 
 import Data.Foldable (toList)
@@ -18,8 +21,76 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word
 import Language.Haskell.TH
+import qualified Prelude.Linear as PL
+import Prelude.Linear (Ur(..), consume, lseq)
 
 import qualified Data.Array.Growable as GA
+import Data.Array.Growable (GrowArray)
+
+
+-- Dt[Double] = (Double, (Int, BuildState -o BuildState))
+-- Dt[()] = ()
+-- Dt[(a, b)] = (Dt[a], Dt[b])
+-- Dt[a -> b] = a -> Int -> (Dt[b], Int)
+-- Dt[Int] = Int
+--
+-- Dt[eps] = eps
+-- Dt[Γ, x : a] = Dt[Γ], x : Dt[a]
+--
+-- Γ |- t : a
+-- Γ |- i : Int
+-- ~> Dt[Γ] |- D[i, t] : (Dt[a], Int)
+-- D[i, r] = ((r, (i, PL.id)), i + 1)
+-- D[i, x] = (x, i)
+-- D[i, ()] = ((), i)
+-- D[i, (s, t)] = let (x, i1) = D[i, s]
+--                    (y, i2) = D[i1, t]
+--                in ((x, y), i2)
+-- D[i, s t] = let (f, i1) = D[i, s]
+--                 (a, i2) = D[i1, t]
+--             in f a i2
+-- D[i, \x -> t] = (\x i1 -> D[i1, t], i)
+-- D[i, let x = s in t] = let (x, i1) = D[i, s]
+--                        in D[i1, t]
+-- D[i, op t1..tn] =
+--   let ((x1, (di1, df1)), i1) = D[i, t1]
+--       ((x2, (di2, df2)), i2) = D[i1, t1]
+--       ...
+--       ((xn, (din, dfn)), in) = D[i{n-1}, tn]
+--   in ((op x1..xn
+--       ,(in, tapeStore in (Contrib [(di1, dop_1 x1..xn), ..., (din, dop_n x1..xn)])
+--             PL.. df1 PL.. ... PL.. dfn))
+--      ,in + 1)
+
+type BuildState = GrowArray Contrib
+newtype Contrib = Contrib [(Int, Double)]
+
+tapeStore :: Int -> Contrib -> BuildState %1-> BuildState
+tapeStore = GA.set
+
+type ResolveState = GrowArray Double
+
+resolve :: Double -> BuildState %1-> ResolveState
+resolve adj carr =
+  GA.size carr PL.& \(Ur n, carr1) ->
+  GA.allocBeside n 0 carr1 PL.& \(darr2, carr2) ->
+  GA.set (n - 1) adj darr2 PL.& \darr3 ->
+  loop (n - 1) (darr3, carr2) PL.& \(darr4, carr4) ->
+    consume carr4 `lseq` darr4
+  where
+    loop :: Int -> (ResolveState, BuildState) %1-> (ResolveState, BuildState)
+    loop 0 st = st
+    loop i (darr, carr') =
+      GA.get i carr' PL.& \(Ur cb, carr1) ->
+      GA.get i darr PL.& \(Ur a, darr1) ->
+        loop (i - 1) (apply cb a darr1, carr1)
+
+    apply :: Contrib -> Double -> ResolveState %1-> ResolveState
+    apply (Contrib []) _ darr = darr
+    apply (Contrib ((i, d) : cbs)) a darr =
+      GA.get i darr PL.& \(Ur acc, darr1) ->
+      GA.set i (acc + a * d) darr1 PL.& \darr2 ->
+        apply (Contrib cbs) a darr2
 
 
 data Structure = SDiscrete | SScalar | STuple [Structure]
@@ -64,6 +135,7 @@ reverseAD (examineCode -> inputCode) =
 
 transform :: Structure -> Structure -> Exp -> Q Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
+  let todo = "TODO: this whole transform function needs to be checked if it's still up to date with latest transformation"
   argvar <- newName "arg"
   (inp, idnum) <- numberInput inpStruc (VarE argvar) 1
   idvar <- newName "i0"
@@ -80,101 +152,33 @@ transform inpStruc outStruc (LamE (pat : pats) body) =
 transform _ _ expr =
   fail $ "Top-level expression in reverseAD must be lambda, but is: " ++ show expr
 
-data NumOp2 = Add | Sub | Mul
-  deriving (Show)
-
-data NumOp1 = Negate
-  deriving (Show)
-
-class DiffNum a where
-  type DiffNumDual a = r | r -> a
-  applyNum2 :: NumOp2 -> DiffNumDual a -> DiffNumDual a -> Int -> (DiffNumDual a, Int)
-  applyNum1 :: NumOp1 -> DiffNumDual a -> Int -> (DiffNumDual a, Int)
-
-instance DiffNum Int where
-  type DiffNumDual Int = Int
-  applyNum2 Add x y i = (x + y, i)
-  applyNum2 Sub x y i = (x - y, i)
-  applyNum2 Mul x y i = (x * y, i)
-  applyNum1 Negate x i = (negate x, i)
-
-binaryPrimOp :: (a -> a -> a)  -- ^ primal
-             -> (a -> a -> (a, a))  -- ^ gradient given primals
-             -> (a, Backpropagator a) -> (a, Backpropagator a) -> Int -> ((a, Backpropagator a), Int)
-binaryPrimOp fun dfun (x, d1) (y, d2) i = case (d1, d2) of
-  (Zero, Zero) -> ((fun x y, Zero), i)
-  (Contribs i1 _, Zero) -> ((fun x y, Contribs i [(fst (dfun x y), i1)]), succ i)
-  (Zero, Contribs i2 _) -> ((fun x y, Contribs i [(snd (dfun x y), i2)]), succ i)
-  (Contribs i1 _, Contribs i2 _) -> let (g1, g2) = dfun x y
-                                    in ((fun x y, Contribs i [(g1, i1), (g2, i2)]), succ i)
-
-unaryPrimOp :: (a -> a)  -- ^ primal
-            -> (a -> a)  -- ^ gradient given primal
-            -> (a, Backpropagator a) -> Int -> ((a, Backpropagator a), Int)
-unaryPrimOp fun dfun (x, d) i = case d of
-  Zero -> ((fun x, Zero), i)
-  Contribs j _ -> ((fun x, Contribs i [(dfun x, j)]), succ i)
-
-instance DiffNum Double where
-  type DiffNumDual Double = (Double, Backpropagator Double)
-  applyNum2 Add = binaryPrimOp (+) (\_ _ -> (1.0, 1.0))
-  applyNum2 Sub = binaryPrimOp (-) (\_ _ -> (1.0, -1.0))
-  applyNum2 Mul = binaryPrimOp (*) (\x y -> (y, x))
-  applyNum1 Negate = unaryPrimOp negate (\_ -> -1.0)
-
-instance DiffNum Float where
-  type DiffNumDual Float = (Float, Backpropagator Float)
-  applyNum2 Add = binaryPrimOp (+) (\_ _ -> (1.0, 1.0))
-  applyNum2 Sub = binaryPrimOp (-) (\_ _ -> (1.0, -1.0))
-  applyNum2 Mul = binaryPrimOp (*) (\x y -> (y, x))
-  applyNum1 Negate = unaryPrimOp negate (\_ -> -1.0)
-
-data Scalars f = ScalarsD (f Double) | ScalarsF (f Float)
-deriving instance (Show (f Double), Show (f Float)) => Show (Scalars f)
-
-newtype ContribVec a = ContribVec [(Int, a)]
-
-data State = State { stNextId :: Name       -- ^ :: Int
-                   , stAdjArr :: Name       -- ^ :: GrowArray Adjoint
-                   , stBackpropArr :: Name  -- ^ :: GrowArray Backpropagator
-                   }
-  deriving (Show)
-
 ddr :: Name -> Exp -> Q Exp
 ddr idName = \case
-  VarE name -> return (TupE [Just (VarE name), Just (VarE idName)])
+  VarE name -> return (pair (VarE name) (VarE idName))
 
   LitE lit -> case lit of
-    RationalL _ -> return (TupE [Just (TupE [Just (LitE lit), Just (ConE 'Zero)])
-                                ,Just (VarE idName)])
+    RationalL _ -> return (pair (pair (LitE lit) (AppE (ConE 'Contrib) (ListE [])))
+                                (InfixE (Just (VarE idName))
+                                        (VarE '(+))
+                                        (Just (LitE (IntegerL 1)))))
     FloatPrimL _ -> fail "float prim?"
     DoublePrimL _ -> fail "double prim?"
-    _ -> return (TupE [Just (LitE lit), Just (VarE idName)])
+    _ -> return (pair (LitE lit) (VarE idName))
 
   AppE e1 e2 -> do
-    e1' <- ddr idName e1
-    idName1 <- newName "i1"
-    e2' <- ddr idName1 e2
-    idName2 <- newName "i2"
-    funname <- newName "f"
-    argname <- newName "a"
-    return (LetE [ValD (TupP [VarP funname, VarP idName1]) (NormalB e1') []
-                 ,ValD (TupP [VarP argname, VarP idName2]) (NormalB e2') []]
-              (VarE funname `AppE` VarE argname `AppE` VarE idName2))
+    (letwrap, [funname, argname], outid) <- ddrList [e1, e2] idName
+    return (letwrap (VarE funname `AppE` VarE argname `AppE` VarE outid))
 
   InfixE (Just e1) (VarE opname) (Just e2) -> do
-    e1' <- ddr idName e1
-    idName1 <- newName "i1"
-    e2' <- ddr idName1 e2
-    idName2 <- newName "i2"
-    x1name <- newName "x"
-    x2name <- newName "y"
-    case fromBinaryOperatorName opname of
-      Just numop -> return $
-        LetE [ValD (TupP [VarP x1name, VarP idName1]) (NormalB e1') []
-             ,ValD (TupP [VarP x2name, VarP idName2]) (NormalB e2') []]
-          (foldl AppE (VarE 'applyNum2) [ConE numop, VarE x1name, VarE x2name, VarE idName2])
-      Nothing -> fail ("Unsupported infix operator " ++ show opname)
+    let scal = LitE . RationalL
+    gradientfun <- if
+      | opname == '(+) -> return $ \_ -> [scal 1.0, scal 1.0]
+      | opname == '(-) -> return $ \_ -> [scal 1.0, scal (-1.0)]
+      | opname == '(*) -> return $ \[e1', e2'] -> [e2', e1']
+      | otherwise -> fail ("Unsupported infix operator " ++ show opname)
+    ddrOp idName [e1, e2]
+      (\[e1', e2'] -> InfixE (Just e1') (VarE opname) (Just e2'))
+      gradientfun
 
   e@InfixE{} -> fail $ "Unsupported operator section: " ++ show e
 
@@ -183,13 +187,13 @@ ddr idName = \case
   LamE [pat] e -> do
     idName1 <- newName "i"
     e' <- ddr idName1 e
-    return (TupE [Just (LamE [pat, VarP idName1] e'), Just (VarE idName)])
+    return (pair (LamE [pat, VarP idName1] e') (VarE idName))
 
   TupE mes
     | Just es <- sequence mes -> do
         (letwrap, vars, outid) <- ddrList es idName
-        return (letwrap (TupE [Just (TupE (map (Just . VarE) vars))
-                              ,Just (VarE outid)]))
+        return (letwrap (pair (TupE (map (Just . VarE) vars))
+                              (VarE outid)))
     | otherwise -> notSupported "Tuple sections" (Just (show (TupE mes)))
 
   CondE e1 e2 e3 -> do
@@ -211,8 +215,8 @@ ddr idName = \case
 
   ListE es -> do
     (letwrap, vars, outid) <- ddrList es idName
-    return (letwrap (TupE [Just (ListE (map VarE vars))
-                          ,Just (VarE outid)]))
+    return (letwrap (pair (ListE (map VarE vars))
+                          (VarE outid)))
 
   UnboundVarE n -> fail $ "Free variable in reverseAD: " ++ show n
 
@@ -244,9 +248,12 @@ ddr idName = \case
   e@GetFieldE{} -> notSupported "Records" (Just (show e))
   e@ProjectionE{} -> notSupported "Records" (Just (show e))
 
+pair :: Exp -> Exp -> Exp
+pair e1 e2 = TupE [Just e1, Just e2]
+
 -- | Given list of expressions and the input ID, returns a let-wrapper that
--- defines a variable for each item in the list, the names of those variables,
--- and the output ID name (in scope in the let-wrapper).
+-- defines a variable for each item in the list (differentiated), the names of
+-- those variables, and the output ID name (in scope in the let-wrapper).
 ddrList :: [Exp] -> Name -> Q (Exp -> Exp, [Name], Name)
 ddrList es idName = do
   -- output varnames of the expressions
@@ -263,6 +270,32 @@ ddrList es idName = do
                | ((nx, ni), e) <- binds]
          ,map fst names
          ,out_index)
+
+-- Arguments:
+-- - input nextid
+-- - arguments to the operation
+-- - the operation itself (taking duplicable arguments)
+-- - list of partial derivatives of the operation, assuming incoming adjoint 1 (taking
+--   duplicable arguments)
+-- Returns: (Dt[Double], Int)
+ddrOp :: Name -> [Exp] -> ([Exp] -> Exp) -> ([Exp] -> [Exp]) -> Q Exp
+ddrOp idName args primal gradient = do
+  (letwrap, argnames, outid) <- ddrList args idName
+  let fste = AppE (VarE 'fst)
+      snde = AppE (VarE 'snd)
+      answer = primal (map (fste . VarE) argnames)
+      pderivs = gradient (map (fste . VarE) argnames)
+  let comp e1 e2 = VarE '(PL..) `AppE` e1 `AppE` e2
+      argupdaters = map (snde . snde . VarE) argnames
+      argcontribids = map (fste . snde . VarE) argnames
+      storecall = VarE 'tapeStore
+                    `AppE` VarE outid
+                    `AppE` AppE (ConE 'Contrib) (ListE (zipWith pair argcontribids pderivs))
+  return $ letwrap $
+    pair (pair answer
+               (pair (VarE outid)
+                     (foldr comp storecall argupdaters)))
+         (InfixE (Just (VarE outid)) (VarE '(+)) (Just (LitE (IntegerL 1))))
 
 -- | Differentiate a declaration, given a variable containing the next ID to
 -- generate. Modifies the declaration to bind the next ID to a new name, which
@@ -283,6 +316,47 @@ transDecs (d : ds) n = do
   (d', n') <- transDec d n
   (ds', n'') <- transDecs ds n'
   return (d' : ds', n'')
+
+-- | If these declarations occur in a let block, check that all dependencies go
+-- backwards, i.e. it would be valid to replace the let block with a chain of
+-- single-dec lets. If non-recursive, returns, for each variable defined: the
+-- name, the free variables of its right-hand side, and its right-hand side.
+checkDecsNonRecursive :: MonadFail m => [Dec] -> m (Maybe [(Name, Set Name, Exp)])
+checkDecsNonRecursive decs = do
+  let processDec :: MonadFail m => Dec -> m (Name, Set Name, Exp)
+      processDec = \case
+        ValD (VarP name) (NormalB e) [] -> (name,,e) <$> freeVars e
+        dec -> fail $ "Unsupported declaration in let: " ++ show dec
+  tups <- mapM processDec decs
+  -- TODO: mild quadratic behaviour with this notElem
+  let nonRecursive :: [Name] -> Set Name -> Bool
+      nonRecursive boundAfterThis frees = all (\name -> name `notElem` boundAfterThis) (toList frees)
+  if all (\((_, frees, _), boundAfterThis) -> nonRecursive boundAfterThis frees)
+         (zip tups (tail (tails (map fst3 tups))))
+    then return (Just tups)
+    else return Nothing
+
+numberInput :: Structure -> Exp -> Integer -> Q (Exp, Integer)
+numberInput struc input nextid = case struc of
+  SDiscrete -> return (input, nextid)
+  SScalar -> return
+    (TupE [Just input
+          ,Just (ConE 'Contribs
+                 `AppE` LitE (IntegerL nextid)
+                 `AppE` ListE [TupE [Just (LitE (RationalL 1.0))
+                                    ,Just (LitE (IntegerL nextid))]])]
+    ,succ nextid)
+  STuple strucs -> do
+    names <- mapM (const (newName "inp")) strucs
+    (nextid', exps) <-
+      mapAccumLM (\nextid' (s, name) -> swap <$> numberInput s (VarE name) nextid')
+                 nextid (zip strucs names)
+    return (LetE [ValD (TupP (map VarP names)) (NormalB input) []]
+                 (TupE (map Just exps))
+           ,nextid')
+
+fst3 :: (a, b, c) -> a
+fst3 (a, _, _) = a
 
 freeVars :: MonadFail m => Exp -> m (Set Name)
 freeVars = \case
@@ -326,27 +400,6 @@ freeVars = \case
   e@GetFieldE{} -> notSupported "Records" (Just (show e))
   e@ProjectionE{} -> notSupported "Records" (Just (show e))
 
--- | If these declarations occur in a let block, check that all dependencies go
--- backwards, i.e. it would be valid to replace the let block with a chain of
--- single-dec lets. If non-recursive, returns, for each variable defined: the
--- name, the free variables of its right-hand side, and its right-hand side.
-checkDecsNonRecursive :: MonadFail m => [Dec] -> m (Maybe [(Name, Set Name, Exp)])
-checkDecsNonRecursive decs = do
-  let processDec :: MonadFail m => Dec -> m (Name, Set Name, Exp)
-      processDec = \case
-        ValD (VarP name) (NormalB e) [] -> (name,,e) <$> freeVars e
-        dec -> fail $ "Unsupported declaration in let: " ++ show dec
-  tups <- mapM processDec decs
-  let nonRecursive :: [Name] -> Set Name -> Bool
-      nonRecursive boundAfterThis frees = all (\name -> name `notElem` boundAfterThis) (toList frees)
-  if all (\((_, frees, _), boundAfterThis) -> nonRecursive boundAfterThis frees)
-         (zip tups (tail (tails (map fst3 tups))))
-    then return (Just tups)
-    else return Nothing
-
-fst3 :: (a, b, c) -> a
-fst3 (a, _, _) = a
-
 boundVars :: MonadFail m => Pat -> m (Set Name)
 boundVars = \case
   LitP _ -> return mempty
@@ -372,32 +425,6 @@ combine = fmap mconcat . sequence
 
 notSupported :: MonadFail m => String -> Maybe String -> m a
 notSupported descr mthing = fail $ descr ++ " not supported in reverseAD" ++ maybe "" (": " ++) mthing
-
-fromBinaryOperatorName :: Name -> Maybe Name
-fromBinaryOperatorName opname
-  | opname == '(+) = Just 'Add
-  | opname == '(-) = Just 'Sub
-  | opname == '(*) = Just 'Mul
-  | otherwise      = Nothing
-
-numberInput :: Structure -> Exp -> Integer -> Q (Exp, Integer)
-numberInput struc input nextid = case struc of
-  SDiscrete -> return (input, nextid)
-  SScalar -> return
-    (TupE [Just input
-          ,Just (ConE 'Contribs
-                 `AppE` LitE (IntegerL nextid)
-                 `AppE` ListE [TupE [Just (LitE (RationalL 1.0))
-                                    ,Just (LitE (IntegerL nextid))]])]
-    ,succ nextid)
-  STuple strucs -> do
-    names <- mapM (const (newName "inp")) strucs
-    (nextid', exps) <-
-      mapAccumLM (\nextid' (s, name) -> swap <$> numberInput s (VarE name) nextid')
-                 nextid (zip strucs names)
-    return (LetE [ValD (TupP (map VarP names)) (NormalB input) []]
-                 (TupE (map Just exps))
-           ,nextid')
 
 mapAccumLM :: Monad m => (s -> a -> m (s, b)) -> s -> [a] -> m (s, [b])
 mapAccumLM = go id

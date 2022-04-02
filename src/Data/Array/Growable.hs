@@ -19,6 +19,9 @@ import Prelude.Linear
 data GrowArray a where
   GrowArray :: Int -> a -> A.Array a %1-> GrowArray a
 
+instance Consumable (GrowArray a) where
+  consume (GrowArray _ _ a) = consume a
+
 alloc :: HasCallStack => Int -> a -> (GrowArray a %1-> Ur b) %1-> Ur b
 alloc n def f = A.alloc n def (f . GrowArray n def)
 
