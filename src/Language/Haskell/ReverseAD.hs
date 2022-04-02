@@ -13,6 +13,7 @@
 {-# OPTIONS -Wno-incomplete-uni-patterns #-}
 module Language.Haskell.ReverseAD where
 
+import Control.Monad (forM)
 import Data.Foldable (toList)
 import Data.List (tails)
 import Data.Int
@@ -22,13 +23,13 @@ import qualified Data.Set as Set
 import Data.Word
 import Language.Haskell.TH
 import qualified Prelude.Linear as PL
-import Prelude.Linear (Ur(..), consume, lseq)
+import Prelude.Linear (Ur(..))
 
 import qualified Data.Array.Growable as GA
 import Data.Array.Growable (GrowArray)
 
 
--- Dt[Double] = (Double, (Int, BuildState -o BuildState))
+-- Dt[Double] = (Double, (Int, Contrib))
 -- Dt[()] = ()
 -- Dt[(a, b)] = (Dt[a], Dt[b])
 -- Dt[a -> b] = a -> Int -> (Dt[b], Int)
@@ -37,10 +38,10 @@ import Data.Array.Growable (GrowArray)
 -- Dt[eps] = eps
 -- Dt[Γ, x : a] = Dt[Γ], x : Dt[a]
 --
--- Γ |- t : a
 -- Γ |- i : Int
+-- Γ |- t : a
 -- ~> Dt[Γ] |- D[i, t] : (Dt[a], Int)
--- D[i, r] = ((r, (i, PL.id)), i + 1)
+-- D[i, r] = ((r, (i, Contrib [])), i + 1)
 -- D[i, x] = (x, i)
 -- D[i, ()] = ((), i)
 -- D[i, (s, t)] = let (x, i1) = D[i, s]
@@ -53,44 +54,39 @@ import Data.Array.Growable (GrowArray)
 -- D[i, let x = s in t] = let (x, i1) = D[i, s]
 --                        in D[i1, t]
 -- D[i, op t1..tn] =
---   let ((x1, (di1, df1)), i1) = D[i, t1]
---       ((x2, (di2, df2)), i2) = D[i1, t1]
+--   let ((x1, (di1, cb1)), i1) = D[i, t1]
+--       ((x2, (di2, cb2)), i2) = D[i1, t1]
 --       ...
---       ((xn, (din, dfn)), in) = D[i{n-1}, tn]
+--       ((xn, (din, cbn)), in) = D[i{n-1}, tn]
 --   in ((op x1..xn
---       ,(in, tapeStore in (Contrib [(di1, dop_1 x1..xn), ..., (din, dop_n x1..xn)])
---             PL.. df1 PL.. ... PL.. dfn))
+--       ,(in, Contrib [(di1, cb1, dop_1 x1..xn), ..., (din, cbn, dop_n x1..xn)]))
 --      ,in + 1)
 
-type BuildState = GrowArray Contrib
-newtype Contrib = Contrib [(Int, Double)]
+type BuildState = GrowArray (Contrib, Double)
+newtype Contrib = Contrib [(Int, Contrib, Double)]
 
-tapeStore :: Int -> Contrib -> BuildState %1-> BuildState
-tapeStore = GA.set
-
-type ResolveState = GrowArray Double
-
-resolve :: Double -> BuildState %1-> ResolveState
-resolve adj carr =
-  GA.size carr PL.& \(Ur n, carr1) ->
-  GA.allocBeside n 0 carr1 PL.& \(darr2, carr2) ->
-  GA.set (n - 1) adj darr2 PL.& \darr3 ->
-  loop (n - 1) (darr3, carr2) PL.& \(darr4, carr4) ->
-    consume carr4 `lseq` darr4
+resolve :: BuildState %1-> BuildState
+resolve = \arr ->
+  GA.size arr PL.& \(Ur n, arr1) ->
+    loop (n - 1) arr1
   where
-    loop :: Int -> (ResolveState, BuildState) %1-> (ResolveState, BuildState)
-    loop 0 st = st
-    loop i (darr, carr') =
-      GA.get i carr' PL.& \(Ur cb, carr1) ->
-      GA.get i darr PL.& \(Ur a, darr1) ->
-        loop (i - 1) (apply cb a darr1, carr1)
+    loop :: Int -> BuildState %1-> BuildState
+    loop 0 arr = arr
+    loop i arr =
+      GA.get i arr PL.& \(Ur (cb, adj), arr1) ->
+        loop (i - 1) (apply cb adj arr1)
 
-    apply :: Contrib -> Double -> ResolveState %1-> ResolveState
-    apply (Contrib []) _ darr = darr
-    apply (Contrib ((i, d) : cbs)) a darr =
-      GA.get i darr PL.& \(Ur acc, darr1) ->
-      GA.set i (acc + a * d) darr1 PL.& \darr2 ->
-        apply (Contrib cbs) a darr2
+    apply :: Contrib -> Double -> BuildState %1-> BuildState
+    apply (Contrib []) _ arr = arr
+    apply (Contrib ((i, cb, d) : cbs)) a arr =
+      GA.get i arr PL.& \(Ur (_, acc), arr1) ->
+      GA.set i (cb, acc + a * d) arr1 PL.& \arr2 ->
+        apply (Contrib cbs) a arr2
+
+addContrib :: Int -> Contrib -> Double -> BuildState %1-> BuildState
+addContrib i cb adj arr =
+  GA.get i arr PL.& \(Ur (_, acc), arr1) ->
+    GA.set i (cb, acc + adj) arr1
 
 
 data Structure = SDiscrete | SScalar | STuple [Structure]
@@ -118,9 +114,6 @@ instance (KnownStructure a, KnownStructure b, KnownStructure c) => KnownStructur
 instance (KnownStructure a, KnownStructure b, KnownStructure c, KnownStructure d) => KnownStructure (a, b, c, d) where
   knownStructure _ = STuple [knownStructure (Proxy @a), knownStructure (Proxy @b), knownStructure (Proxy @c), knownStructure (Proxy @d)]
 
-data Backpropagator a = Zero | Contribs Int [(a, Int)]
-  deriving (Show)
-
 -- | Use as follows:
 --
 --     > :t $$(reverseAD [|| \(x, y) -> x * y :: Double ||])
@@ -135,16 +128,37 @@ reverseAD (examineCode -> inputCode) =
 
 transform :: Structure -> Structure -> Exp -> Q Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
-  let todo = "TODO: this whole transform function needs to be checked if it's still up to date with latest transformation"
   argvar <- newName "arg"
   (inp, idnum) <- numberInput inpStruc (VarE argvar) 1
   idvar <- newName "i0"
-  expr' <- ddr idvar expr
-  let todo = "TODO: need to deinterleave the output and apply ResolveStaged still"
+  ddrexpr <- ddr idvar expr
+  deinterexpr <- deinterleave outStruc ddrexpr
+  primalname <- newName "primal"
+  dualname <- newName "dual"
+  let todo = "TODO: see comment"
+             -- In the hole below, we have:
+             --   VarE dualname :: Exp (a -> BuildState -o BuildState)
+             --   resolve :: BuildState -o BuildState
+             -- and we need something of type:
+             --   a -> s
+             -- where s is the input type of the program.
+             -- Informally, the hole should be this:
+             --   \adjoint ->
+             --     let updater = resolve PL.. AppE (VarE dualname) adjoint
+             --     in GA.alloc 0 (Contrib [], 0.0) (reconstruct PL.. updater)
+             -- where
+             --   reconstruct :: BuildState -o s
+             -- uses the input structure (and, in the future for sum types,
+             -- metadata collected in numberInput) to create an input value
+             -- with the same structure as the actual input but with the
+             -- scalars replaced with the `snd` items in the array at the
+             -- numbered indices.
   return (LamE [VarP argvar] $
             LetE [ValD pat (NormalB inp) []
-                 ,ValD (VarP idvar) (NormalB (LitE (IntegerL idnum))) []] $
-              expr')
+                 ,ValD (VarP idvar) (NormalB (LitE (IntegerL idnum))) []
+                 ,ValD (TupP [VarP primalname, VarP dualname]) (NormalB deinterexpr) []] $
+              pair (VarE primalname)
+                   _)
 transform inpStruc outStruc (LamE [] body) =
   transform inpStruc outStruc body
 transform inpStruc outStruc (LamE (pat : pats) body) =
@@ -152,18 +166,55 @@ transform inpStruc outStruc (LamE (pat : pats) body) =
 transform _ _ expr =
   fail $ "Top-level expression in reverseAD must be lambda, but is: " ++ show expr
 
+-- outexp :: Dt[a]                            -- expression returning the output of the transformed program
+-- result :: (a                               -- primal result
+--           ,a -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+deinterleave :: Structure -> Exp -> Q Exp
+deinterleave struc outexp = case struc of
+  SDiscrete -> return (pair outexp (LamE [WildP] (VarE 'PL.id)))
+  SScalar -> do
+    -- outexp :: (Double, (Int, Contrib))
+    -- adjexp :: Double
+    primalname <- newName "prim"
+    idname <- newName "id"
+    cbname <- newName "cb"
+    return $
+      LetE [ValD (TupP [VarP primalname, TupP [VarP idname, VarP cbname]]) (NormalB outexp) []] $
+        pair (VarE primalname)
+             (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
+  STuple strucs -> do
+    (funs, outnames, adjnames) <- fmap unzip3 . forM (zip strucs [1::Int ..]) $ \(struc', index) -> do
+      outn <- newName ("out" ++ show index)
+      adjn <- newName ("adj" ++ show index)
+      fun <- deinterleave struc' (VarE outn)
+      return (fun, outn, adjn)
+    fulloutname <- newName "out"
+    case strucs of
+      [] -> return (pair (TupE []) (LamE [WildP] (VarE 'PL.id)))
+      _ -> return $
+        LetE [ValD (AsP fulloutname (TupP (map VarP outnames))) (NormalB outexp) []] $
+          pair (VarE fulloutname)
+               (LamE [TupP (map VarP adjnames)] $
+                  foldr1 (\e1 e2 -> VarE '(PL..) `AppE` e1 `AppE` e2)
+                         (zipWith AppE funs (map VarE adjnames)))
+
+-- Γ |- i : Int                        -- idName
+-- Γ |- t : a                          -- expression
+-- ~> Dt[Γ] |- D[i, t] : (Dt[a], Int)  -- result
 ddr :: Name -> Exp -> Q Exp
 ddr idName = \case
   VarE name -> return (pair (VarE name) (VarE idName))
 
   LitE lit -> case lit of
-    RationalL _ -> return (pair (pair (LitE lit) (AppE (ConE 'Contrib) (ListE [])))
+    RationalL _ -> return (pair (pair (LitE lit)
+                                      (pair (VarE idName) (AppE (ConE 'Contrib) (ListE []))))
                                 (InfixE (Just (VarE idName))
                                         (VarE '(+))
                                         (Just (LitE (IntegerL 1)))))
     FloatPrimL _ -> fail "float prim?"
     DoublePrimL _ -> fail "double prim?"
-    _ -> return (pair (LitE lit) (VarE idName))
+    IntegerL _ -> return (pair (LitE lit) (VarE idName))
+    _ -> fail $ "literal? " ++ show lit
 
   AppE e1 e2 -> do
     (letwrap, [funname, argname], outid) <- ddrList [e1, e2] idName
@@ -285,16 +336,12 @@ ddrOp idName args primal gradient = do
       snde = AppE (VarE 'snd)
       answer = primal (map (fste . VarE) argnames)
       pderivs = gradient (map (fste . VarE) argnames)
-  let comp e1 e2 = VarE '(PL..) `AppE` e1 `AppE` e2
-      argupdaters = map (snde . snde . VarE) argnames
-      argcontribids = map (fste . snde . VarE) argnames
-      storecall = VarE 'tapeStore
-                    `AppE` VarE outid
-                    `AppE` AppE (ConE 'Contrib) (ListE (zipWith pair argcontribids pderivs))
+  let contriblist = [TupE [Just (fste (VarE var)), Just (fste (snde (VarE var))), Just pderiv]
+                    | (var, pderiv) <- zip argnames pderivs]
   return $ letwrap $
     pair (pair answer
                (pair (VarE outid)
-                     (foldr comp storecall argupdaters)))
+                     (AppE (ConE 'Contrib) (ListE contriblist))))
          (InfixE (Just (VarE outid)) (VarE '(+)) (Just (LitE (IntegerL 1))))
 
 -- | Differentiate a declaration, given a variable containing the next ID to
@@ -340,11 +387,12 @@ numberInput :: Structure -> Exp -> Integer -> Q (Exp, Integer)
 numberInput struc input nextid = case struc of
   SDiscrete -> return (input, nextid)
   SScalar -> return
-    (TupE [Just input
-          ,Just (ConE 'Contribs
-                 `AppE` LitE (IntegerL nextid)
-                 `AppE` ListE [TupE [Just (LitE (RationalL 1.0))
-                                    ,Just (LitE (IntegerL nextid))]])]
+    (pair input
+          (pair (LitE (IntegerL nextid))
+                (ConE 'Contrib
+                   `AppE` ListE [TupE [Just (LitE (IntegerL nextid))
+                                      ,Just (ConE 'Contrib `AppE` ListE [])
+                                      ,Just (LitE (RationalL 0.0))]]))
     ,succ nextid)
   STuple strucs -> do
     names <- mapM (const (newName "inp")) strucs

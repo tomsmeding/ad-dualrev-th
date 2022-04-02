@@ -16,6 +16,9 @@ import GHC.Stack (HasCallStack)
 import Prelude.Linear
 
 
+todo = "TODO: automatically grow array on set, and return default on out-of-bounds get"
+
+
 data GrowArray a where
   GrowArray :: Int -> a -> A.Array a %1-> GrowArray a
 
