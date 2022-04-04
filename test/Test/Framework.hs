@@ -21,6 +21,8 @@ import System.IO
 import Test.QuickCheck as ExportQC hiding (property)
 import qualified Test.QuickCheck as QC
 
+import Test.Parallel
+
 
 data Test = Prop Property
           | Unit (IO Bool)
@@ -43,38 +45,38 @@ tree = SubTree
 
 runTests :: Tree -> IO ()
 runTests t = do
-  failed <- runTestsTree (maxLeftWidth t) stdArgs 0 t
+  -- TODO: evalParallel
+  failed <- evalSequential $ runTestsTree (maxLeftWidth t) stdArgs 0 t
   if Set.null failed
     then putStrLn "All successful"
     else putStrLn $ "Failed: " ++ intercalate ", " (toList failed)
 
-runTestsTree :: Int -> Args -> Int -> Tree -> IO (Set String)
+runTestsTree :: Int -> Args -> Int -> Tree -> Parallel (Set String)
 runTestsTree leftwid args indent = \case
-  SubTree name ts -> do
-    putStrLn (replicate (2 * indent) ' ' ++ name ++ ":")
-    mconcat <$> mapM (runTestsTree leftwid args (indent + 1)) ts
-  Leaf name test -> do
+  SubTree name ts ->
+    run (putStrLn (replicate (2 * indent) ' ' ++ name ++ ":"))
+    *> (mconcat <$> traverse (runTestsTree leftwid args (indent + 1)) ts)
+  Leaf name test ->
     let padding = leftwid - 2 * indent - length name
-    putStr (replicate (2 * indent) ' ' ++ name ++ ": " ++ replicate padding ' ')
-    hFlush stdout
-    runTest args test >>= \case
-      True -> return mempty
-      False -> return (Set.singleton name)
+    in run (do putStr (replicate (2 * indent) ' ' ++ name ++ ": " ++
+                         replicate padding ' ')
+               hFlush stdout)
+       *> ((\ok -> if ok then mempty else Set.singleton name) <$> runTest args test)
   ChangeArgs f t ->
     runTestsTree leftwid (f args) indent t
 
-runTest :: Args -> Test -> IO Bool
+runTest :: Args -> Test -> Parallel Bool
 runTest args = \case
-  Prop prop -> do
-    res <- quickCheckWithResult args prop
-    return $ case res of
-      Success{} -> True
-      GaveUp{} -> False
-      Failure{} -> False
-      NoExpectedFailure{} -> False
-  Unit action -> action >>= \case
-    False -> putStrLn "FAILED" >> return False
-    True -> putStrLn "Success" >> return True
+  Prop prop ->
+    let checkRes Success{} = True
+        checkRes GaveUp{} = False
+        checkRes Failure{} = False
+        checkRes NoExpectedFailure{} = False
+    in checkRes <$> Spawn (quickCheckWithResult args prop)
+  Unit action ->
+    Action (Spawn action) $ \case
+      False -> putStrLn "FAILED"
+      True -> putStrLn "Success"
 
 maxLeftWidth :: Tree -> Int
 maxLeftWidth (SubTree _ ts) = 2 + maximum (map maxLeftWidth ts)
