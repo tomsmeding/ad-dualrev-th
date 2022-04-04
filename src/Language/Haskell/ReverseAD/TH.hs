@@ -1,9 +1,9 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE LinearTypes #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
@@ -27,6 +27,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Vector as V
 import Data.Word
+import GHC.TypeLits (TypeError, ErrorMessage(Text))
 import Language.Haskell.TH
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
@@ -114,7 +115,8 @@ instance KnownStructure Word16 where knownStructure _ = SDiscrete
 instance KnownStructure Word32 where knownStructure _ = SDiscrete
 instance KnownStructure Word64 where knownStructure _ = SDiscrete
 instance KnownStructure () where knownStructure _ = SDiscrete
-instance KnownStructure Float where knownStructure _ = SScalar
+-- instance KnownStructure Float where knownStructure _ = SScalar
+instance TypeError ('Text "Only Double is an active type for now (Float isn't)") => KnownStructure Float where knownStructure _ = undefined
 instance KnownStructure Double where knownStructure _ = SScalar
 instance (KnownStructure a, KnownStructure b) => KnownStructure (a, b) where
   knownStructure _ = STuple [knownStructure (Proxy @a), knownStructure (Proxy @b)]
