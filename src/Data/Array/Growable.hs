@@ -6,17 +6,15 @@ module Data.Array.Growable (
   alloc,
   allocBeside,
   set,
-  push,
   get,
-  size
+  size,
+  freeze,
 ) where
 
 import qualified Data.Array.Mutable.Linear as A
+import qualified Data.Vector as V
 import GHC.Stack (HasCallStack)
 import Prelude.Linear
-
-
-todo = "TODO: automatically grow array on set, and return default on out-of-bounds get"
 
 
 data GrowArray a where
@@ -35,18 +33,19 @@ allocBeside n def (GrowArray otherlen otherdef other) =
 
 set :: HasCallStack => Int -> a -> GrowArray a %1-> GrowArray a
 set i x (GrowArray len def a)
-  | 0 <= i, i < len = GrowArray len def (A.set i x a)
-  | otherwise = a `lseq` error ("Index out of bounds: " ++ show i)
-
-push :: a -> GrowArray a %1-> GrowArray a
-push x (GrowArray len def a) = case A.size a of
-  (Ur cap, a') | cap < len -> GrowArray (succ len) def (A.set len x a')
-               | otherwise -> push x (GrowArray len def (A.resize (2 * cap) def a'))
+  | i < 0 = a `lseq` error ("GrowArray.set: Negative index: " ++ show i)
+  | i < len = GrowArray len def (A.set i x a)
+  | otherwise = set i x (GrowArray (i + 1) def (A.resize (i + 1) def a))
 
 get :: Int -> GrowArray a %1-> (Ur a, GrowArray a)
 get i (GrowArray len def a)
-  | 0 <= i, i < len = case A.get i a of (x, a') -> (x, GrowArray len def a')
-  | otherwise = a `lseq` error ("Index out of bounds: " ++ show i)
+  | i < 0 = a `lseq` error ("GrowArray.get: Negative index: " ++ show i)
+  | i < len = case A.get i a of (x, a') -> (x, GrowArray len def a')
+  | otherwise = (Ur def, GrowArray len def a)
 
 size :: GrowArray a %1-> (Ur Int, GrowArray a)
 size (GrowArray len def a) = (Ur len, GrowArray len def a)
+
+freeze :: GrowArray a %1-> Ur (V.Vector a)
+freeze (GrowArray len _ a) =
+  case A.freeze a of Ur v -> Ur (V.slice 0 len v)

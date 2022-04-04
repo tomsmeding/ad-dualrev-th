@@ -2,11 +2,10 @@ cabal-version: 1.12
 name:          dualrev
 version:       0.1.0.0
 description:   Implementation of dual-numbers reverse AD for Haskell
-homepage:      https://github.com/tomsmeding/dualrev#readme
-bug-reports:   https://github.com/tomsmeding/dualrev/issues
-author:        Tom Smeding, Matthijs Vákár
+homepage:      https://git.tomsmeding.com/dualrev
+author:        Tom Smeding
 maintainer:    Tom Smeding <tom@tomsmeding.com>
-copyright:     2022 Tom Smeding, Matthijs Vákár
+copyright:     2022 Tom Smeding
 license:       MIT
 build-type:    Simple
 extra-source-files:
@@ -14,12 +13,12 @@ extra-source-files:
 
 source-repository head
   type: git
-  location: https://github.com/tomsmeding/dualrev
+  location: https://git.tomsmeding.com/dualrev
 
 library
   exposed-modules:
     Data.Array.Growable
-    Language.Haskell.ReverseAD
+    Language.Haskell.ReverseAD.TH
   hs-source-dirs:
     src
   ghc-options: -Wall
@@ -28,4 +27,17 @@ library
     , containers
     , linear-base
     , template-haskell
+    , vector
+  default-language: Haskell2010
+
+test-suite ad-test
+  type: exitcode-stdio-1.0
+  main-is: test/Main.hs
+  other-modules:
+    Test.Framework
+  ghc-options: -Wall -O2 -threaded
+  build-depends:
+      base >=4.7 && <5
+    , dualrev
+    , QuickCheck
   default-language: Haskell2010

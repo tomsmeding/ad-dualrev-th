@@ -1,2 +1,12 @@
 cradle:
-  cabal:
+  multi:
+    - path: "src/"
+      config:
+        cradle:
+          cabal:
+            component: "lib:dualrev"
+    # - path: "test/"
+    #   config:
+    #     cradle:
+    #       cabal:
+    #         component: "test:ad-test"
