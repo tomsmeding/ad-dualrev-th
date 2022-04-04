@@ -155,7 +155,7 @@ transform inpStruc outStruc (LamE [pat] expr) = do
                                      1
   return (LamE [VarP argvar] $
             LetE [ValD pat (NormalB inp) []
-                 ,ValD (VarP idvar) (NormalB (LitE (IntegerL idnum))) []
+                 ,ValD (VarP idvar) (NormalB (SigE (LitE (IntegerL idnum)) (ConT ''Int))) []
                  ,ValD (TupP [VarP primalname, VarP dualname]) (NormalB deinterexpr) []] $
               pair (VarE primalname)
                    (LamE [VarP adjname] $
