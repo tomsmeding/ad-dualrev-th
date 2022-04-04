@@ -5,6 +5,7 @@ module Test.Framework (
   -- Building test trees
   tree,
   withArgs,
+  changeArgs,
   property,
   -- * Tree data types
   Tree(..), Test(..),
@@ -26,10 +27,13 @@ data Test = Prop Property
 
 data Tree = SubTree String [Tree]
           | Leaf String Test
-          | WithArgs Args Tree
+          | ChangeArgs (Args -> Args) Tree
 
 withArgs :: Args -> Tree -> Tree
-withArgs = WithArgs
+withArgs = ChangeArgs . const
+
+changeArgs :: (Args -> Args) -> Tree -> Tree
+changeArgs = ChangeArgs
 
 property :: Testable prop => String -> prop -> Tree
 property name p = Leaf name (Prop (QC.property p))
@@ -56,8 +60,8 @@ runTestsTree leftwid args indent = \case
     runTest args test >>= \case
       True -> return mempty
       False -> return (Set.singleton name)
-  WithArgs args' t ->
-    runTestsTree leftwid args' indent t
+  ChangeArgs f t ->
+    runTestsTree leftwid (f args) indent t
 
 runTest :: Args -> Test -> IO Bool
 runTest args = \case
@@ -75,4 +79,4 @@ runTest args = \case
 maxLeftWidth :: Tree -> Int
 maxLeftWidth (SubTree _ ts) = 2 + maximum (map maxLeftWidth ts)
 maxLeftWidth (Leaf name _) = length name
-maxLeftWidth (WithArgs _ t) = maxLeftWidth t
+maxLeftWidth (ChangeArgs _ t) = maxLeftWidth t

@@ -62,7 +62,9 @@ checkFDcontrol name program controlfun controlgrad =
                       (controlJac ~= findiffJac)
 
 main :: IO ()
-main = runTests $
+main =
+  runTests $
+  changeArgs (\a -> a { maxSuccess = 10000 }) $
   tree "AD"
     [checkFDcontrol "id"
        $$(reverseAD @Double @Double
