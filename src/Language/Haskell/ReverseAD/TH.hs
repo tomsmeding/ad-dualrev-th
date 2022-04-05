@@ -18,7 +18,7 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Applicative (asum)
-import Control.Monad (forM)
+import Control.Monad (forM, zipWithM)
 import Data.Bifunctor (second)
 import Data.Foldable (toList)
 import Data.Function ((&))
@@ -142,7 +142,8 @@ reverseAD (examineCode -> inputCode) =
 transform :: QuoteFail m => Structure -> Structure -> Exp -> m Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
   argvar <- newName "arg"
-  (inp, idnum) <- numberInput inpStruc (VarE argvar) 1
+  onevar <- newName "one"
+  inp <- numberInput inpStruc (VarE argvar) onevar
   idvar <- newName "i0"
   ddrexpr <- ddr idvar expr
   deinterexpr <- deinterleave outStruc (AppE (VarE 'fst) ddrexpr)
@@ -158,8 +159,8 @@ transform inpStruc outStruc (LamE [pat] expr) = do
                                         (VarE 'V.map `AppE` VarE 'snd `AppE` VarE vecname)
                                         1
   return (LamE [VarP argvar] $
-            LetE [ValD pat (NormalB inp) []
-                 ,ValD (VarP idvar) (NormalB (SigE (LitE (IntegerL idnum)) (ConT ''Int))) []
+            LetE [ValD (VarP onevar) (NormalB (SigE (LitE (IntegerL 1)) (ConT ''Int))) []
+                 ,ValD (TupP [pat, VarP idvar]) (NormalB inp) []
                  ,ValD (TupP [VarP primalname, VarP dualname]) (NormalB deinterexpr) []] $
               pair (VarE primalname)
                    (LamE [VarP adjname] $
@@ -462,26 +463,28 @@ checkDecsNonRecursive decs = do
     then return (Just tups)
     else return Nothing
 
-numberInput :: Quote m => Structure -> Exp -> Integer -> m (Exp, Integer)
+-- input :: a
+-- nextid :: name Int
+-- result :: (Dt[a], Int)
+numberInput :: Quote m => Structure -> Exp -> Name -> m Exp
 numberInput struc input nextid = case struc of
-  SDiscrete -> return (input, nextid)
-  SScalar -> return
-    (pair input
-          (pair (LitE (IntegerL nextid))
-                (ConE 'Contrib `AppE` ListE []))
-                -- (ConE 'Contrib
-                --    `AppE` ListE [TupE [Just (LitE (IntegerL nextid))
-                --                       ,Just (ConE 'Contrib `AppE` ListE [])
-                --                       ,Just (LitE (RationalL 0.0))]]))
-    ,succ nextid)
+  SDiscrete -> return (pair input (VarE nextid))
+  SScalar -> return $
+    pair (pair input
+               (pair (VarE nextid)
+                     (ConE 'Contrib `AppE` ListE [])))
+         (AppE (VarE 'succ) (VarE nextid))
   STuple strucs -> do
     names <- mapM (const (newName "inp")) strucs
-    (nextid', exps) <-
-      mapAccumLM (\nextid' (s, name) -> swap <$> numberInput s (VarE name) nextid')
-                 nextid (zip strucs names)
-    return (LetE [ValD (TupP (map VarP names)) (NormalB input) []]
-                 (TupE (map Just exps))
-           ,nextid')
+    postnames <- mapM (const (newName "inp'")) strucs
+    idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) strucs [1::Int ..]
+    let outid = case idnames of [] -> nextid ; _ -> last idnames
+    exps <- zipWithM3 numberInput strucs (map VarE names) (nextid : idnames)
+    return (LetE (ValD (TupP (map VarP names)) (NormalB input) []
+                 :[ValD (TupP [VarP postname, VarP idname]) (NormalB expr) []
+                  | (postname, idname, expr) <- zip3 postnames idnames exps])
+                 (pair (TupE (map (Just . VarE) postnames))
+                       (VarE outid)))
 
 fst3 :: (a, b, c) -> a
 fst3 (a, _, _) = a
@@ -564,9 +567,6 @@ mapAccumLM = go id
 
 zipWithM3 :: Applicative m => (a -> b -> c -> m d) -> [a] -> [b] -> [c] -> m [d]
 zipWithM3 f a b c = traverse (\(x,y,z) -> f x y z) (zip3 a b c)
-
-swap :: (a, b) -> (b, a)
-swap (a, b) = (b, a)
 
 mapUr :: (a -> b) -> Ur a %1-> Ur b
 mapUr f (Ur x) = Ur (f x)
