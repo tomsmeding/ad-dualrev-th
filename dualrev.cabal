@@ -49,3 +49,16 @@ test-suite test
     , QuickCheck
     , template-haskell
   default-language: Haskell2010
+
+benchmark bench
+  type: exitcode-stdio-1.0
+  hs-source-dirs: bench
+  main-is: Main.hs
+  ghc-options: -Wall -O2 -threaded -rtsopts
+  build-depends:
+      base >=4.7 && <4.17
+    , dualrev
+    , ad
+    , criterion-measurement
+    , template-haskell
+  default-language: Haskell2010

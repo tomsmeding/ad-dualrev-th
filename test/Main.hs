@@ -104,7 +104,7 @@ main :: IO ()
 main =
   runTestsExit $
   withShowDuration True $
-  changeArgs (\a -> a { maxSuccess = 10000 }) $
+  changeArgs (\a -> a { maxSuccess = 50000 }) $
   tree "AD"
     [checkFDcontrol "id"
        $$(reverseADandControl @Double @Double
