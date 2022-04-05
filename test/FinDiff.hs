@@ -27,59 +27,64 @@ class FinDiff a where
   type ReplaceElements a s
   elements' :: Proxy a -> ReplaceElements a s -> [s]
 
-  -- | Returns any excess elements.
-  rebuild' :: Proxy a -> [s] -> (ReplaceElements a s, [s])
+  -- | Given a reference object to glean the structure from, rebuilds a value
+  -- from the prefix of the list. Returns any excess elements.
+  rebuild' :: Proxy a -> Proxy s' -> ReplaceElements a s' -> [s] -> (ReplaceElements a s, [s])
 
   -- | The "one" element of the 'Element' type of this thing. For 'Double' this
   -- is @1.0@.
   oneElement :: Proxy a -> Element a
 
-  zero :: a
+  -- | Given a reference object for structure
+  zero :: Proxy s' -> ReplaceElements a s' -> a
 
-  replaceElements :: Proxy a -> ReplaceElements a s1 -> (s1 -> s2) -> ReplaceElements a s2
+  replaceElements :: Proxy a -> (s1 -> s2) -> ReplaceElements a s1 -> ReplaceElements a s2
 
   replaceElementsId :: ReplaceElements a (Element a) :~: a
 
   elements :: a -> [Element a]
   elements | Refl <- replaceElementsId @a = elements' (Proxy @a)
 
-  -- | Rebuild a value from the list of elements. Assumes that the list has the
+  -- | Given a reference object to glean the structure from, rebuild a value
+  -- from the list of elements. Assumes that the list has the right length.
+  rebuild :: Proxy s' -> ReplaceElements a s' -> [Element a] -> a
+  rebuild p ref | Refl <- replaceElementsId @a = fst . rebuild' (Proxy @a) p ref
+
+  -- | Given a reference object to glean the structure from, rebuild a value
+  -- from a list of differently-typed elements. Assumes that the list has the
   -- right length.
-  rebuild :: [Element a] -> a
-  rebuild | Refl <- replaceElementsId @a = fst . rebuild' (Proxy @a)
+  rebuildAs :: Proxy a -> Proxy s' -> ReplaceElements a s' -> [s] -> ReplaceElements a s
+  rebuildAs p q ref = fst . rebuild' p q ref
 
-  -- | Rebuild a value from a list of differently-typed elements. Assumes that
-  -- the list has the right length.
-  rebuildAs :: Proxy a -> [s] -> ReplaceElements a s
-  rebuildAs p = fst . rebuild' p
-
-  oneHotVecs :: [a]
-  oneHotVecs = go id (elements (zero @a))
+  -- | Given a reference object for structure
+  oneHotVecs :: Proxy s' -> ReplaceElements a s' -> [a]
+  oneHotVecs p ref = go id (elements @a (zero p ref))
     where go :: FinDiff a => ([Element a] -> [Element a]) -> [Element a] -> [a]
           go _ [] = []
-          go prefix (x:xs) = rebuild (prefix (oneElement (Proxy @a) : xs)) : go (prefix . (x:)) xs
+          go prefix (x:xs) = rebuild p ref (prefix (oneElement (Proxy @a) : xs)) : go (prefix . (x:)) xs
 
 -- | Element type is assumed to be Double
 instance FinDiff () where
   type Element () = Double
   type ReplaceElements () s = ()
   elements' _ () = []
-  rebuild' _ l = ((), l)
+  rebuild' _ _ () l = ((), l)
   oneElement _ = 1.0
-  zero = ()
-  replaceElements _ () _ = ()
+  zero _ () = ()
+  replaceElements _ _ () = ()
   replaceElementsId = Refl
 
 instance (FinDiff a, FinDiff b, Element a ~ Element b) => FinDiff (a, b) where
   type Element (a, b) = Element a
   type ReplaceElements (a, b) s = (ReplaceElements a s, ReplaceElements b s)
   elements' _ (x, y) = elements' (Proxy @a) x ++ elements' (Proxy @b) y
-  rebuild' _ l = let (x, l1) = rebuild' (Proxy @a) l
-                     (y, l2) = rebuild' (Proxy @b) l1
-                 in ((x, y), l2)
+  rebuild' _ p (refx, refy) l =
+    let (x, l1) = rebuild' (Proxy @a) p refx l
+        (y, l2) = rebuild' (Proxy @b) p refy l1
+    in ((x, y), l2)
   oneElement _ = oneElement (Proxy @a)
-  zero = (zero, zero)
-  replaceElements _ (x, y) f = (replaceElements (Proxy @a) x f, replaceElements (Proxy @b) y f)
+  zero p (refx, refy) = (zero p refx, zero p refy)
+  replaceElements _ f (x, y) = (replaceElements (Proxy @a) f x, replaceElements (Proxy @b) f y)
   replaceElementsId
     | Refl <- replaceElementsId @a
     , Refl <- replaceElementsId @b
@@ -89,10 +94,10 @@ instance FinDiff Double where
   type Element Double = Double
   type ReplaceElements Double s = s
   elements' _ x = [x]
-  rebuild' _ l = (head l, tail l)
+  rebuild' _ _ _ l = (head l, tail l)
   oneElement _ = 1.0
-  zero = 0.0
-  replaceElements _ x f = f x
+  zero _ _ = 0.0
+  replaceElements _ f x = f x
   replaceElementsId = Refl
 
 -- instance KnownNat n => FinDiff (Vect n) where
@@ -104,24 +109,46 @@ instance FinDiff Double where
 --     in (v, l2)
 --   oneElement _ = 1.0
 
+instance FinDiff a => FinDiff [a] where
+  type Element [a] = Element a
+  type ReplaceElements [a] s = [ReplaceElements a s]
+  elements' _ l = concatMap (elements' (Proxy @a)) l
+  rebuild' _ _ [] elts = ([], elts)
+  rebuild' _ p (refx:refxs) elts =
+    let (x, elts') = rebuild' (Proxy @a) p refx elts
+        (xs, elts'') = rebuild' (Proxy @[a]) p refxs elts'
+    in (x : xs, elts'')
+  oneElement _ = oneElement (Proxy @a)
+  zero p refl = map (zero p) refl
+  replaceElements _ f l = map (replaceElements (Proxy @a) f) l
+  replaceElementsId | Refl <- replaceElementsId @a = Refl
+
 -- | Given the reverse derivative of some function of type @a -> b@, return the
 -- Jacobian of the function at the given input.
+-- The first argument is a reference adjoint so that successful one-hot adjoint
+-- can be generated.
 jacobianByRows :: forall a b' a'. (FinDiff b', FinDiff a', Element a' ~ Double)
-               => (a -> b' -> a') -> a -> [[Double]]
-jacobianByRows revad inp = [elements (revad inp adjoint) | adjoint <- oneHotVecs @b']
+               => b' -> (a -> b' -> a') -> a -> [[Double]]
+jacobianByRows refadj revad inp
+  | Refl <- replaceElementsId @b'
+  = [elements (revad inp adjoint) | adjoint <- oneHotVecs (Proxy @(Element b')) refadj]
 
 -- | Given the forward derivative of some function of type @a -> b@, return the
 -- Jacobian of the function at the given input.
-jacobianByCols :: forall a a' b'. (FinDiff a', FinDiff b', Element b' ~ Double)
-               => (a -> a' -> b') -> a -> [[Double]]
-jacobianByCols fwdad inp = transpose [elements (fwdad inp tangent) | tangent <- oneHotVecs @a']
+jacobianByCols :: forall a b. (FinDiff a, FinDiff b, Element b ~ Double)
+               => (a -> a -> b) -> a -> [[Double]]
+jacobianByCols fwdad inp
+  | Refl <- replaceElementsId @a
+  = transpose [elements (fwdad inp tangent) | tangent <- oneHotVecs (Proxy @(Element a)) inp]
 
 jacobianByFinDiff :: forall a b. (FinDiff a, FinDiff b, Element a ~ Double, Element b ~ Double)
-                  => (a -> b) -> a -> [[Double]]
-jacobianByFinDiff f x = jacobianByElts (finiteDifference f) x
+                  => b -> (a -> b) -> a -> [[Double]]
+jacobianByFinDiff refout f x = jacobianByElts refout (finiteDifference f) x
 
 -- | Given a finite-differencing derivative of some function of type @a -> b@,
--- return the Jacobian of the function at the given input.
+-- return the Jacobian of the function at the given input. The first argument
+-- is a reference output value so that effective one-hot output adjoints can be
+-- generated to this model.
 --
 -- The finite-differencing derivative takes three arguments: an input value
 -- @x@, a one-hot input vector @v@, and a one-hot output vector @w@. Let @f@ be
@@ -134,8 +161,12 @@ jacobianByFinDiff f x = jacobianByElts (finiteDifference f) x
 -- following is expected:
 -- @1/h ((f(x + h v) - f(x)) `dot` w)@.
 jacobianByElts :: forall a b. (FinDiff a, Element a ~ Double, FinDiff b, Element b ~ Double)
-               => (a -> a -> b -> Double) -> a -> [[Double]]
-jacobianByElts fd inp = [[fd inp v w | v <- oneHotVecs @a] | w <- oneHotVecs @b]
+               => b -> (a -> a -> b -> Double) -> a -> [[Double]]
+jacobianByElts refadj fd inp
+  | Refl <- replaceElementsId @a
+  , Refl <- replaceElementsId @b
+  = [[fd inp v w | v <- oneHotVecs (Proxy @Double) inp]
+    | w <- oneHotVecs (Proxy @Double) refadj]
 
 -- | Compute a single element of the Jacobian of @f@ using finite differencing.
 -- In the arguments @f@, @x@, @dx@, @dy@, the argument @x@ is the input value,
@@ -143,17 +174,20 @@ jacobianByElts fd inp = [[fd inp v w | v <- oneHotVecs @a] | w <- oneHotVecs @b]
 -- column and row of the Jacobian, respectively.
 --
 -- This function is suitable to be used with 'jacobianByElts'.
-finiteDifference :: (FinDiff a, FinDiff b, Element a ~ Double, Element b ~ Double)
+finiteDifference :: forall a b. (FinDiff a, FinDiff b, Element a ~ Double, Element b ~ Double)
                  => (a -> b) -> a -> a -> b -> Double
-finiteDifference f x dx dy =
-  let veczip :: FinDiff a => (Element a -> Element a -> Element a) -> a -> a -> a
-      veczip g a b = rebuild (zipWith g (elements a) (elements b))
+finiteDifference f x dx dy
+  | Refl <- replaceElementsId @a =
+  let veczip :: forall a'. FinDiff a' => (Element a' -> Element a' -> Element a') -> a' -> a' -> a'
+      veczip g a b | Refl <- replaceElementsId @a'
+                   = rebuild (Proxy @(Element a')) a (zipWith g (elements a) (elements b))
       vecsum = sum . elements
       add = veczip (+)
       sub = veczip (-)
       dot a b = vecsum (veczip (*) a b)
-      scale :: forall a. (FinDiff a, Num (Element a)) => Element a -> a -> a
-      scale e a = veczip (*) (rebuild (e <$ elements (zero @a))) a
+      scale :: forall a'. (FinDiff a', Num (Element a')) => Element a' -> a' -> a'
+      scale e a | Refl <- replaceElementsId @a'
+                = veczip (*) (rebuild (Proxy @(Element a')) a (e <$ elements @a' (zero (Proxy @(Element a')) a))) a
   in recip h * ((f (x `add` scale h dx) `sub` f x) `dot` dy)
   where
     h = 0.000001 :: Double

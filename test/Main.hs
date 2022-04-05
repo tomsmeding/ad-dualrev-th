@@ -65,17 +65,18 @@ checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
   | Refl <- replaceElementsId @a
   , Refl <- replaceElementsId @b
   = property name $ \x ->
-      let controlJac = (`jacobianByRows` x) <$> mcontrolgrad
-          programJac = jacobianByRows (snd . program) x
-          findiffJac = jacobianByFinDiff (controlfun @Double) x
+      let refout = controlfun x
+          controlJac = (\df -> jacobianByRows refout df x) <$> mcontrolgrad
+          programJac = jacobianByRows refout (snd . program) x
+          findiffJac = jacobianByFinDiff refout (controlfun @Double) x
           forwardJac = jacobianByCols
                           (\input tangent ->
-                              rebuild @b . map snd $
+                              rebuild @b (Proxy @Double) refout . map snd $
                               forwardAD
                                 (\(inelts :: [s]) ->
                                    elements' (Proxy @b)
                                      (controlfun @s
-                                        (rebuildAs (Proxy @a) inelts)))
+                                        (rebuildAs (Proxy @a) (Proxy @Double) input inelts)))
                                 (zip (elements @a input) (elements @a tangent)))
                           x
           (refJacName, refJac) = case controlJac of
@@ -187,4 +188,15 @@ main =
                        in f x0 ||])
        Nothing
        YesFD
+    ,checkFDcontrol "list constr"
+       $$(reverseADandControl @Double @[Double]
+            [|| \x -> 2.0 * x : 3.0 * x : [x, x + 1.0] ||])
+       (Just (\_ [d1, d2, d3, d4] -> 2*d1 + 3*d2 + d3 + d4))
+       YesFD
+    -- ,checkFDcontrol "list case"
+    --    $$(reverseADandControl @[Double] @Double
+    --         [|| \l -> case l of [] -> 2.0
+    --                             x : xs -> x + 3.0 ||])
+    --    Nothing
+    --    YesFD
     ]

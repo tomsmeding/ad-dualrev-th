@@ -339,6 +339,14 @@ ddr idName = \case
       Nothing -> fail ("Unsupported infix operator " ++ show opname)
       Just act -> act
 
+  InfixE (Just e1) (ConE constr) (Just e2)
+    | constr == '(:) -> do
+        (letwrap, [xname, xsname], outid) <- ddrList [e1, e2] idName
+        return $ letwrap $
+          pair (InfixE (Just (VarE xname)) (ConE '(:)) (Just (VarE xsname)))
+               (VarE outid)
+    | otherwise -> fail $ "Unsupported infix operator: " ++ show constr
+
   e@InfixE{} -> fail $ "Unsupported operator section: " ++ show e
 
   ParensE e -> ParensE <$> ddr idName e
