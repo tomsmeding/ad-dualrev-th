@@ -116,58 +116,58 @@ main =
        (\(x,y) -> x*y)
        (Just (\(x,y) d -> (y*d,x*d)))
     ,checkFDcontrol "let"
-      $$(reverseAD @Double @Double
-           [|| \x -> let y = 3.0 + x in x * y ||])
-      (\x -> x^2 + 3*x)
-      (Just (\x d -> d * (2*x + 3)))
+       $$(reverseAD @Double @Double
+            [|| \x -> let y = 3.0 + x in x * y ||])
+       (\x -> x^2 + 3*x)
+       (Just (\x d -> d * (2*x + 3)))
     ,checkFDcontrol "higher-order"
-      $$(reverseAD @(Double, Double) @Double
-           [|| \(x,y) -> let f = \z -> x * z + y
-                         in f y * f x ||])
-      (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
-      (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
+       $$(reverseAD @(Double, Double) @Double
+            [|| \(x,y) -> let f = \z -> x * z + y
+                          in f y * f x ||])
+       (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
+       (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
     ,checkFDcontrol "higher-order2"
-      $$(reverseAD @(Double, Double) @Double
-           [|| \(x,y) -> let f = \z -> x * z + y
-                             g = \f' u -> f' u * f x
-                             h = g f
-                         in h y ||])
-      (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
-      (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
+       $$(reverseAD @(Double, Double) @Double
+            [|| \(x,y) -> let f = \z -> x * z + y
+                              g = \f' u -> f' u * f x
+                              h = g f
+                          in h y ||])
+       (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
+       (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
     ,checkFDcontrol "complexity"
-      $$(reverseAD @(Double, Double) @Double
-           [|| \(x,y) -> let x1 = x + y
-                             x2 = x1 + x
-                             x3 = x2 + x1
-                             x4 = x3 + x2
-                             x5 = x4 + x3
-                             x6 = x5 + x4
-                             x7 = x6 + x5
-                             x8 = x7 + x6
-                             x9 = x8 + x7
-                             x10 = x9 + x8
-                         in x10 * x10 ||])
-      -- x10 = 89x + 55y
-      -- x10^2 = 7921x^2 + 9790xy + 3025y^2
-      (\(x,y) -> 7921*x^2 + 9790*x*y + 3025*y^2)
-      (Just (\(x,y) d -> (d * (2*7921*x + 9790*y), d * (9790*x + 2*3025*y))))
+       $$(reverseAD @(Double, Double) @Double
+            [|| \(x,y) -> let x1 = x + y
+                              x2 = x1 + x
+                              x3 = x2 + x1
+                              x4 = x3 + x2
+                              x5 = x4 + x3
+                              x6 = x5 + x4
+                              x7 = x6 + x5
+                              x8 = x7 + x6
+                              x9 = x8 + x7
+                              x10 = x9 + x8
+                          in x10 * x10 ||])
+       -- x10 = 89x + 55y
+       -- x10^2 = 7921x^2 + 9790xy + 3025y^2
+       (\(x,y) -> 7921*x^2 + 9790*x*y + 3025*y^2)
+       (Just (\(x,y) d -> (d * (2*7921*x + 9790*y), d * (9790*x + 2*3025*y))))
     ,checkFDcontrol "complexity2"
-      $$(reverseAD @Double @Double
-           [|| \x0 -> let x1  = x0 + x0 + x0 + x0 + x0 - x0 - x0 - x0 ;
-                          x2  = x1 + x1 + x1 + x1 + x1 - x1 - x1 - x1 ;
-                          x3  = x2 + x2 + x2 + x2 + x2 - x2 - x2 - x2 ;
-                          x4  = x3 + x3 + x3 + x3 + x3 - x3 - x3 - x3 ;
-                          x5  = x4 + x4 + x4 + x4 + x4 - x4 - x4 - x4 ;
-                          x6  = x5 + x5 + x5 + x5 + x5 - x5 - x5 - x5 ;
-                          x7  = x6 + x6 + x6 + x6 + x6 - x6 - x6 - x6 ;
-                          x8  = x7 + x7 + x7 + x7 + x7 - x7 - x7 - x7 ;
-                          x9  = x8 + x8 + x8 + x8 + x8 - x8 - x8 - x8 ;
-                          x10 = x9 + x9 + x9 + x9 + x9 - x9 - x9 - x9
-                      in 0.000001 * x10 * x10 ||])
-      -- xn = 2 * x{n-1}
-      -- x10 = 2^10 * x
-      -- x10*x10 = 2^20 * x^2
-      -- The small constant is there so that finite differencing doesn't explode
-      (\x -> 0.000001 * 2^20 * x^2)
-      (Just (\x d -> 0.000001 * 2^21 * x * d))
+       $$(reverseAD @Double @Double
+            [|| \x0 -> let x1  = x0 + x0 + x0 + x0 + x0 - x0 - x0 - x0 ;
+                           x2  = x1 + x1 + x1 + x1 + x1 - x1 - x1 - x1 ;
+                           x3  = x2 + x2 + x2 + x2 + x2 - x2 - x2 - x2 ;
+                           x4  = x3 + x3 + x3 + x3 + x3 - x3 - x3 - x3 ;
+                           x5  = x4 + x4 + x4 + x4 + x4 - x4 - x4 - x4 ;
+                           x6  = x5 + x5 + x5 + x5 + x5 - x5 - x5 - x5 ;
+                           x7  = x6 + x6 + x6 + x6 + x6 - x6 - x6 - x6 ;
+                           x8  = x7 + x7 + x7 + x7 + x7 - x7 - x7 - x7 ;
+                           x9  = x8 + x8 + x8 + x8 + x8 - x8 - x8 - x8 ;
+                           x10 = x9 + x9 + x9 + x9 + x9 - x9 - x9 - x9
+                       in 0.000001 * x10 * x10 ||])
+       -- xn = 2 * x{n-1}
+       -- x10 = 2^10 * x
+       -- x10*x10 = 2^20 * x^2
+       -- The small constant is there so that finite differencing doesn't explode
+       (\x -> 0.000001 * 2^20 * x^2)
+       (Just (\x d -> 0.000001 * 2^21 * x * d))
     ]
