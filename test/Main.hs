@@ -191,4 +191,16 @@ main =
        (\(x,y) -> if x > y then x * y else x + y)
        (Just (\(x,y) d -> if x > y then (d * y, d * x) else (d, d)))
        NoFD
+    ,let control x0  = let f = \x -> if x < 10.0 then g (x * 0.6) + 1.0 else g (x * 0.1) + 2.0
+                           g = \x -> if x < 1.0 then x else f (x - 1.0) + 2.0
+                       in f x0
+     in
+     checkFDcontrol "recursive"
+       $$(reverseAD @Double @Double
+            [|| \x0 -> let f = \x -> if x < 10.0 then g (x * 0.6) + 1.0 else g (x * 0.1) + 2.0
+                           g = \x -> if x < 1.0 then x else f (x - 1.0) + 2.0
+                       in f x0 ||])
+       control
+       Nothing
+       YesFD
     ]

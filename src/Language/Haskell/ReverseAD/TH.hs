@@ -455,7 +455,9 @@ checkDecsNonRecursive decs = do
   -- TODO: mild quadratic behaviour with this notElem
   let nonRecursive :: [Name] -> Set Name -> Bool
       nonRecursive boundAfterThis frees = all (\name -> name `notElem` boundAfterThis) (toList frees)
-  if all (\((_, frees, _), boundAfterThis) -> nonRecursive boundAfterThis frees)
+  if all (\((_, frees, rhs), boundAfterThis) ->
+            case rhs of LamE (_:_) _ -> True
+                        _ -> nonRecursive boundAfterThis frees)
          (zip tups (tail (tails (map fst3 tups))))
     then return (Just tups)
     else return Nothing
