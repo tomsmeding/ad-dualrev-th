@@ -170,4 +170,9 @@ main =
        -- The small constant is there so that finite differencing doesn't explode
        (\x -> 0.000001 * 2^20 * x^2)
        (Just (\x d -> 0.000001 * 2^21 * x * d))
+    ,checkFDcontrol "conditional"
+       $$(reverseAD @(Double, Double) @Double
+            [|| \(x,y) -> if x > y then x * y else x + y ||])
+       (\(x,y) -> if x > y then x * y else x + y)
+       (Just (\(x,y) d -> if x > y then (d * y, d * x) else (d, d)))
     ]

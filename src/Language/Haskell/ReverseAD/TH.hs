@@ -7,6 +7,8 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS -Wno-incomplete-uni-patterns #-}
@@ -15,9 +17,11 @@ module Language.Haskell.ReverseAD.TH (
   KnownStructure,
 ) where
 
+import Control.Applicative (asum)
 import Control.Monad (forM)
 import Data.Bifunctor (second)
 import Data.Foldable (toList)
+import Data.Function ((&))
 import Data.List (tails)
 import Data.Int
 import Data.Proxy
@@ -258,15 +262,45 @@ ddr idName = \case
     return (letwrap (VarE funname `AppE` VarE argname `AppE` VarE outid))
 
   InfixE (Just e1) (VarE opname) (Just e2) -> do
-    let scal = LitE . RationalL
-    gradientfun <- if
-      | opname == '(+) -> return $ \_ -> [scal 1.0, scal 1.0]
-      | opname == '(-) -> return $ \_ -> [scal 1.0, scal (-1.0)]
-      | opname == '(*) -> return $ \[e1', e2'] -> [e2', e1']
-      | otherwise -> fail ("Unsupported infix operator " ++ show opname)
-    ddrOp idName [e1, e2]
-      (\[e1', e2'] -> InfixE (Just e1') (VarE opname) (Just e2'))
-      gradientfun
+    let handleNum = do
+          let num = LitE . IntegerL
+          if | opname == '(+) -> Just ((False, False), \_ _ -> pair (num 1) (num 1))
+             | opname == '(-) -> Just ((False, False), \_ _ -> pair (num 1) (num (-1)))
+             | opname == '(*) -> Just ((True, True), \x y -> pair y x)
+             | otherwise -> Nothing
+            & \case
+              Nothing -> Nothing
+              Just ((gxused, gyused), gradientfun) -> Just $ do
+                (letwrap, [x1name, x2name], outid) <- ddrList [e1, e2] idName
+                t1name <- newName "arg1"
+                t2name <- newName "arg2"
+                return $ letwrap $
+                  foldl AppE (VarE 'applyBinaryOp)
+                    [VarE x1name, VarE x2name
+                    ,LamE [VarP t1name, VarP t2name] $
+                       InfixE (Just (VarE t1name)) (VarE opname) (Just (VarE t2name))
+                    ,LamE [if gxused then VarP t1name else WildP
+                          ,if gyused then VarP t2name else WildP] $
+                       gradientfun (VarE t1name) (VarE t2name)
+                    ,VarE outid]
+
+        handleOrd = do
+          if opname `elem` ['(==), '(/=), '(<), '(>), '(<=), '(>=)]
+            then Just $ do
+              (letwrap, [x1name, x2name], outid) <- ddrList [e1, e2] idName
+              t1name <- newName "arg1"
+              t2name <- newName "arg2"
+              return $ letwrap $
+                pair (foldl AppE (VarE 'applyCmpOp)
+                        [VarE x1name, VarE x2name
+                        ,LamE [VarP t1name, VarP t2name] $
+                           InfixE (Just (VarE t1name)) (VarE opname) (Just (VarE t2name))])
+                     (VarE outid)
+            else Nothing
+
+    case asum [handleNum, handleOrd] of
+      Nothing -> fail ("Unsupported infix operator " ++ show opname)
+      Just act -> act
 
   e@InfixE{} -> fail $ "Unsupported operator section: " ++ show e
 
@@ -359,27 +393,33 @@ ddrList es idName = do
          ,map fst names
          ,out_index)
 
--- Arguments:
--- - input nextid
--- - arguments to the operation
--- - the operation itself (taking duplicable arguments)
--- - list of partial derivatives of the operation, assuming incoming adjoint 1 (taking
---   duplicable arguments)
--- Returns: (Dt[Double], Int)
-ddrOp :: QuoteFail m => Name -> [Exp] -> ([Exp] -> Exp) -> ([Exp] -> [Exp]) -> m Exp
-ddrOp idName args primal gradient = do
-  (letwrap, argnames, outid) <- ddrList args idName
-  let fste = AppE (VarE 'fst)
-      snde = AppE (VarE 'snd)
-      answer = primal (map (fste . VarE) argnames)
-      pderivs = gradient (map (fste . VarE) argnames)
-  let contriblist = [TupE [Just (fste (snde (VarE var))), Just (snde (snde (VarE var))), Just pderiv]
-                    | (var, pderiv) <- zip argnames pderivs]
-  return $ letwrap $
-    pair (pair answer
-               (pair (VarE outid)
-                     (AppE (ConE 'Contrib) (ListE contriblist))))
-         (InfixE (Just (VarE outid)) (VarE '(+)) (Just (LitE (IntegerL 1))))
+class NumOperation a where
+  type DualNum a = r | r -> a
+  applyBinaryOp
+    :: DualNum a -> DualNum a  -- arguments
+    -> (a -> a -> a)           -- primal
+    -> (a -> a -> (a, a))      -- gradient given inputs (assuming adjoint 1)
+    -> Int                     -- nextid
+    -> (DualNum a, Int)        -- output and nextid
+  applyCmpOp
+    :: DualNum a -> DualNum a  -- arguments
+    -> (a -> a -> Bool)        -- primal
+    -> Bool                    -- output
+
+instance NumOperation Double where
+  type DualNum Double = (Double, (Int, Contrib))
+  applyBinaryOp (x, (xi, xcb)) (y, (yi, ycb)) primal grad nextid =
+    let (dx, dy) = grad x y
+    in ((primal x y
+        ,(nextid
+         ,Contrib [(xi, xcb, dx), (yi, ycb, dy)]))
+       ,nextid + 1)
+  applyCmpOp (x, _) (y, _) f = f x y
+
+instance NumOperation Int where
+  type DualNum Int = Int
+  applyBinaryOp x y primal _ nextid = (primal x y, nextid)
+  applyCmpOp x y f = f x y
 
 -- | Differentiate a declaration, given a variable containing the next ID to
 -- generate. Modifies the declaration to bind the next ID to a new name, which
