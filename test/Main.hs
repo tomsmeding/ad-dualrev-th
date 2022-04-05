@@ -1,9 +1,7 @@
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# OPTIONS -Wno-incomplete-uni-patterns #-}
 module Main where
 
 import Prelude hiding ((^))
@@ -12,9 +10,9 @@ import qualified Prelude
 import Data.Proxy
 import Data.Type.Equality
 
+import ControlFun
 import FinDiff
 import ForwardAD
-import Language.Haskell.ReverseAD.TH
 import Test.Framework hiding (elements)
 
 
@@ -59,12 +57,11 @@ checkFDcontrol :: forall a b.
                   (Arbitrary a, Arbitrary b, Approx a, Approx b, Show a, Show b
                   ,FinDiff a, FinDiff b, Element a ~ Double, Element b ~ Double)
                => String
-               -> (a -> (b, b -> a))
-               -> (forall s. (Floating s, Ord s) => ReplaceElements a s -> ReplaceElements b s)
+               -> (a -> (b, b -> a), ControlFun a b)
                -> Maybe (a -> b -> a)
                -> DoCheckFinDiff
                -> Tree
-checkFDcontrol name program controlfun mcontrolgrad dofindiff
+checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
   | Refl <- replaceElementsId @a
   , Refl <- replaceElementsId @b
   = property name $ \x ->
@@ -108,47 +105,41 @@ main =
   changeArgs (\a -> a { maxSuccess = 10000 }) $
   tree "AD"
     [checkFDcontrol "id"
-       $$(reverseAD @Double @Double
+       $$(reverseADandControl @Double @Double
             [|| \x -> x ||])
-       (\x -> x)
        (Just (\_ d -> d))
        YesFD
     ,checkFDcontrol "plus"
-       $$(reverseAD @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double
             [|| \(x, y) -> x + y ||])
-       (\(x,y) -> x+y)
        (Just (\_ d -> (d,d)))
        YesFD
     ,checkFDcontrol "times"
-       $$(reverseAD @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double
             [|| \(x, y) -> x * y ||])
-       (\(x,y) -> x*y)
        (Just (\(x,y) d -> (y*d,x*d)))
        YesFD
     ,checkFDcontrol "let"
-       $$(reverseAD @Double @Double
+       $$(reverseADandControl @Double @Double
             [|| \x -> let y = 3.0 + x in x * y ||])
-       (\x -> x^2 + 3*x)
        (Just (\x d -> d * (2*x + 3)))
        YesFD
     ,checkFDcontrol "higher-order"
-       $$(reverseAD @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double
             [|| \(x,y) -> let f = \z -> x * z + y
                           in f y * f x ||])
-       (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
        (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
        YesFD
     ,checkFDcontrol "higher-order2"
-       $$(reverseAD @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double
             [|| \(x,y) -> let f = \z -> x * z + y
                               g = \f' u -> f' u * f x
                               h = g f
                           in h y ||])
-       (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
        (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
        YesFD
     ,checkFDcontrol "complexity"
-       $$(reverseAD @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double
             [|| \(x,y) -> let x1 = x + y
                               x2 = x1 + x
                               x3 = x2 + x1
@@ -162,11 +153,10 @@ main =
                           in x10 * x10 ||])
        -- x10 = 89x + 55y
        -- x10^2 = 7921x^2 + 9790xy + 3025y^2
-       (\(x,y) -> 7921*x^2 + 9790*x*y + 3025*y^2)
        (Just (\(x,y) d -> (d * (2*7921*x + 9790*y), d * (9790*x + 2*3025*y))))
        YesFD
     ,checkFDcontrol "complexity2"
-       $$(reverseAD @Double @Double
+       $$(reverseADandControl @Double @Double
             [|| \x0 -> let x1  = x0 + x0 + x0 + x0 + x0 - x0 - x0 - x0 ;
                            x2  = x1 + x1 + x1 + x1 + x1 - x1 - x1 - x1 ;
                            x3  = x2 + x2 + x2 + x2 + x2 - x2 - x2 - x2 ;
@@ -182,25 +172,18 @@ main =
        -- x10 = 2^10 * x
        -- x10*x10 = 2^20 * x^2
        -- The small constant is there so that finite differencing doesn't explode
-       (\x -> 0.000001 * 2^20 * x^2)
        (Just (\x d -> 0.000001 * 2^21 * x * d))
        YesFD
     ,checkFDcontrol "conditional"
-       $$(reverseAD @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double
             [|| \(x,y) -> if x > y then x * y else x + y ||])
-       (\(x,y) -> if x > y then x * y else x + y)
        (Just (\(x,y) d -> if x > y then (d * y, d * x) else (d, d)))
        NoFD
-    ,let control x0  = let f = \x -> if x < 10.0 then g (x * 0.6) + 1.0 else g (x * 0.1) + 2.0
-                           g = \x -> if x < 1.0 then x else f (x - 1.0) + 2.0
-                       in f x0
-     in
-     checkFDcontrol "recursive"
-       $$(reverseAD @Double @Double
+    ,checkFDcontrol "recursive"
+       $$(reverseADandControl @Double @Double
             [|| \x0 -> let f = \x -> if x < 10.0 then g (x * 0.6) + 1.0 else g (x * 0.1) + 2.0
                            g = \x -> if x < 1.0 then x else f (x - 1.0) + 2.0
                        in f x0 ||])
-       control
        Nothing
        YesFD
     ]
