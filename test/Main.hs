@@ -52,6 +52,9 @@ checkControl name program controlfun controlgrad =
     let (y1, df1) = program x
     in y1 ~= controlfun x && df1 adj ~= controlgrad x adj
 
+data DoCheckFinDiff = YesFD | NoFD
+  deriving (Show)
+
 checkFDcontrol :: forall a b.
                   (Arbitrary a, Arbitrary b, Approx a, Approx b, Show a, Show b
                   ,FinDiff a, FinDiff b, Element a ~ Double, Element b ~ Double)
@@ -59,8 +62,9 @@ checkFDcontrol :: forall a b.
                -> (a -> (b, b -> a))
                -> (forall s. (Floating s, Ord s) => ReplaceElements a s -> ReplaceElements b s)
                -> Maybe (a -> b -> a)
+               -> DoCheckFinDiff
                -> Tree
-checkFDcontrol name program controlfun mcontrolgrad
+checkFDcontrol name program controlfun mcontrolgrad dofindiff
   | Refl <- replaceElementsId @a
   , Refl <- replaceElementsId @b
   = property name $ \x ->
@@ -88,10 +92,13 @@ checkFDcontrol name program controlfun mcontrolgrad
                                  show jac ++ " /= " ++ show forwardJac)
                               (jac ~= forwardJac)])
          ++
-         [counterexample (refJacName ++ " /= findiffJac\n" ++
-                            show refJac ++ " /= " ++ show findiffJac)
-                         (refJac ~= findiffJac)
-         ,counterexample (refJacName ++ " /= programJac\n" ++
+         (case dofindiff of
+            YesFD -> [counterexample (refJacName ++ " /= findiffJac\n" ++
+                                        show refJac ++ " /= " ++ show findiffJac)
+                                     (refJac ~= findiffJac)]
+            NoFD -> [])
+         ++
+         [counterexample (refJacName ++ " /= programJac\n" ++
                             show refJac ++ " /= " ++ show programJac)
                          (refJac ~= programJac)]
 
@@ -105,27 +112,32 @@ main =
             [|| \x -> x ||])
        (\x -> x)
        (Just (\_ d -> d))
+       YesFD
     ,checkFDcontrol "plus"
        $$(reverseAD @(Double, Double) @Double
             [|| \(x, y) -> x + y ||])
        (\(x,y) -> x+y)
        (Just (\_ d -> (d,d)))
+       YesFD
     ,checkFDcontrol "times"
        $$(reverseAD @(Double, Double) @Double
             [|| \(x, y) -> x * y ||])
        (\(x,y) -> x*y)
        (Just (\(x,y) d -> (y*d,x*d)))
+       YesFD
     ,checkFDcontrol "let"
        $$(reverseAD @Double @Double
             [|| \x -> let y = 3.0 + x in x * y ||])
        (\x -> x^2 + 3*x)
        (Just (\x d -> d * (2*x + 3)))
+       YesFD
     ,checkFDcontrol "higher-order"
        $$(reverseAD @(Double, Double) @Double
             [|| \(x,y) -> let f = \z -> x * z + y
                           in f y * f x ||])
        (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
        (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
+       YesFD
     ,checkFDcontrol "higher-order2"
        $$(reverseAD @(Double, Double) @Double
             [|| \(x,y) -> let f = \z -> x * z + y
@@ -134,6 +146,7 @@ main =
                           in h y ||])
        (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
        (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
+       YesFD
     ,checkFDcontrol "complexity"
        $$(reverseAD @(Double, Double) @Double
             [|| \(x,y) -> let x1 = x + y
@@ -151,6 +164,7 @@ main =
        -- x10^2 = 7921x^2 + 9790xy + 3025y^2
        (\(x,y) -> 7921*x^2 + 9790*x*y + 3025*y^2)
        (Just (\(x,y) d -> (d * (2*7921*x + 9790*y), d * (9790*x + 2*3025*y))))
+       YesFD
     ,checkFDcontrol "complexity2"
        $$(reverseAD @Double @Double
             [|| \x0 -> let x1  = x0 + x0 + x0 + x0 + x0 - x0 - x0 - x0 ;
@@ -170,9 +184,11 @@ main =
        -- The small constant is there so that finite differencing doesn't explode
        (\x -> 0.000001 * 2^20 * x^2)
        (Just (\x d -> 0.000001 * 2^21 * x * d))
+       YesFD
     ,checkFDcontrol "conditional"
        $$(reverseAD @(Double, Double) @Double
             [|| \(x,y) -> if x > y then x * y else x + y ||])
        (\(x,y) -> if x > y then x * y else x + y)
        (Just (\(x,y) d -> if x > y then (d * y, d * x) else (d, d)))
+       NoFD
     ]
