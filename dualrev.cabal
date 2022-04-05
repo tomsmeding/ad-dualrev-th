@@ -30,7 +30,7 @@ library
     , vector
   default-language: Haskell2010
 
-test-suite ad-test
+test-suite test
   type: exitcode-stdio-1.0
   main-is: Main.hs
   hs-source-dirs: test
@@ -42,8 +42,9 @@ test-suite ad-test
     Test.Parallel
   ghc-options: -Wall -O2 -threaded -rtsopts
   build-depends:
-      base >=4.7 && <5
+      base >=4.7 && <4.17
     , dualrev
+    , clock
     , containers
     , QuickCheck
     , template-haskell

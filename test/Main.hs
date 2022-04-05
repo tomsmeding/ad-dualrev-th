@@ -101,7 +101,8 @@ checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
 
 main :: IO ()
 main =
-  runTests $
+  runTestsExit $
+  withShowDuration True $
   changeArgs (\a -> a { maxSuccess = 10000 }) $
   tree "AD"
     [checkFDcontrol "id"
