@@ -149,10 +149,10 @@ transform inpStruc outStruc (LamE [pat] expr) = do
   let composeLinearFuns :: [Exp] -> Exp
       composeLinearFuns [] = VarE 'PL.id
       composeLinearFuns l = foldl1 (\a b -> InfixE (Just a) (VarE '(PL..)) (Just b)) l
-  (reconstructExp, _) <- reconstruct inpStruc
-                                     (VarE argvar)
-                                     (VarE 'V.map `AppE` VarE 'snd `AppE` VarE vecname)
-                                     1
+  (reconstructExp, _, _) <- reconstruct inpStruc
+                                        (VarE argvar)
+                                        (VarE 'V.map `AppE` VarE 'snd `AppE` VarE vecname)
+                                        1
   return (LamE [VarP argvar] $
             LetE [ValD pat (NormalB inp) []
                  ,ValD (VarP idvar) (NormalB (SigE (LitE (IntegerL idnum)) (ConT ''Int))) []
@@ -212,20 +212,28 @@ deinterleave struc outexp = case struc of
 -- inexp :: s                          -- primal input (duplicable)
 -- vecexp :: Vector (Contrib, Double)  -- resolved input adjoint vector (duplicable)
 -- ~> result :: s                      -- final input adjoint
-reconstruct :: Quote m => Structure -> Exp -> Exp -> Integer -> m (Exp, Integer)
+-- In ID generation monad; also returns whether the inexp argument was actually used
+reconstruct :: Quote m => Structure -> Exp -> Exp -> Integer -> m (Exp, Integer, Bool)
 reconstruct struc inexp vecexp startid = case struc of
-  SDiscrete -> return (inexp, startid)
+  SDiscrete -> return (inexp, startid, True)
   SScalar -> return (InfixE (Just vecexp) (VarE '(V.!)) (Just (LitE (IntegerL startid)))
-                    ,startid + 1)
+                    ,startid + 1
+                    ,False)
   STuple strucs -> do
     let f startid' (struc', index) = do
           name <- newName ("x" ++ show index)
-          (recexp, nextid) <- reconstruct struc' (VarE name) vecexp startid'
-          return (nextid, (name, recexp))
-    (nextid, (names, recexps)) <- second unzip <$> mapAccumLM f startid (zip strucs [1::Int ..])
-    return (LetE [ValD (TupP (map VarP names)) (NormalB inexp) []] $
-              TupE (map Just recexps)
-           ,nextid)
+          (recexp, nextid, used) <- reconstruct struc' (VarE name) vecexp startid'
+          return (nextid, (name, recexp, used))
+    (nextid, (names, recexps, useds)) <-
+      second unzip3 <$> mapAccumLM f startid (zip strucs [1::Int ..])
+    if or useds
+      then return (LetE [ValD (TupP (zipWith (\n u -> if u then VarP n else WildP)
+                                             names useds))
+                              (NormalB inexp) []] $
+                     TupE (map Just recexps)
+                  ,nextid
+                  ,True)
+      else return (TupE (map Just recexps), nextid, False)
 
 -- Γ |- i : Int                        -- idName
 -- Γ |- t : a                          -- expression
