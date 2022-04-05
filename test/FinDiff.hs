@@ -2,6 +2,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
 
 -- | Supporting definitions for finite differencing in the test suite, as well
 -- as Jacobian computation using a function transformed with forward-ad,
@@ -12,29 +13,45 @@ module FinDiff (
   jacobianByFinDiff,
   jacobianByElts,
   finiteDifference,
-  FinDiff(Element)
+  FinDiff(..)
 ) where
 
 import Data.Proxy
 import Data.List (transpose)
 -- import qualified Data.Vector as V
+import Data.Type.Equality
 
 
 class FinDiff a where
   type Element a
-  elements :: a -> [Element a]
+  type ReplaceElements a s
+  elements' :: Proxy a -> ReplaceElements a s -> [s]
+
   -- | Returns any excess elements.
-  rebuild' :: [Element a] -> (a, [Element a])
+  rebuild' :: Proxy a -> [s] -> (ReplaceElements a s, [s])
+
   -- | The "one" element of the 'Element' type of this thing. For 'Double' this
   -- is @1.0@.
   oneElement :: Proxy a -> Element a
 
   zero :: a
 
+  replaceElements :: Proxy a -> ReplaceElements a s1 -> (s1 -> s2) -> ReplaceElements a s2
+
+  replaceElementsId :: ReplaceElements a (Element a) :~: a
+
+  elements :: a -> [Element a]
+  elements | Refl <- replaceElementsId @a = elements' (Proxy @a)
+
   -- | Rebuild a value from the list of elements. Assumes that the list has the
   -- right length.
   rebuild :: [Element a] -> a
-  rebuild = fst . rebuild'
+  rebuild | Refl <- replaceElementsId @a = fst . rebuild' (Proxy @a)
+
+  -- | Rebuild a value from a list of differently-typed elements. Assumes that
+  -- the list has the right length.
+  rebuildAs :: Proxy a -> [s] -> ReplaceElements a s
+  rebuildAs p = fst . rebuild' p
 
   oneHotVecs :: [a]
   oneHotVecs = go id (elements (zero @a))
@@ -45,26 +62,38 @@ class FinDiff a where
 -- | Element type is assumed to be Double
 instance FinDiff () where
   type Element () = Double
-  elements _ = []
-  rebuild' l = ((), l)
+  type ReplaceElements () s = ()
+  elements' _ () = []
+  rebuild' _ l = ((), l)
   oneElement _ = 1.0
   zero = ()
+  replaceElements _ () _ = ()
+  replaceElementsId = Refl
 
 instance (FinDiff a, FinDiff b, Element a ~ Element b) => FinDiff (a, b) where
   type Element (a, b) = Element a
-  elements (x, y) = elements x ++ elements y
-  rebuild' l = let (x, l1) = rebuild' l
-                   (y, l2) = rebuild' l1
-               in ((x, y), l2)
+  type ReplaceElements (a, b) s = (ReplaceElements a s, ReplaceElements b s)
+  elements' _ (x, y) = elements' (Proxy @a) x ++ elements' (Proxy @b) y
+  rebuild' _ l = let (x, l1) = rebuild' (Proxy @a) l
+                     (y, l2) = rebuild' (Proxy @b) l1
+                 in ((x, y), l2)
   oneElement _ = oneElement (Proxy @a)
   zero = (zero, zero)
+  replaceElements _ (x, y) f = (replaceElements (Proxy @a) x f, replaceElements (Proxy @b) y f)
+  replaceElementsId
+    | Refl <- replaceElementsId @a
+    , Refl <- replaceElementsId @b
+    = Refl
 
 instance FinDiff Double where
   type Element Double = Double
-  elements x = [x]
-  rebuild' l = (head l, tail l)
+  type ReplaceElements Double s = s
+  elements' _ x = [x]
+  rebuild' _ l = (head l, tail l)
   oneElement _ = 1.0
   zero = 0.0
+  replaceElements _ x f = f x
+  replaceElementsId = Refl
 
 -- instance KnownNat n => FinDiff (Vect n) where
 --   type Element (Vect n) = Double

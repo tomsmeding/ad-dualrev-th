@@ -36,6 +36,7 @@ test-suite ad-test
   hs-source-dirs: test
   other-modules:
     FinDiff
+    ForwardAD
     Test.Framework
     Test.Parallel
   ghc-options: -Wall -O2 -threaded -rtsopts

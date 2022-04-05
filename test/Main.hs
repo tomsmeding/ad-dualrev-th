@@ -1,14 +1,21 @@
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# OPTIONS -Wno-incomplete-uni-patterns #-}
 module Main where
 
 import Prelude hiding ((^))
 import qualified Prelude
 
+import Data.Proxy
+import Data.Type.Equality
+
 import FinDiff
+import ForwardAD
 import Language.Haskell.ReverseAD.TH
-import Test.Framework
+import Test.Framework hiding (elements)
 
 
 (^) :: Num a => a -> Int -> a
@@ -45,21 +52,48 @@ checkControl name program controlfun controlgrad =
     let (y1, df1) = program x
     in y1 ~= controlfun x && df1 adj ~= controlgrad x adj
 
-checkFDcontrol :: (Arbitrary a, Arbitrary b, Approx a, Approx b, Show a, Show b
+checkFDcontrol :: forall a b.
+                  (Arbitrary a, Arbitrary b, Approx a, Approx b, Show a, Show b
                   ,FinDiff a, FinDiff b, Element a ~ Double, Element b ~ Double)
-               => String -> (a -> (b, b -> a)) -> (a -> b) -> (a -> b -> a) -> Tree
-checkFDcontrol name program controlfun controlgrad =
-  property name $ \x ->
-    let controlJac = jacobianByRows controlgrad x
-        programJac = jacobianByRows (snd . program) x
-        findiffJac = jacobianByFinDiff controlfun x
-    in counterexample ("controlJac /= programJac\n" ++
-                         show controlJac ++ " /= " ++ show programJac)
-                      (controlJac ~= programJac)
-       .&&.
-       counterexample ("controlJac /= findiffJac\n" ++
-                         show controlJac ++ " /= " ++ show findiffJac)
-                      (controlJac ~= findiffJac)
+               => String
+               -> (a -> (b, b -> a))
+               -> (forall s. (Floating s, Ord s) => ReplaceElements a s -> ReplaceElements b s)
+               -> Maybe (a -> b -> a)
+               -> Tree
+checkFDcontrol name program controlfun mcontrolgrad
+  | Refl <- replaceElementsId @a
+  , Refl <- replaceElementsId @b
+  = property name $ \x ->
+      let controlJac = (`jacobianByRows` x) <$> mcontrolgrad
+          programJac = jacobianByRows (snd . program) x
+          findiffJac = jacobianByFinDiff (controlfun @Double) x
+          forwardJac = jacobianByCols
+                          (\input tangent ->
+                              rebuild @b . map snd $
+                              forwardAD
+                                (\(inelts :: [s]) ->
+                                   elements' (Proxy @b)
+                                     (controlfun @s
+                                        (rebuildAs (Proxy @a) inelts)))
+                                (zip (elements @a input) (elements @a tangent)))
+                          x
+          (refJacName, refJac) = case controlJac of
+                                   Nothing -> ("forwardJac", forwardJac)
+                                   Just jac -> ("controlJac", jac)
+      in conjoin $
+         (case controlJac of
+            Nothing -> []
+            Just jac ->
+              [counterexample ("controlJac /= forwardJac\n" ++
+                                 show jac ++ " /= " ++ show forwardJac)
+                              (jac ~= forwardJac)])
+         ++
+         [counterexample (refJacName ++ " /= findiffJac\n" ++
+                            show refJac ++ " /= " ++ show findiffJac)
+                         (refJac ~= findiffJac)
+         ,counterexample (refJacName ++ " /= programJac\n" ++
+                            show refJac ++ " /= " ++ show programJac)
+                         (refJac ~= programJac)]
 
 main :: IO ()
 main =
@@ -70,28 +104,28 @@ main =
        $$(reverseAD @Double @Double
             [|| \x -> x ||])
        (\x -> x)
-       (\_ d -> d)
+       (Just (\_ d -> d))
     ,checkFDcontrol "plus"
        $$(reverseAD @(Double, Double) @Double
             [|| \(x, y) -> x + y ||])
        (\(x,y) -> x+y)
-       (\_ d -> (d,d))
+       (Just (\_ d -> (d,d)))
     ,checkFDcontrol "times"
        $$(reverseAD @(Double, Double) @Double
             [|| \(x, y) -> x * y ||])
        (\(x,y) -> x*y)
-       (\(x,y) d -> (y*d,x*d))
+       (Just (\(x,y) d -> (y*d,x*d)))
     ,checkFDcontrol "let"
       $$(reverseAD @Double @Double
            [|| \x -> let y = 3.0 + x in x * y ||])
       (\x -> x^2 + 3*x)
-      (\x d -> d * (2*x + 3))
+      (Just (\x d -> d * (2*x + 3)))
     ,checkFDcontrol "higher-order"
       $$(reverseAD @(Double, Double) @Double
            [|| \(x,y) -> let f = \z -> x * z + y
                          in f y * f x ||])
       (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
-      (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y)))
+      (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
     ,checkFDcontrol "higher-order2"
       $$(reverseAD @(Double, Double) @Double
            [|| \(x,y) -> let f = \z -> x * z + y
@@ -99,7 +133,7 @@ main =
                              h = g f
                          in h y ||])
       (\(x,y) -> x^3*y + x^2*y + x*y^2 + y^2)
-      (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y)))
+      (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
     ,checkFDcontrol "complexity"
       $$(reverseAD @(Double, Double) @Double
            [|| \(x,y) -> let x1 = x + y
@@ -116,7 +150,7 @@ main =
       -- x10 = 89x + 55y
       -- x10^2 = 7921x^2 + 9790xy + 3025y^2
       (\(x,y) -> 7921*x^2 + 9790*x*y + 3025*y^2)
-      (\(x,y) d -> (d * (2*7921*x + 9790*y), d * (9790*x + 2*3025*y)))
+      (Just (\(x,y) d -> (d * (2*7921*x + 9790*y), d * (9790*x + 2*3025*y))))
     ,checkFDcontrol "complexity2"
       $$(reverseAD @Double @Double
            [|| \x0 -> let x1  = x0 + x0 + x0 + x0 + x0 - x0 - x0 - x0 ;
@@ -135,5 +169,5 @@ main =
       -- x10*x10 = 2^20 * x^2
       -- The small constant is there so that finite differencing doesn't explode
       (\x -> 0.000001 * 2^20 * x^2)
-      (\x d -> 0.000001 * 2^21 * x * d)
+      (Just (\x d -> 0.000001 * 2^21 * x * d))
     ]
