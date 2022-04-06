@@ -65,7 +65,7 @@ checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
   | Refl <- replaceElementsId @a
   , Refl <- replaceElementsId @b
   = property name $ \x ->
-      let refout = controlfun x
+      let refout = controlfun @Double x
           controlJac = (\df -> jacobianByRows refout df x) <$> mcontrolgrad
           programJac = jacobianByRows refout (snd . program) x
           findiffJac = jacobianByFinDiff refout (controlfun @Double) x
@@ -134,8 +134,8 @@ main =
        YesFD
     ,checkFDcontrol "higher-order2"
        $$(reverseADandControl @(Double, Double) @Double
-            [|| \(x,y) -> let f = \z -> x * z + y
-                              g = \f' u -> f' u * f x
+            [|| \(x,y) -> let f z = x * z + y
+                              g f' u = f' u * f x
                               h = g f
                           in h y ||])
        (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))

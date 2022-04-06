@@ -372,13 +372,14 @@ ddr idName = \case
     return (LetE [ValD (TupP [VarP boolName, VarP idName1]) (NormalB e1') []]
               (CondE (VarE boolName) e2' e3'))
 
-  LetE decs body ->
-    checkDecsNonRecursive decs >>= \case
+  LetE decs body -> do
+    decs' <- mapM desugarDec decs
+    checkDecsNonRecursive decs' >>= \case
       Just _ -> do
-        (decs', idName') <- transDecs decs idName
+        (decs'', idName') <- transDecs decs' idName
         body' <- ddr idName' body
-        return (LetE decs' body')
-      Nothing -> notSupported "Recursive or non-variable let-bindings" (Just (show (LetE decs body)))
+        return (LetE decs'' body')
+      Nothing -> notSupported "Recursive or non-variable let-bindings" (Just (show (LetE decs' body)))
 
   CaseE expr matches -> do
     (letwrap, [evar], outid) <- ddrList [expr] idName
@@ -503,6 +504,35 @@ instance NumOperation Int where
   type DualNum Int = Int
   applyBinaryOp x y primal _ nextid = (primal x y, nextid)
   applyCmpOp x y f = f x y
+
+desugarDec :: QuoteFail m => Dec -> m Dec
+desugarDec = \case
+  dec@(ValD (VarP _) (NormalB _) []) -> return $ dec
+
+  FunD _ [] -> fail "Function declaration with empty list of clauses?"
+
+  FunD name clauses
+    | not (allEqual [length pats | Clause pats _ _ <- clauses])
+    -> fail "Clauses of a function declaration do not all have the same number of arguments"
+    | not (and [null decs | Clause _ _ decs <- clauses])
+    -> fail $ "Where blocks not supported in declaration of " ++ show name
+    | length [() | Clause _ (NormalB _) _ <- clauses] /= length clauses
+    -> fail $ "Guards not supported in declaration of " ++ show name
+    | otherwise
+    -> do
+      let nargs = head [length pats | Clause pats _ _ <- clauses]
+      argnames <- mapM (\i -> newName ("arg" ++ show i)) [1..nargs]
+      let body = LamE (map VarP argnames) $
+                   CaseE (TupE (map (Just . VarE) argnames))
+                     [Match (TupP ps) (NormalB rhs) []
+                     | Clause ps ~(NormalB rhs) ~[] <- clauses]
+      return $ ValD (VarP name) (NormalB body) []
+
+  dec -> fail $ "Only simple let bindings supported in reverseAD: " ++ show dec
+  where
+    allEqual :: Eq a => [a] -> Bool
+    allEqual [] = True
+    allEqual (x:xs) = all (== x) xs
 
 -- | Differentiate a declaration, given a variable containing the next ID to
 -- generate. Modifies the declaration to bind the next ID to a new name, which
