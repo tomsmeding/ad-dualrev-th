@@ -380,6 +380,20 @@ ddr idName = \case
         return (LetE decs' body')
       Nothing -> notSupported "Recursive or non-variable let-bindings" (Just (show (LetE decs body)))
 
+  CaseE expr matches -> do
+    (letwrap, [evar], outid) <- ddrList [expr] idName
+    matches' <- sequence
+      [case mat of
+         Match pat (NormalB rhs) [] -> do
+           pat' <- ddrPat pat
+           rhs' <- ddr outid rhs
+           return (pat', rhs')
+         _ -> fail "Where blocks or guards not supported in case expressions"
+      | mat <- matches]
+    return $ letwrap $
+      CaseE (VarE evar)
+        [Match pat (NormalB rhs) [] | (pat, rhs) <- matches']
+
   ListE es -> do
     (letwrap, vars, outid) <- ddrList es idName
     return (letwrap (pair (ListE (map VarE vars))
@@ -401,7 +415,6 @@ ddr idName = \case
   e@UnboxedTupE{} -> notSupported "Unboxed tuples" (Just (show e))
   e@UnboxedSumE{} -> notSupported "Unboxed sums" (Just (show e))
   e@MultiIfE{} -> notSupported "Multi-way ifs" (Just (show e))
-  e@CaseE{} -> notSupported "Case expressions" (Just (show e))
   e@DoE{} -> notSupported "Do blocks" (Just (show e))
   e@MDoE{} -> notSupported "MDo blocks" (Just (show e))
   e@CompE{} -> notSupported "List comprehensions" (Just (show e))
@@ -437,6 +450,31 @@ ddrList es idName = do
                | ((nx, ni), e) <- binds]
          ,map fst names
          ,out_index)
+
+ddrPat :: MonadFail m => Pat -> m Pat
+ddrPat = \case
+  LitP{} -> fail "Literals in patterns unsupported"
+  p@VarP{} -> return p
+  TupP ps -> TupP <$> traverse ddrPat ps
+  UnboxedTupP ps -> UnboxedTupP <$> traverse ddrPat ps
+  p@UnboxedSumP{} -> notSupported "Unboxed sums" (Just (show p))
+  p@(ConP name tyapps args)
+    | not (null tyapps) -> notSupported "Type applications in patterns" (Just (show p))
+    | name `elem` ['(:), '[]] -> ConP name [] <$> traverse ddrPat args
+    | otherwise -> notSupported "This constructor in a pattern" (Just (show name))
+  InfixP p1 name p2
+    | name == '(:) -> InfixP <$> ddrPat p1 <*> return name <*> ddrPat p2
+    | otherwise -> notSupported "This constructor in a pattern" (Just (show name))
+  p@UInfixP{} -> notSupported "UInfix patterns" (Just (show p))
+  ParensP p -> ParensP <$> ddrPat p
+  p@TildeP{} -> notSupported "Irrefutable patterns" (Just (show p))
+  p@BangP{} -> notSupported "Bang patterns" (Just (show p))
+  AsP name p -> AsP name <$> ddrPat p
+  WildP -> return WildP
+  p@RecP{} -> notSupported "Records" (Just (show p))
+  ListP ps -> ListP <$> traverse ddrPat ps
+  p@SigP{} -> notSupported "Type signatures in patterns, because then I need to rewrite types and I'm lazy" (Just (show p))
+  p@ViewP{} -> notSupported "View patterns" (Just (show p))
 
 class NumOperation a where
   type DualNum a = r | r -> a
@@ -476,7 +514,7 @@ transDec dec idName = case dec of
     body' <- ddr idName body
     return (ValD (TupP [VarP name, VarP idName1]) (NormalB body') [], idName1)
 
-  _ -> fail $ "Only plain variable let-bindings (without type-signatures!) are supported in reverseAD: " ++ show dec
+  _ -> fail $ "How did this declaration get through desugaring? " ++ show dec
 
 -- | `sequence 'transDec'`
 transDecs :: QuoteFail m => [Dec] -> Name -> m ([Dec], Name)
@@ -570,7 +608,10 @@ freeVars = \case
     checkDecsNonRecursive decs >>= \case
         Just tups -> (Set.\\) <$> freeVars body <*> pure (Set.fromList (map fst3 tups))
         Nothing -> fail $ "Recursive declarations in let unsupported: " ++ show (LetE decs body)
-  e@CaseE{} -> notSupported "Case expressions" (Just (show e))
+  CaseE e ms -> (<>) <$> freeVars e <*> combine (map go ms)
+    where go :: MonadFail m => Match -> m (Set Name)
+          go (Match pat (NormalB rhs) []) = (Set.\\) <$> freeVars rhs <*> boundVars pat
+          go mat = fail $ "Unsupported match in case: " ++ show mat
   e@DoE{} -> notSupported "Do blocks" (Just (show e))
   e@MDoE{} -> notSupported "MDo blocks" (Just (show e))
   e@CompE{} -> notSupported "List comprehensions" (Just (show e))

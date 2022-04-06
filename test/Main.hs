@@ -191,12 +191,12 @@ main =
     ,checkFDcontrol "list constr"
        $$(reverseADandControl @Double @[Double]
             [|| \x -> 2.0 * x : 3.0 * x : [x, x + 1.0] ||])
-       (Just (\_ [d1, d2, d3, d4] -> 2*d1 + 3*d2 + d3 + d4))
+       (Just (\_ d -> sum (zipWith (*) [2,3,1,1] d)))
        YesFD
-    -- ,checkFDcontrol "list case"
-    --    $$(reverseADandControl @[Double] @Double
-    --         [|| \l -> case l of [] -> 2.0
-    --                             x : xs -> x + 3.0 ||])
-    --    Nothing
-    --    YesFD
+    ,checkFDcontrol "list case"
+       $$(reverseADandControl @[Double] @Double
+            [|| \l -> case l of [] -> 2.0
+                                x : _ -> x + 3.0 ||])
+       Nothing
+       YesFD
     ]
