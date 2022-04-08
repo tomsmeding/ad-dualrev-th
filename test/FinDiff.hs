@@ -16,6 +16,7 @@ module FinDiff (
   FinDiff(..)
 ) where
 
+import Data.Monoid (Sum(..))
 import Data.Proxy
 import Data.List (transpose)
 -- import qualified Data.Vector as V
@@ -121,6 +122,16 @@ instance FinDiff a => FinDiff [a] where
   oneElement _ = oneElement (Proxy @a)
   zero p refl = map (zero p) refl
   replaceElements _ f l = map (replaceElements (Proxy @a) f) l
+  replaceElementsId | Refl <- replaceElementsId @a = Refl
+
+instance FinDiff a => FinDiff (Sum a) where
+  type Element (Sum a) = Element a
+  type ReplaceElements (Sum a) s = Sum (ReplaceElements a s)
+  elements' _ (Sum x) = elements' (Proxy @a) x
+  rebuild' _ p (Sum ref) elts = let (x, rest) = rebuild' (Proxy @a) p ref elts in (Sum x, rest)
+  oneElement _ = oneElement (Proxy @a)
+  zero p (Sum ref) = Sum (zero p ref)
+  replaceElements _ f (Sum x) = Sum (replaceElements (Proxy @a) f x)
   replaceElementsId | Refl <- replaceElementsId @a = Refl
 
 -- | Given the reverse derivative of some function of type @a -> b@, return the

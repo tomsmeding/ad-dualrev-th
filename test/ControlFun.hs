@@ -5,7 +5,7 @@
     separate module from where it is used. -}
 module ControlFun where
 
-import Language.Haskell.TH (Quote, Code)
+import Language.Haskell.TH (Q, Code)
 import Language.Haskell.TH.Syntax (unTypeCode, unsafeCodeCoerce)
 
 import FinDiff
@@ -15,9 +15,9 @@ import Language.Haskell.ReverseAD.TH
 newtype ControlFun a b = ControlFun (forall s. (Floating s, Ord s) => ReplaceElements a s -> ReplaceElements b s)
 
 reverseADandControl
-  :: forall a b m. (KnownStructure a, KnownStructure b, Quote m, MonadFail m)
-  => Code m (a -> b)
-  -> Code m (a -> (b, b -> a), ControlFun a b)
+  :: forall a b. (KnownStructure a, KnownStructure b)
+  => Code Q (a -> b)
+  -> Code Q (a -> (b, b -> a), ControlFun a b)
 reverseADandControl program =
   -- The code coercion here goes from `a -> b` to
   -- `ReplaceElements a s -> ReplaceElements b s`, which is fine if the

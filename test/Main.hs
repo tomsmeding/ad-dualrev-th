@@ -7,6 +7,7 @@ module Main where
 import Prelude hiding ((^))
 import qualified Prelude
 
+import Data.Monoid (Sum(..))
 import Data.Proxy
 import Data.Type.Equality
 
@@ -36,6 +37,9 @@ instance (Approx a, Approx b) => Approx (a, b) where
 instance Approx a => Approx [a] where
   approx absdelta reldelta l1 l2 =
     foldr (&&) True (zipWith (approx absdelta reldelta) l1 l2)
+
+instance Approx a => Approx (Sum a) where
+  approx absdelta reldelta (Sum a) (Sum b) = approx absdelta reldelta a b
 
 (~=) :: Approx a => a -> a -> Bool
 (~=) = approx 0.01 0.01
@@ -198,5 +202,10 @@ main =
             [|| \l -> case l of [] -> 2.0
                                 x : _ -> x + 3.0 ||])
        Nothing
+       YesFD
+    ,checkFDcontrol "Sum newtype"
+       $$(reverseADandControl @(Sum Double) @Double
+            [|| \s -> case s of Sum x -> 2 * x ||])
+       (Just (\(Sum x) d -> Sum (2 * x * d)))
        YesFD
     ]
