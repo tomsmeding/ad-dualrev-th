@@ -1,14 +1,19 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE LinearTypes #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
+{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS -Wno-incomplete-uni-patterns #-}
@@ -19,6 +24,7 @@ module Language.Haskell.ReverseAD.TH (
 
 import Control.Applicative (asum)
 import Control.Monad (forM, zipWithM)
+import Data.Coerce
 import Data.Foldable (toList)
 import Data.Function ((&))
 import Data.List (tails, mapAccumL)
@@ -26,6 +32,7 @@ import Data.Int
 import Data.Proxy
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Some
 import qualified Data.Vector as V
 import Data.Word
 import GHC.TypeLits (TypeError, ErrorMessage(Text))
@@ -45,6 +52,7 @@ type QuoteFail m = (Quote m, MonadFail m)
 -- Dt[(a, b)] = (Dt[a], Dt[b])
 -- Dt[a -> b] = a -> Int -> (Dt[b], Int)
 -- Dt[Int] = Int
+-- Dt[Newtype a] = Newtype (Dt[a])
 --
 -- Dt[eps] = eps
 -- Dt[Γ, x : a] = Dt[Γ], x : Dt[a]
@@ -100,32 +108,60 @@ addContrib i cb adj arr =
     GA.set i (cb, acc + adj) arr1
 
 
-data Structure = SDiscrete | SScalar | STuple [Structure] | SList Structure
-  deriving (Show)
+type family TupleOfList list where
+  TupleOfList '[] = ()
+  TupleOfList '[a,b] = (a,b)
+  TupleOfList '[a,b,c] = (a,b,c)
+  TupleOfList '[a,b,c,d] = (a,b,c,d)
+  TupleOfList '[a,b,c,d,e] = (a,b,c,d,e)
 
--- TODO: use 'Language.Haskell.TH.reifyType' for this
-class KnownStructure a where knownStructure :: Proxy a -> Structure
-instance KnownStructure Int where knownStructure _ = SDiscrete
-instance KnownStructure Int8 where knownStructure _ = SDiscrete
-instance KnownStructure Int16 where knownStructure _ = SDiscrete
-instance KnownStructure Int32 where knownStructure _ = SDiscrete
-instance KnownStructure Int64 where knownStructure _ = SDiscrete
-instance KnownStructure Word where knownStructure _ = SDiscrete
-instance KnownStructure Word8 where knownStructure _ = SDiscrete
-instance KnownStructure Word16 where knownStructure _ = SDiscrete
-instance KnownStructure Word32 where knownStructure _ = SDiscrete
-instance KnownStructure Word64 where knownStructure _ = SDiscrete
-instance KnownStructure () where knownStructure _ = SDiscrete
+data HList f list where
+  HNil :: HList f '[]
+  HCons :: f a -> HList f list -> HList f (a ': list)
+deriving instance (forall a. Show (f a)) => Show (HList f list)
+
+fromHList :: HList f list -> [Some f]
+fromHList HNil = []
+fromHList (HCons x xs) = Some x : fromHList xs
+
+data Structure a where
+  SDiscrete :: Structure a
+  SScalar :: Structure Double
+  STuple :: HList Structure list -> Structure (TupleOfList list)
+  SList :: Structure a -> Structure [a]
+  SCoercible :: Coercible a b => Structure a -> Structure b
+deriving instance Show (Structure a)
+
+class KnownStructure a where knownStructure :: Structure a
+
+instance KnownStructure Int where knownStructure = SDiscrete
+instance KnownStructure Int8 where knownStructure = SDiscrete
+instance KnownStructure Int16 where knownStructure = SDiscrete
+instance KnownStructure Int32 where knownStructure = SDiscrete
+instance KnownStructure Int64 where knownStructure = SDiscrete
+instance KnownStructure Word where knownStructure = SDiscrete
+instance KnownStructure Word8 where knownStructure = SDiscrete
+instance KnownStructure Word16 where knownStructure = SDiscrete
+instance KnownStructure Word32 where knownStructure = SDiscrete
+instance KnownStructure Word64 where knownStructure = SDiscrete
+instance KnownStructure () where knownStructure = SDiscrete
+
 -- instance KnownStructure Float where knownStructure _ = SScalar
 instance TypeError ('Text "Only Double is an active type for now (Float isn't)") => KnownStructure Float where knownStructure _ = undefined
 instance KnownStructure Double where knownStructure _ = SScalar
+
 instance (KnownStructure a, KnownStructure b) => KnownStructure (a, b) where
   knownStructure _ = STuple [knownStructure (Proxy @a), knownStructure (Proxy @b)]
 instance (KnownStructure a, KnownStructure b, KnownStructure c) => KnownStructure (a, b, c) where
   knownStructure _ = STuple [knownStructure (Proxy @a), knownStructure (Proxy @b), knownStructure (Proxy @c)]
 instance (KnownStructure a, KnownStructure b, KnownStructure c, KnownStructure d) => KnownStructure (a, b, c, d) where
   knownStructure _ = STuple [knownStructure (Proxy @a), knownStructure (Proxy @b), knownStructure (Proxy @c), knownStructure (Proxy @d)]
-instance KnownStructure a => KnownStructure [a] where knownStructure _ = SList (knownStructure (Proxy @a))
+
+instance KnownStructure a => KnownStructure [a] where
+  knownStructure _ = SList (knownStructure (Proxy @a))
+
+instance {-# OVERLAPPABLE #-} (Coercible a (f a), KnownStructure a) => KnownStructure (f a) where
+  knownStructure _ = SCoercible (knownStructure (Proxy @a))
 
 -- | Use as follows:
 --
@@ -139,7 +175,7 @@ reverseAD (examineCode -> inputCode) =
     ex <- unType <$> inputCode
     transform (knownStructure (Proxy @a)) (knownStructure (Proxy @b)) ex
 
-transform :: QuoteFail m => Structure -> Structure -> Exp -> m Exp
+transform :: QuoteFail m => Structure inp -> Structure out -> Exp -> m Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
   argvar <- newName "arg"
   onevar <- newName "one"
@@ -197,7 +233,7 @@ deinterleaveList f l =
 -- outexp :: Dt[a]                            -- expression returning the output of the transformed program
 -- result :: (a                               -- primal result
 --           ,a -> BuildState -o BuildState)  -- given adjoint, add initial contributions
-deinterleave :: Quote m => Structure -> Exp -> m Exp
+deinterleave :: Quote m => Structure out -> Exp -> m Exp
 deinterleave topstruc outexp = case topstruc of
   SDiscrete -> return (pair outexp (LamE [WildP] (VarE 'PL.id)))
   SScalar -> do
@@ -232,6 +268,16 @@ deinterleave topstruc outexp = case topstruc of
               `AppE` LamE [VarP argvar] body
               `AppE` outexp
 
+  SCoercible struc -> do
+    expr <- deinterleave struc (AppE (VarE 'coerce) outexp)
+    primalname <- newName "primal"
+    dualname <- newName "dualf"
+    return $ CaseE expr
+      [Match (TupP [VarP primalname, VarP dualname])
+             (NormalB (pair (AppE (VarE 'coerce) (VarE primalname))
+                            (InfixE (Just (VarE dualname)) (VarE '(.)) (Just (VarE 'coerce)))))
+             []]
+
 reconstructList :: (Int -> s -> (s, Int)) -> [s] -> Int -> ([s], Int)
 reconstructList f primal i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 primal)
 
@@ -241,7 +287,7 @@ reconstructList f primal i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 primal)
 -- startid :: Name Int                 -- first ID in this substructure
 -- ~> result :: (s, Int)               -- final input adjoint plus next ID after this substructure
 -- In ID generation monad; also returns whether the inexp argument was actually used
-reconstruct :: Quote m => Structure -> Exp -> Exp -> Name -> m (Exp, Bool)
+reconstruct :: Quote m => Structure inp -> Exp -> Exp -> Name -> m (Exp, Bool)
 reconstruct topstruc inexp vecexp startid = case topstruc of
   SDiscrete -> return (pair inexp (VarE startid), True)
   SScalar -> return (pair (InfixE (Just vecexp) (VarE '(V.!)) (Just (VarE startid)))
@@ -581,7 +627,7 @@ numberList f l i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 l)
 -- input :: a
 -- nextid :: Name Int
 -- result :: (Dt[a], Int)
-numberInput :: Quote m => Structure -> Exp -> Name -> m Exp
+numberInput :: Quote m => Structure inp -> Exp -> Name -> m Exp
 numberInput topstruc input nextid = case topstruc of
   SDiscrete -> return (pair input (VarE nextid))
   SScalar -> return $

@@ -1,16 +1,17 @@
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE RankNTypes #-}
 module Main where
 
-import Language.Haskell.TH (Quote, Code)
-
-import qualified Numeric.AD as AD
-import qualified Language.Haskell.ReverseAD.TH as DR
+import DFunction
 
 
-newtype Function m a b = Function (forall s. (Floating s, Ord s) => Code m ([s] -> [s]))
+newtype FMult s = FMult (s, s)
+fmult :: DFunction FMult
+fmult = $$(makeFunction [|| GenericFunction (\arg -> case arg of FMult (x, y) -> x * y) ||])
 
--- radWithTH :: Function a b -> a -> (b, b -> a)
--- radWithTH
+-- newtype FDotProd s = FDotProd ([s], [s])
+-- fdotprod :: DFunction FDotProd
+-- fdotprod = $$(makeFunction (GenericFunction (\x -> )))
 
 main :: IO ()
 main = return ()
