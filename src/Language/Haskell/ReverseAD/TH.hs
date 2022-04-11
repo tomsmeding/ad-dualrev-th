@@ -19,6 +19,7 @@
 {-# OPTIONS -Wno-incomplete-uni-patterns #-}
 module Language.Haskell.ReverseAD.TH (
   reverseAD,
+  useTypeForReverseAD,
   KnownStructure,
 ) where
 
@@ -41,7 +42,7 @@ import Language.Haskell.TH
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
--- import Control.Monad.IO.Class
+import Control.Monad.IO.Class
 -- import Debug.Trace
 
 import qualified Data.Array.Growable as GA
@@ -135,7 +136,11 @@ data Structure a where
   SScalar :: Structure Double
   STuple :: HList Structure list -> Structure (TupleOfList list)
   SList :: Structure a -> Structure [a]
-  SCoercible :: Coercible a b => Type {- b -} -> Structure a -> Structure b
+  SCoercible :: Coercible a b
+             => Type -- type constructor of b (not yet applied to type arguments)
+             -> Int  -- number of type arguments of the type constructor of b
+             -> Structure a
+             -> Structure b
 deriving instance Show (Structure a)
 
 class KnownStructure a where knownStructure :: Structure a
@@ -146,7 +151,7 @@ structureType = \case
   SScalar -> ConT ''Double
   STuple (fromHList -> list) -> foldl AppT (TupleT (length list)) (map (\(Some s) -> structureType s) list)
   SList s -> AppT ListT (structureType s)
-  SCoercible t _ -> t
+  SCoercible t ntyvars _ -> iterate (`AppT` WildCardT) t !! ntyvars
 
 instance KnownStructure Int where knownStructure = SDiscrete (ConT ''Int)
 instance KnownStructure Int8 where knownStructure = SDiscrete (ConT ''Int8)
@@ -174,23 +179,57 @@ instance (KnownStructure a, KnownStructure b, KnownStructure c, KnownStructure d
 instance KnownStructure a => KnownStructure [a] where
   knownStructure = SList knownStructure
 
-instance {-# OVERLAPPABLE #-} (Coercible a (f a), KnownStructure a) => KnownStructure (f a) where
-  knownStructure =
-    let todo = "TODO: What needs to happen is this"
-             -- I should create a template haskell splice function for the top
-             -- level that takes a data type name and generates a
-             -- KnownStructure instance for that data type. That splice can
-             -- inspect the type, accept only if it is really okay (i.e.
-             -- satisfies checkStructuralType), and generate the right
-             -- structure info _including_ 'Type' values. The current situation
-             -- is completely broken because this `''f` reference here will be
-             -- out of scope where the 'Type' is used, leading to nothing
-             -- working.
-    in SCoercible (AppT (VarT ''f) (structureType (knownStructure @a))) (knownStructure @a)
+-- instance [># OVERLAPPABLE #<] (Coercible a (f a), KnownStructure a) => KnownStructure (f a) where
+--   knownStructure =
+--     let todo = "TODO: What needs to happen is this"
+--              -- I should create a template haskell splice function for the top
+--              -- level that takes a data type name and generates a
+--              -- KnownStructure instance for that data type. That splice can
+--              -- inspect the type, accept only if it is really okay (i.e.
+--              -- satisfies checkStructuralType), and generate the right
+--              -- structure info _including_ 'Type' values. The current situation
+--              -- is completely broken because this `''f` reference here will be
+--              -- out of scope where the 'Type' is used, leading to nothing
+--              -- working.
+--     in SCoercible (AppT (VarT ''f) (structureType (knownStructure @a))) (knownStructure @a)
+
+-- | Use on the top level for a newtype that you wish to use in 'reverseAD'.
+-- For example:
+--
+--     {-# LANGUAGE TemplateHaskell #-}
+--     import Data.Monoid (Sum(..))
+--     useTypeForReverseAD ''Sum
+useTypeForReverseAD :: Name -> Q [Dec]
+useTypeForReverseAD tyname = do
+  typedecl <- reify tyname >>= \case
+    TyConI decl -> return decl
+    info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
+  (tyvars, fieldty) <- case typedecl of
+    NewtypeD [] _ tyvars _ constr _ -> case constr of
+      NormalC _ [(_, ty)] -> return (tyvars, ty)
+      RecC _ [(_, _, ty)] -> return (tyvars, ty)
+      _ -> fail $ "Unsupported constructor format on newtype: " ++ show constr
+    _ -> fail "Only newtypes supported for now"
+  return [InstanceD Nothing
+                    [ConT ''KnownStructure `AppT` fieldty]
+                    (foldl AppT (ConT ''KnownStructure) (map (VarT . tvbName) tyvars))
+                    [ValD (VarP 'knownStructure)
+                          (NormalB (ConE 'SCoercible
+                                    `AppE` (ConE 'ConT
+                                            `AppE` (VarE 'mkName
+                                                    `AppE` LitE (StringL (show tyname))))
+                                    `AppE` LitE (IntegerL (length tyvars))
+                                    `AppE` (VarE 'knownStructure
+                                            `AppTypeE` fieldty)))
+                          []]]
+  where
+    tvbName :: TyVarBndr () -> Name
+    tvbName (PlainTV n _) = n
+    tvbName (KindedTV n _ _) = n
 
 -- | Use as follows:
 --
---     > :t $$(reverseAD [|| \(x, y) -> x * y :: Double ||])
+--     > :t $$(reverseAD @_ @Double [|| \(x, y) -> x * y ||])
 --     (Double, Double) -> (Double, Double -> (Double, Double))
 reverseAD :: forall a b. (KnownStructure a, KnownStructure b)
           => Code Q (a -> b)

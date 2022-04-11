@@ -19,6 +19,7 @@ library
   exposed-modules:
     Data.Array.Growable
     Language.Haskell.ReverseAD.TH
+    Kaas
   hs-source-dirs:
     src
   ghc-options: -Wall
