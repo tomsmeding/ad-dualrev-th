@@ -5,6 +5,7 @@
     separate module from where it is used. -}
 module ControlFun where
 
+import Data.Monoid (Sum(..))
 import Language.Haskell.TH (Q, Code)
 import Language.Haskell.TH.Syntax (unTypeCode, unsafeCodeCoerce)
 
@@ -25,3 +26,5 @@ reverseADandControl program =
   -- point of using forward AD.
   [|| ($$(reverseAD program)
       ,ControlFun $$(unsafeCodeCoerce (unTypeCode program))) ||]
+
+useTypeForReverseAD ''Sum

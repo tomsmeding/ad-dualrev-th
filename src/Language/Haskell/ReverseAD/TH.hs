@@ -39,10 +39,12 @@ import Data.Word
 import GHC.TypeLits (TypeError, ErrorMessage(Text))
 import GHC.Types (Multiplicity(One))
 import Language.Haskell.TH
+import Language.Haskell.TH.Syntax (Lift(..))
+import Language.Haskell.TH.Lift ()  -- for Lift Name
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
-import Control.Monad.IO.Class
+-- import Control.Monad.IO.Class
 -- import Debug.Trace
 
 import qualified Data.Array.Growable as GA
@@ -199,6 +201,11 @@ instance KnownStructure a => KnownStructure [a] where
 --     {-# LANGUAGE TemplateHaskell #-}
 --     import Data.Monoid (Sum(..))
 --     useTypeForReverseAD ''Sum
+--
+-- Note that, due to the GHC stage restriction, you cannot put the
+-- 'useTypeForReverseAD' invocation and the usage of the datatype in a
+-- 'reverseAD' splice in the same file. Put the 'useTypeForReverseAD'
+-- invocation in a different module and import that.
 useTypeForReverseAD :: Name -> Q [Dec]
 useTypeForReverseAD tyname = do
   typedecl <- reify tyname >>= \case
@@ -206,21 +213,28 @@ useTypeForReverseAD tyname = do
     info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
   (tyvars, fieldty) <- case typedecl of
     NewtypeD [] _ tyvars _ constr _ -> case constr of
-      NormalC _ [(_, ty)] -> return (tyvars, ty)
-      RecC _ [(_, _, ty)] -> return (tyvars, ty)
+      NormalC _ [(_, ty)] -> return (map tvbName tyvars, ty)
+      RecC _ [(_, _, ty)] -> return (map tvbName tyvars, ty)
       _ -> fail $ "Unsupported constructor format on newtype: " ++ show constr
     _ -> fail "Only newtypes supported for now"
+  tynameexp <- lift tyname
+  buildname <- newName "build"
+  let builddecs =
+        [SigD buildname (ArrowT `AppT` (ConT ''Structure `AppT` fieldty)
+                                `AppT` (ConT ''Structure
+                                          `AppT` foldl AppT (ConT tyname) (map VarT tyvars)))
+        ,ValD (VarP buildname)
+              (NormalB (ConE 'SCoercible
+                          `AppE` (ConE 'ConT `AppE` tynameexp)
+                          `AppE` LitE (IntegerL (fromIntegral (length tyvars)))))
+              []]
   return [InstanceD Nothing
                     [ConT ''KnownStructure `AppT` fieldty]
-                    (foldl AppT (ConT ''KnownStructure) (map (VarT . tvbName) tyvars))
+                    (ConT ''KnownStructure
+                       `AppT` foldl AppT (ConT tyname) (map VarT tyvars))
                     [ValD (VarP 'knownStructure)
-                          (NormalB (ConE 'SCoercible
-                                    `AppE` (ConE 'ConT
-                                            `AppE` (VarE 'mkName
-                                                    `AppE` LitE (StringL (show tyname))))
-                                    `AppE` LitE (IntegerL (length tyvars))
-                                    `AppE` (VarE 'knownStructure
-                                            `AppTypeE` fieldty)))
+                          (NormalB (LetE builddecs
+                                         (AppE (VarE buildname) (VarE 'knownStructure))))
                           []]]
   where
     tvbName :: TyVarBndr () -> Name
@@ -258,14 +272,12 @@ transform inpStruc outStruc (LamE [pat] expr) = do
   primalname <- newName "primal"
   dualname <- newName "dual"
   adjname <- newName "adjoint"
+  stagedvecname <- newName "stagedvec"
   vecname <- newName "vec"
   let composeLinearFuns :: [Exp] -> Exp
       composeLinearFuns [] = VarE 'PL.id
       composeLinearFuns l = foldl1 (\a b -> InfixE (Just a) (VarE '(PL..)) (Just b)) l
-  (reconstructExp', _) <- reconstruct inpStruc
-                                      (VarE argvar)
-                                      (VarE 'V.map `AppE` VarE 'snd `AppE` VarE vecname)
-                                      onevar
+  (reconstructExp', _) <- reconstruct inpStruc (VarE argvar) (VarE vecname) onevar
   let reconstructExp = AppE (VarE 'fst) reconstructExp'
   return (LamE [VarP argvar] $
             LetE [ValD (VarP onevar) (NormalB (SigE (LitE (IntegerL 1)) (ConT ''Int))) []
@@ -273,17 +285,21 @@ transform inpStruc outStruc (LamE [pat] expr) = do
                  ,ValD (TupP [VarP primalname, VarP dualname]) (NormalB deinterexpr) []] $
               pair (VarE primalname)
                    (LamE [VarP adjname] $
-                      AppE (VarE 'PL.unur) $
-                        foldl AppE (VarE 'GA.alloc)
-                                   [LitE (IntegerL 0)
-                                   ,pair (AppE (ConE 'Contrib) (ListE []))
-                                         (LitE (RationalL 0.0))
-                                   ,composeLinearFuns
-                                      [AppE (VarE 'mapUr)
-                                            (LamE [VarP vecname] reconstructExp)
-                                      ,VarE 'GA.freeze
-                                      ,VarE 'resolve
-                                      ,AppE (VarE dualname) (VarE adjname)]]))
+                      LetE [ValD (ConP 'Ur [] [VarP stagedvecname])
+                                 (NormalB
+                                    (foldl AppE (VarE 'GA.alloc)
+                                                [LitE (IntegerL 0)
+                                                ,pair (AppE (ConE 'Contrib) (ListE []))
+                                                      (LitE (RationalL 0.0))
+                                                ,composeLinearFuns
+                                                   [VarE 'GA.freeze
+                                                   ,VarE 'resolve
+                                                   ,AppE (VarE dualname) (VarE adjname)]]))
+                                 []
+                           ,ValD (VarP vecname)
+                                 (NormalB (VarE 'V.map `AppE` VarE 'snd `AppE` VarE stagedvecname))
+                                 []]
+                        reconstructExp))
 transform inpStruc outStruc (LamE [] body) =
   transform inpStruc outStruc body
 transform inpStruc outStruc (LamE (pat : pats) body) =
@@ -308,6 +324,7 @@ deinterleaveList f l =
 deinterleave :: Quote m => Structure out -> Exp -> m Exp
 deinterleave topstruc outexp = case topstruc of
   SDiscrete _ -> return (pair outexp (LamE [WildP] (VarE 'PL.id)))
+
   SScalar -> do
     -- outexp :: (Double, (Int, Contrib))
     -- adjexp :: Double
@@ -318,6 +335,7 @@ deinterleave topstruc outexp = case topstruc of
       LetE [ValD (TupP [VarP primalname, TupP [VarP idname, VarP cbname]]) (NormalB outexp) []] $
         pair (VarE primalname)
              (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
+
   STuple strucs -> do
     (funs, outnames, adjnames) <- fmap unzip3 . forM (zip (fromHList strucs) [1::Int ..]) $ \(Some struc', index) -> do
       outn <- newName ("out" ++ show index)
@@ -333,6 +351,7 @@ deinterleave topstruc outexp = case topstruc of
                (LamE [TupP (map VarP adjnames)] $
                   foldr1 (\e1 e2 -> VarE '(PL..) `AppE` e1 `AppE` e2)
                          (zipWith AppE funs (map VarE adjnames)))
+
   SList struc -> do
     argvar <- newName "x"
     body <- deinterleave struc (VarE argvar)
@@ -340,13 +359,16 @@ deinterleave topstruc outexp = case topstruc of
               `AppE` LamE [VarP argvar] body
               `AppE` outexp
 
-  SCoercible topty struc -> do
+  SCoercible _ _ struc -> do
     expr <- deinterleave struc (AppE (VarE 'coerce) outexp)
     primalname <- newName "primal"
     dualname <- newName "dualf"
     return $ CaseE expr
       [Match (TupP [VarP primalname, VarP dualname])
-             (NormalB (pair (AppE (VarE 'coerce `AppTypeE` structureType struc `AppTypeE` topty) (VarE primalname))
+             (NormalB (pair (AppE (VarE 'coerce
+                                   `AppTypeE` structureType struc
+                                   `AppTypeE` structureType topstruc)
+                                  (VarE primalname))
                             (InfixE (Just (VarE dualname)) (VarE '(.)) (Just (VarE 'coerce)))))
              []]
 
@@ -362,9 +384,11 @@ reconstructList f primal i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 primal)
 reconstruct :: Quote m => Structure inp -> Exp -> Exp -> Name -> m (Exp, Bool)
 reconstruct topstruc inexp vecexp startid = case topstruc of
   SDiscrete _ -> return (pair inexp (VarE startid), True)
+
   SScalar -> return (pair (InfixE (Just vecexp) (VarE '(V.!)) (Just (VarE startid)))
                           (AppE (VarE 'succ) (VarE startid))
                     ,False)
+
   STuple strucs -> do
     innames <- zipWithM (\_ i -> newName ("in" ++ show i)) (fromHList strucs) [1::Int ..]
     recnames <- zipWithM (\_ i -> newName ("y" ++ show i)) (fromHList strucs) [1::Int ..]
@@ -384,6 +408,7 @@ reconstruct topstruc inexp vecexp startid = case topstruc of
          pair (TupE (map (Just . VarE) recnames))
               (VarE outid)
       ,or useds)
+
   SList struc -> do
     argvar <- newName "x"
     idvar <- newName "i"
@@ -393,9 +418,15 @@ reconstruct topstruc inexp vecexp startid = case topstruc of
               `AppE` inexp
               `AppE` VarE startid
            ,True)
-  SCoercible topty struc ->
-    first (VarE 'first `AppE` (VarE 'coerce `AppTypeE` structureType struc `AppTypeE` topty) `AppE`)
-      <$> reconstruct struc (AppE (VarE 'coerce) inexp) vecexp startid
+
+  SCoercible _ _ struc -> do
+    (expr, used) <- reconstruct struc (AppE (VarE 'coerce) inexp) vecexp startid
+    return (VarE 'first
+              `AppE` (VarE 'coerce
+                        `AppTypeE` structureType struc
+                        `AppTypeE` structureType topstruc)
+              `AppE` expr
+           ,used)
 
 -- Γ |- i : Int                        -- idName
 -- Γ |- t : a                          -- expression
@@ -531,7 +562,7 @@ ddr idName = \case
     ddr idName (LamE [VarP name] (CaseE (VarE name) mats))
 
   -- Unsupported constructs
-  ConE name -> notSupported "Data constructors" (Just (show name))
+  ConE name -> notSupported "Most data constructors" (Just (show name))
   e@AppTypeE{} -> notSupported "Type applications" (Just (show e))
   e@UInfixE{} -> notSupported "UInfixE" (Just (show e))
   e@UnboxedTupE{} -> notSupported "Unboxed tuples" (Just (show e))
@@ -748,11 +779,13 @@ numberList f l i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 l)
 numberInput :: Quote m => Structure inp -> Exp -> Name -> m Exp
 numberInput topstruc input nextid = case topstruc of
   SDiscrete _ -> return (pair input (VarE nextid))
+
   SScalar -> return $
     pair (pair input
                (pair (VarE nextid)
                      (ConE 'Contrib `AppE` ListE [])))
          (AppE (VarE 'succ) (VarE nextid))
+
   STuple strucs -> do
     names <- mapM (const (newName "inp")) (fromHList strucs)
     postnames <- mapM (const (newName "inp'")) (fromHList strucs)
@@ -764,6 +797,7 @@ numberInput topstruc input nextid = case topstruc of
                    | (postname, idname, expr) <- zip3 postnames idnames exps])
                  (pair (TupE (map (Just . VarE) postnames))
                        (VarE outid)))
+
   SList eltstruc -> do
     idxarg <- newName "i"
     eltarg <- newName "x"
@@ -772,9 +806,14 @@ numberInput topstruc input nextid = case topstruc of
       [LamE [VarP idxarg, VarP eltarg] body
       ,input
       ,VarE nextid]
-  SCoercible _ struc ->
-    (VarE 'first `AppE` VarE 'coerce `AppE`)
-      <$> numberInput struc (AppE (VarE 'coerce) input) nextid
+
+  SCoercible _ _ struc -> do
+    expr <- numberInput struc (AppE (VarE 'coerce) input) nextid
+    return (VarE 'first
+              `AppE` (VarE 'coerce
+                        `AppTypeE` structureType struc
+                        `AppTypeE` structureType topstruc)
+              `AppE` expr)
 
 fst3 :: (a, b, c) -> a
 fst3 (a, _, _) = a
@@ -855,6 +894,3 @@ zipWithM3 f a b c = traverse (\(x,y,z) -> f x y z) (zip3 a b c)
 
 swap :: (a, b) -> (b, a)
 swap (a, b) = (b, a)
-
-mapUr :: (a -> b) -> Ur a %1-> Ur b
-mapUr f (Ur x) = Ur (f x)
