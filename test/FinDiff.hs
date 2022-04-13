@@ -75,6 +75,17 @@ instance FinDiff () where
   replaceElements _ _ () = ()
   replaceElementsId = Refl
 
+-- | Element type is assumed to be Double
+instance FinDiff Int where
+  type Element Int = Double
+  type ReplaceElements Int s = Int
+  elements' _ _ = []
+  rebuild' _ _ n l = (n, l)
+  oneElement _ = 1.0
+  zero _ n = n
+  replaceElements _ _ n = n
+  replaceElementsId = Refl
+
 instance (FinDiff a, FinDiff b, Element a ~ Element b) => FinDiff (a, b) where
   type Element (a, b) = Element a
   type ReplaceElements (a, b) s = (ReplaceElements a s, ReplaceElements b s)

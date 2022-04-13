@@ -29,6 +29,9 @@ instance Approx Double where
     abs (a - b) < absdelta ||
     (max (abs a) (abs b) >= 1 && abs (a - b) < reldelta * max (abs a) (abs b))
 
+instance Approx Int where
+  approx _ _ _ _ = True
+
 instance (Approx a, Approx b) => Approx (a, b) where
   approx absdelta reldelta (a, b) (x, y) =
     approx absdelta reldelta a x &&
@@ -40,6 +43,9 @@ instance Approx a => Approx [a] where
 
 instance Approx a => Approx (Sum a) where
   approx absdelta reldelta (Sum a) (Sum b) = approx absdelta reldelta a b
+
+instance (Approx a, Approx b) => Approx (WeirdType a b) where
+  approx absdelta reldelta (MkWeirdType (_, l)) (MkWeirdType (_, l')) = approx absdelta reldelta l l'
 
 (~=) :: Approx a => a -> a -> Bool
 (~=) = approx 0.01 0.01
@@ -163,15 +169,15 @@ main =
        YesFD
     ,checkFDcontrol "complexity2"
        $$(reverseADandControl @Double @Double
-            [|| \x0 -> let x1  = x0 + x0 + x0 + x0 + x0 - x0 - x0 - x0 ;
-                           x2  = x1 + x1 + x1 + x1 + x1 - x1 - x1 - x1 ;
-                           x3  = x2 + x2 + x2 + x2 + x2 - x2 - x2 - x2 ;
-                           x4  = x3 + x3 + x3 + x3 + x3 - x3 - x3 - x3 ;
-                           x5  = x4 + x4 + x4 + x4 + x4 - x4 - x4 - x4 ;
-                           x6  = x5 + x5 + x5 + x5 + x5 - x5 - x5 - x5 ;
-                           x7  = x6 + x6 + x6 + x6 + x6 - x6 - x6 - x6 ;
-                           x8  = x7 + x7 + x7 + x7 + x7 - x7 - x7 - x7 ;
-                           x9  = x8 + x8 + x8 + x8 + x8 - x8 - x8 - x8 ;
+            [|| \x0 -> let x1  = x0 + x0 + x0 + x0 + x0 - x0 - x0 - x0
+                           x2  = x1 + x1 + x1 + x1 + x1 - x1 - x1 - x1
+                           x3  = x2 + x2 + x2 + x2 + x2 - x2 - x2 - x2
+                           x4  = x3 + x3 + x3 + x3 + x3 - x3 - x3 - x3
+                           x5  = x4 + x4 + x4 + x4 + x4 - x4 - x4 - x4
+                           x6  = x5 + x5 + x5 + x5 + x5 - x5 - x5 - x5
+                           x7  = x6 + x6 + x6 + x6 + x6 - x6 - x6 - x6
+                           x8  = x7 + x7 + x7 + x7 + x7 - x7 - x7 - x7
+                           x9  = x8 + x8 + x8 + x8 + x8 - x8 - x8 - x8
                            x10 = x9 + x9 + x9 + x9 + x9 - x9 - x9 - x9
                        in 0.000001 * x10 * x10 ||])
        -- xn = 2 * x{n-1}
@@ -205,7 +211,22 @@ main =
        YesFD
     ,checkFDcontrol "Sum newtype"
        $$(reverseADandControl @(Sum Double) @Double
-            [|| \s -> case s of Sum x -> 2 * x ||])
-       (Just (\(Sum x) d -> Sum (2 * x * d)))
+            [|| \s -> case s of Sum x -> 2.0 * x ||])
+       (Just (\_ d -> Sum (2 * d)))
+       YesFD
+    ,changeArgs (\a -> a { maxSuccess = 5000 }) $
+     checkFDcontrol "WeirdType newtype"
+       $$(reverseADandControl @(WeirdType Double Int, Double) @Double
+            [|| \(MkWeirdType (n, l), x) ->
+                  let mul [] = []
+                      mul ((y,k):ps) = (y * x, k) : mul ps
+                      times [] = 0
+                      times ((_,k):ps) = k + times ps
+                      iterate k f y = if k == 0 then y else iterate (k - 1) f (f y)
+                      sum [] = 0.0
+                      sum ((y,_):ps) = y + sum ps
+                      count = let k = n + times l in if k < 0 then -k else k
+                  in sum (iterate (if count > 10 then 10 else count) mul l) ||])
+       Nothing
        YesFD
     ]

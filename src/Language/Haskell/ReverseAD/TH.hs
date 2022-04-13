@@ -134,38 +134,35 @@ fromHList HNil = []
 fromHList (HCons x xs) = Some x : fromHList xs
 
 data Structure a where
-  SDiscrete :: Type -> Structure a
+  SDiscrete :: Structure a
   SScalar :: Structure Double
   STuple :: HList Structure list -> Structure (TupleOfList list)
   SList :: Structure a -> Structure [a]
-  SCoercible :: Coercible a b
-             => Type -- type constructor of b (not yet applied to type arguments)
-             -> Int  -- number of type arguments of the type constructor of b
-             -> Structure a
-             -> Structure b
+  SNewtype :: Coercible a b
+           => Name -- data constructor of b
+           -> Structure a
+           -> Structure b
 deriving instance Show (Structure a)
+
+-- | Pattern match on the given data constructor and extract the single value.
+unNewtype :: Quote m => Name -> Exp -> m Exp
+unNewtype conname expr = do
+  name <- newName "x"
+  return $ CaseE expr [Match (ConP conname [] [VarP name]) (NormalB (VarE name)) []]
 
 class KnownStructure a where knownStructure :: Structure a
 
-structureType :: Structure a -> Type
-structureType = \case
-  SDiscrete t -> t
-  SScalar -> ConT ''Double
-  STuple (fromHList -> list) -> foldl AppT (TupleT (length list)) (map (\(Some s) -> structureType s) list)
-  SList s -> AppT ListT (structureType s)
-  SCoercible t ntyvars _ -> iterate (`AppT` WildCardT) t !! ntyvars
-
-instance KnownStructure Int where knownStructure = SDiscrete (ConT ''Int)
-instance KnownStructure Int8 where knownStructure = SDiscrete (ConT ''Int8)
-instance KnownStructure Int16 where knownStructure = SDiscrete (ConT ''Int16)
-instance KnownStructure Int32 where knownStructure = SDiscrete (ConT ''Int32)
-instance KnownStructure Int64 where knownStructure = SDiscrete (ConT ''Int64)
-instance KnownStructure Word where knownStructure = SDiscrete (ConT ''Word)
-instance KnownStructure Word8 where knownStructure = SDiscrete (ConT ''Word8)
-instance KnownStructure Word16 where knownStructure = SDiscrete (ConT ''Word16)
-instance KnownStructure Word32 where knownStructure = SDiscrete (ConT ''Word32)
-instance KnownStructure Word64 where knownStructure = SDiscrete (ConT ''Word64)
-instance KnownStructure () where knownStructure = SDiscrete (ConT ''())
+instance KnownStructure Int where knownStructure = SDiscrete
+instance KnownStructure Int8 where knownStructure = SDiscrete
+instance KnownStructure Int16 where knownStructure = SDiscrete
+instance KnownStructure Int32 where knownStructure = SDiscrete
+instance KnownStructure Int64 where knownStructure = SDiscrete
+instance KnownStructure Word where knownStructure = SDiscrete
+instance KnownStructure Word8 where knownStructure = SDiscrete
+instance KnownStructure Word16 where knownStructure = SDiscrete
+instance KnownStructure Word32 where knownStructure = SDiscrete
+instance KnownStructure Word64 where knownStructure = SDiscrete
+instance KnownStructure () where knownStructure = SDiscrete
 
 -- instance KnownStructure Float where knownStructure _ = SScalar
 instance TypeError ('Text "Only Double is an active type for now (Float isn't)") => KnownStructure Float where knownStructure = undefined
@@ -181,24 +178,10 @@ instance (KnownStructure a, KnownStructure b, KnownStructure c, KnownStructure d
 instance KnownStructure a => KnownStructure [a] where
   knownStructure = SList knownStructure
 
--- instance [># OVERLAPPABLE #<] (Coercible a (f a), KnownStructure a) => KnownStructure (f a) where
---   knownStructure =
---     let todo = "TODO: What needs to happen is this"
---              -- I should create a template haskell splice function for the top
---              -- level that takes a data type name and generates a
---              -- KnownStructure instance for that data type. That splice can
---              -- inspect the type, accept only if it is really okay (i.e.
---              -- satisfies checkStructuralType), and generate the right
---              -- structure info _including_ 'Type' values. The current situation
---              -- is completely broken because this `''f` reference here will be
---              -- out of scope where the 'Type' is used, leading to nothing
---              -- working.
---     in SCoercible (AppT (VarT ''f) (structureType (knownStructure @a))) (knownStructure @a)
-
 -- | Use on the top level for a newtype that you wish to use in 'reverseAD'.
 -- For example:
 --
---     {-# LANGUAGE TemplateHaskell #-}
+--     {-# LANGUAGE FlexibleContexts, TemplateHaskell, UndecidableInstances #-}
 --     import Data.Monoid (Sum(..))
 --     useTypeForReverseAD ''Sum
 --
@@ -211,22 +194,21 @@ useTypeForReverseAD tyname = do
   typedecl <- reify tyname >>= \case
     TyConI decl -> return decl
     info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
-  (tyvars, fieldty) <- case typedecl of
+  (conname, tyvars, fieldty) <- case typedecl of
     NewtypeD [] _ tyvars _ constr _ -> case constr of
-      NormalC _ [(_, ty)] -> return (map tvbName tyvars, ty)
-      RecC _ [(_, _, ty)] -> return (map tvbName tyvars, ty)
+      NormalC conname [(_, fieldty)] -> return (conname, map tvbName tyvars, fieldty)
+      RecC conname [(_, _, fieldty)] -> return (conname, map tvbName tyvars, fieldty)
       _ -> fail $ "Unsupported constructor format on newtype: " ++ show constr
     _ -> fail "Only newtypes supported for now"
-  tynameexp <- lift tyname
+  checkNoScalars fieldty
+  connameexp <- lift conname
   buildname <- newName "build"
   let builddecs =
         [SigD buildname (ArrowT `AppT` (ConT ''Structure `AppT` fieldty)
                                 `AppT` (ConT ''Structure
                                           `AppT` foldl AppT (ConT tyname) (map VarT tyvars)))
         ,ValD (VarP buildname)
-              (NormalB (ConE 'SCoercible
-                          `AppE` (ConE 'ConT `AppE` tynameexp)
-                          `AppE` LitE (IntegerL (fromIntegral (length tyvars)))))
+              (NormalB (ConE 'SNewtype `AppE` connameexp))
               []]
   return [InstanceD Nothing
                     [ConT ''KnownStructure `AppT` fieldty]
@@ -240,6 +222,25 @@ useTypeForReverseAD tyname = do
     tvbName :: TyVarBndr () -> Name
     tvbName (PlainTV n _) = n
     tvbName (KindedTV n _ _) = n
+
+    checkNoScalars :: MonadFail m => Type -> m ()
+    checkNoScalars (ForallT _ [] t) = checkNoScalars t
+    checkNoScalars (AppT t1 t2) = checkNoScalars t1 >> checkNoScalars t2
+    checkNoScalars (SigT t _) = checkNoScalars t
+    checkNoScalars (VarT _) = return ()
+    checkNoScalars (ConT n)
+      | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
+                 ,''Word, ''Word8, ''Word16, ''Word32, ''Word64]
+      = return ()
+      | n == ''Double
+      = fail "No literal Double scalars allowed in type used in reverse AD; replace them with a type parameter."
+    checkNoScalars (ParensT t) = checkNoScalars t
+    checkNoScalars (TupleT _) = return ()
+    checkNoScalars ArrowT = return ()
+    checkNoScalars MulArrowT = return ()
+    checkNoScalars ListT = return ()
+    checkNoScalars t = fail $ "Unsupported type in data type: " ++ show t
+
 
 -- | Use as follows:
 --
@@ -267,7 +268,8 @@ transform inpStruc outStruc (LamE [pat] expr) = do
   onevar <- newName "one"
   inp <- numberInput inpStruc (VarE argvar) onevar
   idvar <- newName "i0"
-  ddrexpr <- ddr idvar expr
+  patbound <- boundVars pat
+  ddrexpr <- ddr patbound idvar expr
   deinterexpr <- deinterleave outStruc (AppE (VarE 'fst) ddrexpr)
   primalname <- newName "primal"
   dualname <- newName "dual"
@@ -323,7 +325,7 @@ deinterleaveList f l =
 --           ,a -> BuildState -o BuildState)  -- given adjoint, add initial contributions
 deinterleave :: Quote m => Structure out -> Exp -> m Exp
 deinterleave topstruc outexp = case topstruc of
-  SDiscrete _ -> return (pair outexp (LamE [WildP] (VarE 'PL.id)))
+  SDiscrete -> return (pair outexp (LamE [WildP] (VarE 'PL.id)))
 
   SScalar -> do
     -- outexp :: (Double, (Int, Contrib))
@@ -359,17 +361,15 @@ deinterleave topstruc outexp = case topstruc of
               `AppE` LamE [VarP argvar] body
               `AppE` outexp
 
-  SCoercible _ _ struc -> do
-    expr <- deinterleave struc (AppE (VarE 'coerce) outexp)
+  SNewtype conname struc -> do
+    outexp' <- unNewtype conname outexp  -- strip off the newtype wrapper first
+    expr <- deinterleave struc outexp'
     primalname <- newName "primal"
     dualname <- newName "dualf"
     return $ CaseE expr
       [Match (TupP [VarP primalname, VarP dualname])
-             (NormalB (pair (AppE (VarE 'coerce
-                                   `AppTypeE` structureType struc
-                                   `AppTypeE` structureType topstruc)
-                                  (VarE primalname))
-                            (InfixE (Just (VarE dualname)) (VarE '(.)) (Just (VarE 'coerce)))))
+             (NormalB (pair (ConE conname `AppE` VarE primalname)
+                            (InfixE (Just (VarE dualname)) (VarE '(.)) (Just (ConE conname)))))
              []]
 
 reconstructList :: (Int -> s -> (s, Int)) -> [s] -> Int -> ([s], Int)
@@ -383,7 +383,7 @@ reconstructList f primal i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 primal)
 -- In ID generation monad; also returns whether the inexp argument was actually used
 reconstruct :: Quote m => Structure inp -> Exp -> Exp -> Name -> m (Exp, Bool)
 reconstruct topstruc inexp vecexp startid = case topstruc of
-  SDiscrete _ -> return (pair inexp (VarE startid), True)
+  SDiscrete -> return (pair inexp (VarE startid), True)
 
   SScalar -> return (pair (InfixE (Just vecexp) (VarE '(V.!)) (Just (VarE startid)))
                           (AppE (VarE 'succ) (VarE startid))
@@ -419,21 +419,37 @@ reconstruct topstruc inexp vecexp startid = case topstruc of
               `AppE` VarE startid
            ,True)
 
-  SCoercible _ _ struc -> do
-    (expr, used) <- reconstruct struc (AppE (VarE 'coerce) inexp) vecexp startid
-    return (VarE 'first
-              `AppE` (VarE 'coerce
-                        `AppTypeE` structureType struc
-                        `AppTypeE` structureType topstruc)
-              `AppE` expr
+  SNewtype conname struc -> do
+    inexp' <- unNewtype conname inexp  -- strip off the newtype wrapper first
+    (expr, used) <- reconstruct struc inexp' vecexp startid
+    return (VarE 'first `AppE` ConE conname `AppE` expr
            ,used)
+
+-- Set of names bound in the program at this point
+type Env = Set Name
 
 -- Γ |- i : Int                        -- idName
 -- Γ |- t : a                          -- expression
 -- ~> Dt[Γ] |- D[i, t] : (Dt[a], Int)  -- result
-ddr :: Name -> Exp -> Q Exp
-ddr idName = \case
-  VarE name -> return (pair (VarE name) (VarE idName))
+ddr :: Env -> Name -> Exp -> Q Exp
+ddr env idName = \case
+  VarE name
+    | name `Set.member` env -> return (pair (VarE name) (VarE idName))
+    | name == 'negate -> do
+        xname <- newName "x"
+        iname <- newName "i"
+        let function = LamE [VarP xname, VarP iname] $
+              foldl AppE (VarE 'applyUnaryOp)
+                [VarE xname
+                ,VarE 'negate
+                ,LamE [WildP] (LitE (IntegerL (-1)))
+                ,VarE iname]
+        return (pair function (VarE idName))
+    | otherwise -> fail $ "Free variables not supported in reverseAD: " ++ show name ++ " (env = " ++ show env ++ ")"
+
+  ConE name
+    | name `elem` ['[]] -> return (pair (ConE name) (VarE idName))
+    | otherwise -> fail $ "Data constructor not supported in reverseAD: " ++ show name
 
   LitE lit -> case lit of
     RationalL _ -> return (pair (pair (LitE lit)
@@ -447,12 +463,12 @@ ddr idName = \case
     _ -> fail $ "literal? " ++ show lit
 
   AppE e1 e2 -> do
-    (letwrap, [funname, argname], outid) <- ddrList [e1, e2] idName
+    (letwrap, [funname, argname], outid) <- ddrList env [e1, e2] idName
     return (letwrap (VarE funname `AppE` VarE argname `AppE` VarE outid))
 
   InfixE (Just e1) (VarE opname) (Just e2) -> do
-    let handleNum = do
-          let num = LitE . IntegerL
+    let handleNum =
+          let num = LitE . IntegerL in
           if | opname == '(+) -> Just ((False, False), \_ _ -> pair (num 1) (num 1))
              | opname == '(-) -> Just ((False, False), \_ _ -> pair (num 1) (num (-1)))
              | opname == '(*) -> Just ((True, True), \x y -> pair y x)
@@ -460,23 +476,22 @@ ddr idName = \case
             & \case
               Nothing -> Nothing
               Just ((gxused, gyused), gradientfun) -> Just $ do
-                (letwrap, [x1name, x2name], outid) <- ddrList [e1, e2] idName
+                (letwrap, [x1name, x2name], outid) <- ddrList env [e1, e2] idName
                 t1name <- newName "arg1"
                 t2name <- newName "arg2"
                 return $ letwrap $
                   foldl AppE (VarE 'applyBinaryOp)
                     [VarE x1name, VarE x2name
-                    ,LamE [VarP t1name, VarP t2name] $
-                       InfixE (Just (VarE t1name)) (VarE opname) (Just (VarE t2name))
+                    ,VarE opname
                     ,LamE [if gxused then VarP t1name else WildP
                           ,if gyused then VarP t2name else WildP] $
                        gradientfun (VarE t1name) (VarE t2name)
                     ,VarE outid]
 
-        handleOrd = do
+        handleOrd =
           if opname `elem` ['(==), '(/=), '(<), '(>), '(<=), '(>=)]
             then Just $ do
-              (letwrap, [x1name, x2name], outid) <- ddrList [e1, e2] idName
+              (letwrap, [x1name, x2name], outid) <- ddrList env [e1, e2] idName
               t1name <- newName "arg1"
               t2name <- newName "arg2"
               return $ letwrap $
@@ -493,7 +508,7 @@ ddr idName = \case
 
   InfixE (Just e1) (ConE constr) (Just e2)
     | constr == '(:) -> do
-        (letwrap, [xname, xsname], outid) <- ddrList [e1, e2] idName
+        (letwrap, [xname, xsname], outid) <- ddrList env [e1, e2] idName
         return $ letwrap $
           pair (InfixE (Just (VarE xname)) (ConE '(:)) (Just (VarE xsname)))
                (VarE outid)
@@ -501,45 +516,47 @@ ddr idName = \case
 
   e@InfixE{} -> fail $ "Unsupported operator section: " ++ show e
 
-  ParensE e -> ParensE <$> ddr idName e
+  ParensE e -> ParensE <$> ddr env idName e
 
   LamE [pat] e -> do
     idName1 <- newName "i"
-    e' <- ddr idName1 e
+    patbound <- boundVars pat
+    e' <- ddr (env <> patbound) idName1 e
     return (pair (LamE [pat, VarP idName1] e') (VarE idName))
 
   TupE mes
     | Just es <- sequence mes -> do
-        (letwrap, vars, outid) <- ddrList es idName
+        (letwrap, vars, outid) <- ddrList env es idName
         return (letwrap (pair (TupE (map (Just . VarE) vars))
                               (VarE outid)))
     | otherwise -> notSupported "Tuple sections" (Just (show (TupE mes)))
 
   CondE e1 e2 e3 -> do
-    e1' <- ddr idName e1
+    e1' <- ddr env idName e1
     boolName <- newName "bool"
     idName1 <- newName "i1"
-    e2' <- ddr idName1 e2
-    e3' <- ddr idName1 e3
+    e2' <- ddr env idName1 e2
+    e3' <- ddr env idName1 e3
     return (LetE [ValD (TupP [VarP boolName, VarP idName1]) (NormalB e1') []]
               (CondE (VarE boolName) e2' e3'))
 
   LetE decs body -> do
     decs' <- mapM desugarDec decs
     checkDecsNonRecursive decs' >>= \case
-      Just _ -> do
-        (decs'', idName') <- transDecs decs' idName
-        body' <- ddr idName' body
+      Just (map fst3 -> declared) -> do
+        (decs'', idName') <- transDecs (env <> Set.fromList declared) decs' idName
+        body' <- ddr (env <> Set.fromList declared) idName' body
         return (LetE decs'' body')
       Nothing -> notSupported "Recursive or non-variable let-bindings" (Just (show (LetE decs' body)))
 
   CaseE expr matches -> do
-    (letwrap, [evar], outid) <- ddrList [expr] idName
+    (letwrap, [evar], outid) <- ddrList env [expr] idName
     matches' <- sequence
       [case mat of
          Match pat (NormalB rhs) [] -> do
+           patbound <- boundVars pat
            pat' <- ddrPat pat
-           rhs' <- ddr outid rhs
+           rhs' <- ddr (env <> patbound) outid rhs
            return (pat', rhs')
          _ -> fail "Where blocks or guards not supported in case expressions"
       | mat <- matches]
@@ -548,21 +565,20 @@ ddr idName = \case
         [Match pat (NormalB rhs) [] | (pat, rhs) <- matches']
 
   ListE es -> do
-    (letwrap, vars, outid) <- ddrList es idName
+    (letwrap, vars, outid) <- ddrList env es idName
     return (letwrap (pair (ListE (map VarE vars))
                           (VarE outid)))
 
   UnboundVarE n -> fail $ "Free variable in reverseAD: " ++ show n
 
   -- Constructs that we can express in terms of other, simpler constructs handled above
-  LamE [] e -> ddr idName e  -- is this even a valid AST?
-  LamE (pat : pats@(_:_)) e -> ddr idName (LamE [pat] (LamE pats e))
+  LamE [] e -> ddr env idName e  -- is this even a valid AST?
+  LamE (pat : pats@(_:_)) e -> ddr env idName (LamE [pat] (LamE pats e))
   LamCaseE mats -> do
     name <- newName "lcarg"
-    ddr idName (LamE [VarP name] (CaseE (VarE name) mats))
+    ddr env idName (LamE [VarP name] (CaseE (VarE name) mats))
 
   -- Unsupported constructs
-  ConE name -> notSupported "Most data constructors" (Just (show name))
   e@AppTypeE{} -> notSupported "Type applications" (Just (show e))
   e@UInfixE{} -> notSupported "UInfixE" (Just (show e))
   e@UnboxedTupE{} -> notSupported "Unboxed tuples" (Just (show e))
@@ -587,13 +603,14 @@ pair e1 e2 = TupE [Just e1, Just e2]
 -- | Given list of expressions and the input ID, returns a let-wrapper that
 -- defines a variable for each item in the list (differentiated), the names of
 -- those variables, and the output ID name (in scope in the let-wrapper).
-ddrList :: [Exp] -> Name -> Q (Exp -> Exp, [Name], Name)
-ddrList es idName = do
+-- The expressions must all have the same, given, environment.
+ddrList :: Env -> [Exp] -> Name -> Q (Exp -> Exp, [Name], Name)
+ddrList env es idName = do
   -- output varnames of the expressions
   names <- mapM (\idx -> (,) <$> newName ("x" ++ show idx) <*> newName ("i" ++ show idx))
                 (take (length es) [1::Int ..])
   -- the let-binding pairs
-  binds <- zipWithM3 (\ni_in (nx, ni_out) e -> do e' <- ddr ni_in e
+  binds <- zipWithM3 (\ni_in (nx, ni_out) e -> do e' <- ddr env ni_in e
                                                   return ((nx, ni_out), e'))
                      (idName : map snd names) names es
   let out_index = case names of
@@ -680,6 +697,12 @@ class NumOperation a where
     -> (a -> a -> (a, a))      -- gradient given inputs (assuming adjoint 1)
     -> Int                     -- nextid
     -> (DualNum a, Int)        -- output and nextid
+  applyUnaryOp
+    :: DualNum a               -- argument
+    -> (a -> a)                -- primal
+    -> (a -> a)                -- derivative given input (assuming adjoint 1)
+    -> Int                     -- nextid
+    -> (DualNum a, Int)        -- output and nextid
   applyCmpOp
     :: DualNum a -> DualNum a  -- arguments
     -> (a -> a -> Bool)        -- primal
@@ -693,11 +716,14 @@ instance NumOperation Double where
         ,(nextid
          ,Contrib [(xi, xcb, dx), (yi, ycb, dy)]))
        ,nextid + 1)
+  applyUnaryOp (x, (xi, xcb)) primal grad nextid =
+    ((primal x, (nextid, Contrib [(xi, xcb, grad x)])), nextid + 1)
   applyCmpOp (x, _) (y, _) f = f x y
 
 instance NumOperation Int where
   type DualNum Int = Int
   applyBinaryOp x y primal _ nextid = (primal x y, nextid)
+  applyUnaryOp x primal _ nextid = (primal x, nextid)
   applyCmpOp x y f = f x y
 
 desugarDec :: QuoteFail m => Dec -> m Dec
@@ -732,21 +758,21 @@ desugarDec = \case
 -- | Differentiate a declaration, given a variable containing the next ID to
 -- generate. Modifies the declaration to bind the next ID to a new name, which
 -- is returned.
-transDec :: Dec -> Name -> Q (Dec, Name)
-transDec dec idName = case dec of
+transDec :: Env -> Dec -> Name -> Q (Dec, Name)
+transDec env dec idName = case dec of
   ValD (VarP name) (NormalB body) [] -> do
     idName1 <- newName "i"
-    body' <- ddr idName body
+    body' <- ddr env idName body
     return (ValD (TupP [VarP name, VarP idName1]) (NormalB body') [], idName1)
 
   _ -> fail $ "How did this declaration get through desugaring? " ++ show dec
 
 -- | `sequence 'transDec'`
-transDecs :: [Dec] -> Name -> Q ([Dec], Name)
-transDecs [] n = return ([], n)
-transDecs (d : ds) n = do
-  (d', n') <- transDec d n
-  (ds', n'') <- transDecs ds n'
+transDecs :: Env -> [Dec] -> Name -> Q ([Dec], Name)
+transDecs _ [] n = return ([], n)
+transDecs env (d : ds) n = do
+  (d', n') <- transDec env d n
+  (ds', n'') <- transDecs env ds n'
   return (d' : ds', n'')
 
 -- | If these declarations occur in a let block, check that all dependencies go
@@ -778,7 +804,7 @@ numberList f l i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 l)
 -- result :: (Dt[a], Int)
 numberInput :: Quote m => Structure inp -> Exp -> Name -> m Exp
 numberInput topstruc input nextid = case topstruc of
-  SDiscrete _ -> return (pair input (VarE nextid))
+  SDiscrete -> return (pair input (VarE nextid))
 
   SScalar -> return $
     pair (pair input
@@ -807,13 +833,10 @@ numberInput topstruc input nextid = case topstruc of
       ,input
       ,VarE nextid]
 
-  SCoercible _ _ struc -> do
-    expr <- numberInput struc (AppE (VarE 'coerce) input) nextid
-    return (VarE 'first
-              `AppE` (VarE 'coerce
-                        `AppTypeE` structureType struc
-                        `AppTypeE` structureType topstruc)
-              `AppE` expr)
+  SNewtype conname struc -> do
+    input' <- unNewtype conname input  -- strip off the newtype wrapper first
+    expr <- numberInput struc input' nextid
+    return (VarE 'first `AppE` ConE conname `AppE` expr)
 
 fst3 :: (a, b, c) -> a
 fst3 (a, _, _) = a
