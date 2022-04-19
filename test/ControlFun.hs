@@ -13,7 +13,7 @@ module ControlFun where
 import Data.Monoid (Sum(..))
 import Data.Proxy
 import Data.Type.Equality
-import Language.Haskell.TH (Q, Code)
+import Language.Haskell.TH (Q, Code, Type)
 import Language.Haskell.TH.Syntax (unTypeCode, unsafeCodeCoerce)
 import Test.QuickCheck
 
@@ -24,23 +24,25 @@ import Language.Haskell.ReverseAD.TH
 newtype ControlFun a b = ControlFun (forall s. (Floating s, Ord s) => ReplaceElements a s -> ReplaceElements b s)
 
 reverseADandControl
-  :: forall a b. (KnownStructure a, KnownStructure b)
-  => Code Q (a -> b)
+  :: forall a b.
+     Q Type  -- ^ a
+  -> Q Type  -- ^ b
+  -> Code Q (a -> b)
   -> Code Q (a -> (b, b -> a), ControlFun a b)
-reverseADandControl program =
+reverseADandControl inpStruc outStruc program =
   -- The code coercion here goes from `a -> b` to
   -- `ReplaceElements a s -> ReplaceElements b s`, which is fine if the
   -- function is suitably generic over the scalar type. Which is the whole
-  -- point of using forward AD.
-  [|| ($$(reverseAD program)
+  -- point of using dual-numbers AD.
+  [|| ($$(reverseAD' (deriveStructureT inpStruc) (deriveStructureT outStruc) program)
       ,ControlFun $$(unsafeCodeCoerce (unTypeCode program))) ||]
 
-useTypeForReverseAD ''Sum
+-- useTypeForReverseAD ''Sum
 
 newtype WeirdType a b = MkWeirdType (Int, [(a, b)])
   deriving (Show)
 
-useTypeForReverseAD ''WeirdType
+-- useTypeForReverseAD ''WeirdType
 
 instance (FinDiff a, FinDiff b, Element a ~ Element b) => FinDiff (WeirdType a b) where
   type Element (WeirdType a b) = Element a

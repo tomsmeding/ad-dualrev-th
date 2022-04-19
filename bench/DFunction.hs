@@ -1,11 +1,15 @@
 {-| This separate module exists and is not inlined in "Main" solely because of
     the GHC stage restriction: 'makeFunction' needs to be defined in a
     separate module from where it is used. -}
+{-# LANGUAGE ImpredicativeTypes #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
 module DFunction where
 
-import Language.Haskell.TH (Quote, Code)
+import Data.Proxy
+import Language.Haskell.TH (Q, Code, Type, unsafeCodeCoerce, unTypeCode)
 
 import qualified Numeric.AD as AD
 import qualified Language.Haskell.ReverseAD.TH as DR
@@ -18,15 +22,17 @@ data DFunction f = DFunction
 newtype GenericFunction f = GenericFunction
   { runGF :: forall s. (Floating s, Ord s) => f s -> s }
 
-makeFunction :: (DR.KnownStructure (f Double), Quote m, MonadFail m)
-             => Code m (GenericFunction f)
-             -> Code m (DFunction f)
-makeFunction code =
-  [|| DFunction
-        { funOriginal = runGF $$(code)
-        , radWithTH = \x ->
-            case $$(DR.reverseAD [|| \y -> case $$(code) of GenericFunction f -> f y ||]) x of
-              (out, df) -> (out, df 1.0) } ||]
+makeFunction :: forall f.
+                Q Type  -- ^ `f Double`
+             -> Code Q (f Double -> Double)
+             -> Code Q (DFunction f)
+makeFunction struc code =
+  let code1 = unsafeCodeCoerce [| GenericFunction $(unTypeCode code) |] :: Code Q (GenericFunction f)
+  in [|| DFunction
+           { funOriginal = runGF $$(code1)
+           , radWithTH = \x ->
+               case $$(DR.reverseAD' (DR.deriveStructureT struc) (DR.knownStructure (Proxy @Double)) [|| \y -> $$(code) y ||]) x of
+                 (out, df) -> (out, df 1.0) } ||]
 
 radWithAD :: Traversable f => DFunction f -> f Double -> (Double, f Double)
 radWithAD fun = AD.grad' (\x -> funOriginal fun x)

@@ -14,6 +14,7 @@ import Data.Type.Equality
 import ControlFun
 import FinDiff
 import ForwardAD
+import Language.Haskell.TH.Stupid
 import Test.Framework hiding (elements)
 
 
@@ -117,33 +118,33 @@ main =
   changeArgs (\a -> a { maxSuccess = 50000 }) $
   tree "AD"
     [checkFDcontrol "id"
-       $$(reverseADandControl @Double @Double
+       $$(reverseADandControl @Double @Double (parseType "Double") (parseType "Double")
             [|| \x -> x ||])
        (Just (\_ d -> d))
        YesFD
     ,checkFDcontrol "plus"
-       $$(reverseADandControl @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double (parseType "(Double, Double)") (parseType "Double")
             [|| \(x, y) -> x + y ||])
        (Just (\_ d -> (d,d)))
        YesFD
     ,checkFDcontrol "times"
-       $$(reverseADandControl @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double (parseType "(Double, Double)") (parseType "Double")
             [|| \(x, y) -> x * y ||])
        (Just (\(x,y) d -> (y*d,x*d)))
        YesFD
     ,checkFDcontrol "let"
-       $$(reverseADandControl @Double @Double
+       $$(reverseADandControl @Double @Double (parseType "Double") (parseType "Double")
             [|| \x -> let y = 3.0 + x in x * y ||])
        (Just (\x d -> d * (2*x + 3)))
        YesFD
     ,checkFDcontrol "higher-order"
-       $$(reverseADandControl @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double (parseType "(Double, Double)") (parseType "Double")
             [|| \(x,y) -> let f = \z -> x * z + y
                           in f y * f x ||])
        (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
        YesFD
     ,checkFDcontrol "higher-order2"
-       $$(reverseADandControl @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double (parseType "(Double, Double)") (parseType "Double")
             [|| \(x,y) -> let f z = x * z + y
                               g f' u = f' u * f x
                               h = g f
@@ -151,7 +152,7 @@ main =
        (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
        YesFD
     ,checkFDcontrol "complexity"
-       $$(reverseADandControl @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double (parseType "(Double, Double)") (parseType "Double")
             [|| \(x,y) -> let x1 = x + y
                               x2 = x1 + x
                               x3 = x2 + x1
@@ -168,7 +169,7 @@ main =
        (Just (\(x,y) d -> (d * (2*7921*x + 9790*y), d * (9790*x + 2*3025*y))))
        YesFD
     ,checkFDcontrol "complexity2"
-       $$(reverseADandControl @Double @Double
+       $$(reverseADandControl @Double @Double (parseType "Double") (parseType "Double")
             [|| \x0 -> let x1  = x0 + x0 + x0 + x0 + x0 - x0 - x0 - x0
                            x2  = x1 + x1 + x1 + x1 + x1 - x1 - x1 - x1
                            x3  = x2 + x2 + x2 + x2 + x2 - x2 - x2 - x2
@@ -187,46 +188,46 @@ main =
        (Just (\x d -> 0.000001 * 2^21 * x * d))
        YesFD
     ,checkFDcontrol "conditional"
-       $$(reverseADandControl @(Double, Double) @Double
+       $$(reverseADandControl @(Double, Double) @Double (parseType "(Double, Double)") (parseType "Double")
             [|| \(x,y) -> if x > y then x * y else x + y ||])
        (Just (\(x,y) d -> if x > y then (d * y, d * x) else (d, d)))
        NoFD
     ,checkFDcontrol "recursive"
-       $$(reverseADandControl @Double @Double
+       $$(reverseADandControl @Double @Double (parseType "Double") (parseType "Double")
             [|| \x0 -> let f = \x -> if x < 10.0 then g (x * 0.6) + 1.0 else g (x * 0.1) + 2.0
                            g = \x -> if x < 1.0 then x else f (x - 1.0) + 2.0
                        in f x0 ||])
        Nothing
        YesFD
     ,checkFDcontrol "list constr"
-       $$(reverseADandControl @Double @[Double]
+       $$(reverseADandControl @Double @[Double] (parseType "Double") (parseType "[Double]")
             [|| \x -> 2.0 * x : 3.0 * x : [x, x + 1.0] ||])
        (Just (\_ d -> sum (zipWith (*) [2,3,1,1] d)))
        YesFD
     ,checkFDcontrol "list case"
-       $$(reverseADandControl @[Double] @Double
+       $$(reverseADandControl @[Double] @Double (parseType "[Double]") (parseType "Double")
             [|| \l -> case l of [] -> 2.0
                                 x : _ -> x + 3.0 ||])
        Nothing
        YesFD
     ,checkFDcontrol "Sum newtype"
-       $$(reverseADandControl @(Sum Double) @Double
+       $$(reverseADandControl @(Sum Double) @Double (parseType "Sum Double") (parseType "Double")
             [|| \s -> case s of Sum x -> 2.0 * x ||])
        (Just (\_ d -> Sum (2 * d)))
        YesFD
-    ,changeArgs (\a -> a { maxSuccess = 5000 }) $
+    ,changeArgs (\a -> a { maxSuccess = 1000 }) $
      checkFDcontrol "WeirdType newtype"
-       $$(reverseADandControl @(WeirdType Double Int, Double) @Double
+       $$(reverseADandControl @(WeirdType Double Int, Double) @Double (parseType "(WeirdType Double Int, Double)") (parseType "Double")
             [|| \(MkWeirdType (n, l), x) ->
                   let mul [] = []
                       mul ((y,k):ps) = (y * x, k) : mul ps
                       times [] = 0
                       times ((_,k):ps) = k + times ps
-                      iterate k f y = if k == 0 then y else iterate (k - 1) f (f y)
-                      sum [] = 0.0
-                      sum ((y,_):ps) = y + sum ps
+                      iterate' k f y = if k == 0 then y else iterate' (k - 1) f (f y)
+                      sum' [] = 0.0
+                      sum' ((y,_):ps) = y + sum' ps
                       count = let k = n + times l in if k < 0 then -k else k
-                  in sum (iterate (if count > 10 then 10 else count) mul l) ||])
+                  in sum' (iterate' (if count > 10 then 10 else count) mul l) ||])
        Nothing
        YesFD
     ]

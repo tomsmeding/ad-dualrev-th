@@ -19,22 +19,28 @@
 {-# OPTIONS -Wno-incomplete-uni-patterns #-}
 module Language.Haskell.ReverseAD.TH (
   reverseAD,
-  useTypeForReverseAD,
-  KnownStructure,
+  reverseAD',
+  -- useTypeForReverseAD,
+  KnownType,
+  Structure,
+  knownStructure,
+  deriveStructureT,
 ) where
 
 import Control.Applicative (asum)
-import Data.Bifunctor (first)
-import Control.Monad (forM, zipWithM)
-import Data.Coerce
+import Data.Bifunctor (first, second)
+import Control.Monad (forM, zipWithM, when)
 import Data.Foldable (toList)
 import Data.Function ((&))
 import Data.List (tails, mapAccumL)
 import Data.Int
+import Data.Proxy
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Some
 import qualified Data.Vector as V
+import Data.Void
 import Data.Word
 import GHC.TypeLits (TypeError, ErrorMessage(Text))
 import GHC.Types (Multiplicity(One))
@@ -44,7 +50,7 @@ import Language.Haskell.TH.Lift ()  -- for Lift Name
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
--- import Control.Monad.IO.Class
+import Control.Monad.IO.Class
 -- import Debug.Trace
 
 import qualified Data.Array.Growable as GA
@@ -115,34 +121,103 @@ addContrib i cb adj arr =
     GA.set i (cb, acc + adj) arr1
 
 
-type family TupleOfList list where
-  TupleOfList '[] = ()
-  TupleOfList '[a,b] = (a,b)
-  TupleOfList '[a,b,c] = (a,b,c)
-  TupleOfList '[a,b,c,d] = (a,b,c,d)
-  TupleOfList '[a,b,c,d,e] = (a,b,c,d,e)
+data Structure' tag
+  = SDiscrete
+  | SScalar  -- Double
+  | STuple [Structure' tag]
+  | SList (Structure' tag)
+  | -- | Instantiation of a newtype, with type arguments inlined.
+    SNewtype Name -- ^ data constructor name
+             (Structure' tag)
+  | -- | Instantiation of a data type, with type arguments inlined.
+    SData [(Name, [Structure' tag])]
+  | STag tag
+  deriving (Show)
 
-data HList f list where
-  HNil :: HList f '[]
-  HCons :: f a -> HList f list -> HList f (a ': list)
-deriving instance (forall a. Show (f a)) => Show (HList f list)
+type Structure = Structure' Void
 
-infixr `HCons`
+deriveStructureT :: Q Type -> Q Structure
+deriveStructureT ty = ty >>= deriveStructure mempty
 
-fromHList :: HList f list -> [Some f]
-fromHList HNil = []
-fromHList (HCons x xs) = Some x : fromHList xs
+knownStructure :: KnownType a => Proxy a -> Q Structure
+knownStructure = deriveStructure mempty . knownType
 
-data Structure a where
-  SDiscrete :: Structure a
-  SScalar :: Structure Double
-  STuple :: HList Structure list -> Structure (TupleOfList list)
-  SList :: Structure a -> Structure [a]
-  SNewtype :: Coercible a b
-           => Name -- data constructor of b
-           -> Structure a
-           -> Structure b
-deriving instance Show (Structure a)
+deriveStructure :: Map Name (Structure' tag) -> Type -> Q (Structure' tag)
+deriveStructure = \env -> go env True
+  where
+    go :: Map Name (Structure' tag) -> Bool -> Type -> Q (Structure' tag)
+    go env scalarsAllowed = \case
+      t@AppT{} -> do
+        (headty, argtys) <- collectApps t
+        argstrucs <- mapM (go env scalarsAllowed) argtys
+        goApplied env scalarsAllowed headty argstrucs
+      SigT t _ -> go env scalarsAllowed t
+      ConT n
+        | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
+                   ,''Word, ''Word8, ''Word16, ''Word32, ''Word64]
+        -> return SDiscrete
+        | n == ''Double
+        -> if scalarsAllowed
+             then return SScalar
+             else fail "No literal Double scalars allowed in data type used in reverse AD; replace them with a type parameter."
+        | otherwise
+        -> goApplied env scalarsAllowed (ConT n) []
+      ParensT t -> go env scalarsAllowed t
+      TupleT 0 -> return (STuple [])
+      -- ForallT _ [] t -> go env scalarsAllowed t
+      VarT name ->
+        case Map.lookup name env of
+          Just struc -> return struc
+          Nothing -> fail $ "Type variable out of scope: " ++ show name
+      -- t@(ForallT _ (_:_) _) -> fail $ "Contexts in foralls not supported in type: " ++ replace '\n' ' ' (pprint t)
+      t -> fail $ "Unsupported type in data type: " ++ pprint t
+
+    goApplied :: Map Name (Structure' tag) -> Bool -> Type -> [Structure' tag] -> Q (Structure' tag)
+    goApplied env scalarsAllowed headty argstrucs = case headty of
+      TupleT n
+        | length argstrucs == n
+        -> return (STuple argstrucs)
+
+      ListT
+        | [struc] <- argstrucs
+        -> return (SList struc)
+
+      ConT tyname -> do
+        typedecl <- reify tyname >>= \case
+          TyConI decl -> return decl
+          info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
+        case typedecl of
+          NewtypeD [] _ (map tvbName -> tyvars) _ constr _ -> do
+            when (length tyvars /= length argstrucs) $
+              fail $ "Type not fully applied: " ++ show headty
+            let env' = Map.fromList (zip tyvars argstrucs) <> env
+            case constr of
+              NormalC conname [(_, fieldty)] -> SNewtype conname <$> go env' scalarsAllowed fieldty
+              RecC conname [(_, _, fieldty)] -> SNewtype conname <$> go env' scalarsAllowed fieldty
+              _ -> fail $ "Unsupported constructor format on newtype: " ++ show constr
+          DataD [] _ (map tvbName -> tyvars) _ constrs [] -> do
+            when (length tyvars /= length argstrucs) $
+              fail $ "Type not fully applied: " ++ show headty
+            let env' = Map.fromList (zip tyvars argstrucs) <> env
+                goConstr = \case
+                  NormalC conname (map (\(  _,ty) -> ty) -> fieldtys) ->
+                    (conname,) <$> mapM (go env' False) fieldtys
+                  RecC    conname (map (\(_,_,ty) -> ty) -> fieldtys) ->
+                    (conname,) <$> mapM (go env' False) fieldtys
+                  constr -> fail $ "Unsupported constructor format on newtype: " ++ show constr
+            SData <$> mapM goConstr constrs
+          _ -> fail $ "Type not supported: " ++ show tyname
+
+      _ -> fail $ "Type unsupported in data in reverse AD: " ++ show headty
+
+    collectApps :: Type -> Q (Type, [Type])
+    collectApps (AppT t1 t2) = do (n, ts) <- collectApps t1
+                                  return (n, ts ++ [t2])
+    collectApps t = return (t, [])
+
+    tvbName :: TyVarBndr () -> Name
+    tvbName (PlainTV n _) = n
+    tvbName (KindedTV n _ _) = n
 
 -- | Pattern match on the given data constructor and extract the single value.
 unNewtype :: Quote m => Name -> Exp -> m Exp
@@ -150,33 +225,31 @@ unNewtype conname expr = do
   name <- newName "x"
   return $ CaseE expr [Match (ConP conname [] [VarP name]) (NormalB (VarE name)) []]
 
-class KnownStructure a where knownStructure :: Structure a
+class KnownType a where knownType :: Proxy a -> Type
 
-instance KnownStructure Int where knownStructure = SDiscrete
-instance KnownStructure Int8 where knownStructure = SDiscrete
-instance KnownStructure Int16 where knownStructure = SDiscrete
-instance KnownStructure Int32 where knownStructure = SDiscrete
-instance KnownStructure Int64 where knownStructure = SDiscrete
-instance KnownStructure Word where knownStructure = SDiscrete
-instance KnownStructure Word8 where knownStructure = SDiscrete
-instance KnownStructure Word16 where knownStructure = SDiscrete
-instance KnownStructure Word32 where knownStructure = SDiscrete
-instance KnownStructure Word64 where knownStructure = SDiscrete
-instance KnownStructure () where knownStructure = SDiscrete
+instance KnownType Int where knownType _ = ConT ''Int
+instance KnownType Int8 where knownType _ = ConT ''Int8
+instance KnownType Int16 where knownType _ = ConT ''Int16
+instance KnownType Int32 where knownType _ = ConT ''Int32
+instance KnownType Int64 where knownType _ = ConT ''Int64
+instance KnownType Word where knownType _ = ConT ''Word
+instance KnownType Word8 where knownType _ = ConT ''Word8
+instance KnownType Word16 where knownType _ = ConT ''Word16
+instance KnownType Word32 where knownType _ = ConT ''Word32
+instance KnownType Word64 where knownType _ = ConT ''Word64
+instance KnownType () where knownType _ = TupleT 0
+instance TypeError ('Text "Only Double is an active type for now (Float isn't)") => KnownType Float where knownType = undefined
+instance KnownType Double where knownType _ = ConT ''Double
 
--- instance KnownStructure Float where knownStructure _ = SScalar
-instance TypeError ('Text "Only Double is an active type for now (Float isn't)") => KnownStructure Float where knownStructure = undefined
-instance KnownStructure Double where knownStructure = SScalar
+instance (KnownType a, KnownType b) => KnownType (a, b) where
+  knownType _ = TupleT 2 `AppT` knownType (Proxy @a) `AppT` knownType (Proxy @b)
+instance (KnownType a, KnownType b, KnownType c) => KnownType (a, b, c) where
+  knownType _ = TupleT 3 `AppT` knownType (Proxy @a) `AppT` knownType (Proxy @b) `AppT` knownType (Proxy @c)
+instance (KnownType a, KnownType b, KnownType c, KnownType d) => KnownType (a, b, c, d) where
+  knownType _ = TupleT 3 `AppT` knownType (Proxy @a) `AppT` knownType (Proxy @b) `AppT` knownType (Proxy @c) `AppT` knownType (Proxy @d)
 
-instance (KnownStructure a, KnownStructure b) => KnownStructure (a, b) where
-  knownStructure = STuple (knownStructure `HCons` knownStructure `HCons` HNil)
-instance (KnownStructure a, KnownStructure b, KnownStructure c) => KnownStructure (a, b, c) where
-  knownStructure = STuple (knownStructure `HCons` knownStructure `HCons` knownStructure `HCons` HNil)
-instance (KnownStructure a, KnownStructure b, KnownStructure c, KnownStructure d) => KnownStructure (a, b, c, d) where
-  knownStructure = STuple (knownStructure `HCons` knownStructure `HCons` knownStructure `HCons` knownStructure `HCons` HNil)
-
-instance KnownStructure a => KnownStructure [a] where
-  knownStructure = SList knownStructure
+instance KnownType a => KnownType [a] where
+  knownType _ = ListT `AppT` knownType (Proxy @a)
 
 -- | Use on the top level for a newtype that you wish to use in 'reverseAD'.
 -- For example:
@@ -189,80 +262,86 @@ instance KnownStructure a => KnownStructure [a] where
 -- 'useTypeForReverseAD' invocation and the usage of the datatype in a
 -- 'reverseAD' splice in the same file. Put the 'useTypeForReverseAD'
 -- invocation in a different module and import that.
-useTypeForReverseAD :: Name -> Q [Dec]
-useTypeForReverseAD tyname = do
-  typedecl <- reify tyname >>= \case
-    TyConI decl -> return decl
-    info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
-  (conname, tyvars, fieldty) <- case typedecl of
-    NewtypeD [] _ tyvars _ constr _ -> case constr of
-      NormalC conname [(_, fieldty)] -> return (conname, map tvbName tyvars, fieldty)
-      RecC conname [(_, _, fieldty)] -> return (conname, map tvbName tyvars, fieldty)
-      _ -> fail $ "Unsupported constructor format on newtype: " ++ show constr
-    _ -> fail "Only newtypes supported for now"
-  checkNoScalars fieldty
-  connameexp <- lift conname
-  buildname <- newName "build"
-  let builddecs =
-        [SigD buildname (ArrowT `AppT` (ConT ''Structure `AppT` fieldty)
-                                `AppT` (ConT ''Structure
-                                          `AppT` foldl AppT (ConT tyname) (map VarT tyvars)))
-        ,ValD (VarP buildname)
-              (NormalB (ConE 'SNewtype `AppE` connameexp))
-              []]
-  return [InstanceD Nothing
-                    [ConT ''KnownStructure `AppT` fieldty]
-                    (ConT ''KnownStructure
-                       `AppT` foldl AppT (ConT tyname) (map VarT tyvars))
-                    [ValD (VarP 'knownStructure)
-                          (NormalB (LetE builddecs
-                                         (AppE (VarE buildname) (VarE 'knownStructure))))
-                          []]]
-  where
-    tvbName :: TyVarBndr () -> Name
-    tvbName (PlainTV n _) = n
-    tvbName (KindedTV n _ _) = n
+-- useTypeForReverseAD :: Name -> Q [Dec]
+-- useTypeForReverseAD tyname = do
+--   typedecl <- reify tyname >>= \case
+--     TyConI decl -> return decl
+--     info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
+--   (conname, tyvars, fieldty) <- case typedecl of
+--     NewtypeD [] _ tyvars _ constr _ -> case constr of
+--       NormalC conname [(_, fieldty)] -> return (conname, map tvbName tyvars, fieldty)
+--       RecC conname [(_, _, fieldty)] -> return (conname, map tvbName tyvars, fieldty)
+--       _ -> fail $ "Unsupported constructor format on newtype: " ++ show constr
+--     _ -> fail "Only newtypes supported for now"
+--   checkNoScalars fieldty
+--   connameexp <- lift conname
+--   buildname <- newName "build"
+--   let builddecs =
+--         [SigD buildname (ArrowT `AppT` (ConT ''Structure `AppT` fieldty)
+--                                 `AppT` (ConT ''Structure
+--                                           `AppT` foldl AppT (ConT tyname) (map VarT tyvars)))
+--         ,ValD (VarP buildname)
+--               (NormalB (ConE 'SNewtype `AppE` connameexp))
+--               []]
+--   return [InstanceD Nothing
+--                     [ConT ''KnownStructure `AppT` fieldty]
+--                     (ConT ''KnownStructure
+--                        `AppT` foldl AppT (ConT tyname) (map VarT tyvars))
+--                     [ValD (VarP 'knownStructure)
+--                           (NormalB (LetE builddecs
+--                                          (AppE (VarE buildname) (VarE 'knownStructure))))
+--                           []]]
+--   where
+--     tvbName :: TyVarBndr () -> Name
+--     tvbName (PlainTV n _) = n
+--     tvbName (KindedTV n _ _) = n
 
-    checkNoScalars :: MonadFail m => Type -> m ()
-    checkNoScalars (ForallT _ [] t) = checkNoScalars t
-    checkNoScalars (AppT t1 t2) = checkNoScalars t1 >> checkNoScalars t2
-    checkNoScalars (SigT t _) = checkNoScalars t
-    checkNoScalars (VarT _) = return ()
-    checkNoScalars (ConT n)
-      | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
-                 ,''Word, ''Word8, ''Word16, ''Word32, ''Word64]
-      = return ()
-      | n == ''Double
-      = fail "No literal Double scalars allowed in type used in reverse AD; replace them with a type parameter."
-    checkNoScalars (ParensT t) = checkNoScalars t
-    checkNoScalars (TupleT _) = return ()
-    checkNoScalars ArrowT = return ()
-    checkNoScalars MulArrowT = return ()
-    checkNoScalars ListT = return ()
-    checkNoScalars t = fail $ "Unsupported type in data type: " ++ show t
+--     checkNoScalars :: MonadFail m => Type -> m ()
+--     checkNoScalars (ForallT _ [] t) = checkNoScalars t
+--     checkNoScalars (AppT t1 t2) = checkNoScalars t1 >> checkNoScalars t2
+--     checkNoScalars (SigT t _) = checkNoScalars t
+--     checkNoScalars (VarT _) = return ()
+--     checkNoScalars (ConT n)
+--       | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
+--                  ,''Word, ''Word8, ''Word16, ''Word32, ''Word64]
+--       = return ()
+--       | n == ''Double
+--       = fail "No literal Double scalars allowed in type used in reverse AD; replace them with a type parameter."
+--     checkNoScalars (ParensT t) = checkNoScalars t
+--     checkNoScalars (TupleT _) = return ()
+--     checkNoScalars ArrowT = return ()
+--     checkNoScalars MulArrowT = return ()
+--     checkNoScalars ListT = return ()
+--     checkNoScalars t@(ForallT _ (_:_) _) = fail $ "Contexts in foralls not supported in type: " ++ replace '\n' ' ' (pprint t)
+--     checkNoScalars t = fail $ "Unsupported type in data type: " ++ replace '\n' ' ' (pprint t)
+
+--     replace :: (Eq a, Functor f) => a -> a -> f a -> f a
+--     replace from to = fmap (\x -> if x == from then to else x)
 
 
 -- | Use as follows:
 --
 --     > :t $$(reverseAD @_ @Double [|| \(x, y) -> x * y ||])
 --     (Double, Double) -> (Double, Double -> (Double, Double))
-reverseAD :: forall a b. (KnownStructure a, KnownStructure b)
+reverseAD :: forall a b. (KnownType a, KnownType b)
           => Code Q (a -> b)
           -> Code Q (a -> (b, b -> a))
-reverseAD = reverseAD' knownStructure knownStructure
+reverseAD = reverseAD' (knownStructure (Proxy @a)) (knownStructure (Proxy @b))
 
 -- | Same as 'reverseAD', but with user-supplied 'Structure's.
 reverseAD' :: forall a b.
-              Structure a
-           -> Structure b
+              Q Structure  -- ^ a
+           -> Q Structure  -- ^ b
            -> Code Q (a -> b)
            -> Code Q (a -> (b, b -> a))
-reverseAD' inpStruc outStruc (examineCode -> inputCode) =
+reverseAD' inpStruc outStruc (unTypeCode -> inputCode) =
   unsafeCodeCoerce $ do
-    ex <- unType <$> inputCode
-    transform inpStruc outStruc ex
+    inpStruc' <- inpStruc
+    outStruc' <- outStruc
+    ex <- inputCode
+    transform inpStruc' outStruc' ex
 
-transform :: Structure inp -> Structure out -> Exp -> Q Exp
+transform :: Structure -> Structure -> Exp -> Q Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
   argvar <- newName "arg"
   onevar <- newName "one"
@@ -323,7 +402,7 @@ deinterleaveList f l =
 -- outexp :: Dt[a]                            -- expression returning the output of the transformed program
 -- result :: (a                               -- primal result
 --           ,a -> BuildState -o BuildState)  -- given adjoint, add initial contributions
-deinterleave :: Quote m => Structure out -> Exp -> m Exp
+deinterleave :: Quote m => Structure -> Exp -> m Exp
 deinterleave topstruc outexp = case topstruc of
   SDiscrete -> return (pair outexp (LamE [WildP] (VarE 'PL.id)))
 
@@ -339,14 +418,14 @@ deinterleave topstruc outexp = case topstruc of
              (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
 
   STuple strucs -> do
-    (funs, outnames, adjnames) <- fmap unzip3 . forM (zip (fromHList strucs) [1::Int ..]) $ \(Some struc', index) -> do
+    (funs, outnames, adjnames) <- fmap unzip3 . forM (zip strucs [1::Int ..]) $ \(struc', index) -> do
       outn <- newName ("out" ++ show index)
       adjn <- newName ("adj" ++ show index)
       fun <- deinterleave struc' (VarE outn)
       return (fun, outn, adjn)
     fulloutname <- newName "out"
     case strucs of
-      HNil -> return (pair (TupE []) (LamE [WildP] (VarE 'PL.id)))
+      [] -> return (pair (TupE []) (LamE [WildP] (VarE 'PL.id)))
       _ -> return $
         LetE [ValD (AsP fulloutname (TupP (map VarP outnames))) (NormalB outexp) []] $
           pair (VarE fulloutname)
@@ -381,7 +460,7 @@ reconstructList f primal i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 primal)
 -- startid :: Name Int                 -- first ID in this substructure
 -- ~> result :: (s, Int)               -- final input adjoint plus next ID after this substructure
 -- In ID generation monad; also returns whether the inexp argument was actually used
-reconstruct :: Quote m => Structure inp -> Exp -> Exp -> Name -> m (Exp, Bool)
+reconstruct :: Quote m => Structure -> Exp -> Exp -> Name -> m (Exp, Bool)
 reconstruct topstruc inexp vecexp startid = case topstruc of
   SDiscrete -> return (pair inexp (VarE startid), True)
 
@@ -390,13 +469,13 @@ reconstruct topstruc inexp vecexp startid = case topstruc of
                     ,False)
 
   STuple strucs -> do
-    innames <- zipWithM (\_ i -> newName ("in" ++ show i)) (fromHList strucs) [1::Int ..]
-    recnames <- zipWithM (\_ i -> newName ("y" ++ show i)) (fromHList strucs) [1::Int ..]
-    idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) (fromHList strucs) [1::Int ..]
+    innames <- zipWithM (\_ i -> newName ("in" ++ show i)) strucs [1::Int ..]
+    recnames <- zipWithM (\_ i -> newName ("y" ++ show i)) strucs [1::Int ..]
+    idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) strucs [1::Int ..]
     (recexps, useds) <-
-      unzip <$> zipWithM3 (\(Some str) inn idn -> reconstruct str inn vecexp idn)
-                          (fromHList strucs) (map VarE innames) (startid : idnames)
-    let outid = case strucs of HNil -> startid ; _ -> last idnames
+      unzip <$> zipWithM3 (\str inn idn -> reconstruct str inn vecexp idn)
+                          strucs (map VarE innames) (startid : idnames)
+    let outid = case strucs of [] -> startid ; _ -> last idnames
     return $
       (LetE ((if or useds
                 then [ValD (TupP (zipWith (\n u -> if u then VarP n else WildP)
@@ -633,15 +712,32 @@ ddrPat = \case
     | name `elem` ['(:), '[]] -> ConP name [] <$> traverse ddrPat args
     | otherwise -> do
         conty <- reifyType name
-        con <- case typeApplyN conty (length args) >>= extractTypeCon of
-          Just con -> return con
-          _ -> fail $ show (length args) ++ " arguments given to " ++ show conty ++ " but not a function type"
-        typedecl <- reify con >>= \case
-          TyConI decl -> return decl
-          info -> fail $ "Constructor of " ++ show name ++ " used in pattern, but not a type? " ++ show info
-        if checkStructuralType typedecl
-          then ConP name [] <$> traverse ddrPat args
-          else notSupported "Pattern matching on this type" (Just (show con))
+        appliedType <- case typeApplyN conty (length args) of
+          Just ty -> return ty
+          Nothing -> fail $ show (length args) ++ " arguments given to " ++ show conty ++ " but not a function type"
+        tyargs <- case extractTypeCon appliedType of
+                    Just (_, tyargs)
+                      | Just tyargs' <- traverse (\case VarT n -> Just n
+                                                        _ -> Nothing)
+                                                 tyargs
+                      -> return tyargs'
+                      | otherwise
+                      -> fail "Normal constructor has GADT properties?"
+                    Nothing -> fail $ "Unknown type format " ++ show appliedType
+        -- liftIO (print appliedType)
+        -- liftIO (print tyargs)
+        -- The fact that 'deriveStructure' returns successfully implies that the type is fine
+        _ <- deriveStructure (Map.fromList (zip tyargs (repeat (STag ())))) appliedType
+        ConP name [] <$> traverse ddrPat args
+        -- typename <- case extractTypeCon appliedType of
+        --   Just ty -> return ty
+        --   Nothing -> fail $ "Unknown type format " ++ show appliedType
+        -- typedecl <- reify typename >>= \case
+        --   TyConI decl -> return decl
+        --   info -> fail $ "Constructor of " ++ show name ++ " used in pattern, but not a type? " ++ show info
+        -- if checkStructuralType typedecl
+        --   then ConP name [] <$> traverse ddrPat args
+        --   else notSupported "Pattern matching on this type" (Just (show typename))
   InfixP p1 name p2
     | name == '(:) -> InfixP <$> ddrPat p1 <*> return name <*> ddrPat p2
     | otherwise -> notSupported "This constructor in a pattern" (Just (show name))
@@ -664,30 +760,30 @@ typeApplyN (MulArrowT `AppT` PromotedT multi `AppT` _ `AppT` t) n
   | multi == 'One = typeApplyN t (n - 1)
 typeApplyN _ _ = Nothing
 
-extractTypeCon :: Type -> Maybe Name
-extractTypeCon (AppT t _) = extractTypeCon t
-extractTypeCon (ConT n) = Just n
+extractTypeCon :: Type -> Maybe (Name, [Type])
+extractTypeCon (AppT t arg) = second (++ [arg]) <$> extractTypeCon t
+extractTypeCon (ConT n) = Just (n, [])
 extractTypeCon _ = Nothing
 
--- | Checks that the type with this declaration is isomorphic to nested
--- products/sums plus possibly some discrete literal types. This is a
--- sufficient criterion for the constructors of the type being allowable in
--- expressions and patterns under 'reverseAD'.
-checkStructuralType :: Dec -> Bool
-checkStructuralType = \case
-  NewtypeD [] _ _ _ constr _ -> goCon constr
-  DataD [] _ _ _ constrs _ -> all goCon constrs
-  _ -> False
-  where
-    goCon :: Con -> Bool
-    goCon = \case
-      NormalC _ tys -> all goField [ty | (_, ty) <- tys]
-      RecC _ tys -> all goField [ty | (_, _, ty) <- tys]
-      _ -> False
+-- -- | Checks that the type with this declaration is isomorphic to nested
+-- -- products/sums plus possibly some discrete literal types. This is a
+-- -- sufficient criterion for the constructors of the type being allowable in
+-- -- expressions and patterns under 'reverseAD'.
+-- checkStructuralType :: Dec -> Bool
+-- checkStructuralType = \case
+--   NewtypeD [] _ _ _ constr _ -> goCon constr
+--   DataD [] _ _ _ constrs _ -> all goCon constrs
+--   _ -> False
+--   where
+--     goCon :: Con -> Bool
+--     goCon = \case
+--       NormalC _ tys -> all goField [ty | (_, ty) <- tys]
+--       RecC _ tys -> all goField [ty | (_, _, ty) <- tys]
+--       _ -> False
 
-    goField :: Type -> Bool
-    goField  (VarT _) = True
-    goField _ = False
+--     goField :: Type -> Bool
+--     goField (VarT _) = True
+--     goField _ = False
 
 class NumOperation a where
   type DualNum a = r | r -> a
@@ -802,7 +898,7 @@ numberList f l i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 l)
 -- input :: a
 -- nextid :: Name Int
 -- result :: (Dt[a], Int)
-numberInput :: Quote m => Structure inp -> Exp -> Name -> m Exp
+numberInput :: Quote m => Structure -> Exp -> Name -> m Exp
 numberInput topstruc input nextid = case topstruc of
   SDiscrete -> return (pair input (VarE nextid))
 
@@ -813,11 +909,11 @@ numberInput topstruc input nextid = case topstruc of
          (AppE (VarE 'succ) (VarE nextid))
 
   STuple strucs -> do
-    names <- mapM (const (newName "inp")) (fromHList strucs)
-    postnames <- mapM (const (newName "inp'")) (fromHList strucs)
-    idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) (fromHList strucs) [1::Int ..]
+    names <- mapM (const (newName "inp")) strucs
+    postnames <- mapM (const (newName "inp'")) strucs
+    idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) strucs [1::Int ..]
     let outid = case idnames of [] -> nextid ; _ -> last idnames
-    exps <- zipWithM3 (\(Some str) -> numberInput str) (fromHList strucs) (map VarE names) (nextid : idnames)
+    exps <- zipWithM3 (\str -> numberInput str) strucs (map VarE names) (nextid : idnames)
     return (LetE (ValD (TupP (map VarP names)) (NormalB input) []
                  : [ValD (TupP [VarP postname, VarP idname]) (NormalB expr) []
                    | (postname, idname, expr) <- zip3 postnames idnames exps])
