@@ -107,6 +107,44 @@ instance (FinDiff a, FinDiff b, Element a ~ Element b) => FinDiff (a, b) where
     , Refl <- replaceElementsId @b
     = Refl
 
+instance (FinDiff a, FinDiff b, FinDiff c, Element a ~ Element b, Element a ~ Element c) => FinDiff (a, b, c) where
+  type Element (a, b, c) = Element a
+  type ReplaceElements (a, b, c) s = (ReplaceElements a s, ReplaceElements b s, ReplaceElements c s)
+  elements' _ (x, y, z) = elements' (Proxy @a) x ++ elements' (Proxy @b) y ++ elements' (Proxy @c) z
+  rebuild' _ p (refx, refy, refz) l =
+    let (x, l1) = rebuild' (Proxy @a) p refx l
+        (y, l2) = rebuild' (Proxy @b) p refy l1
+        (z, l3) = rebuild' (Proxy @c) p refz l2
+    in ((x, y, z), l3)
+  oneElement _ = oneElement (Proxy @a)
+  zero p (refx, refy, refz) = (zero p refx, zero p refy, zero p refz)
+  replaceElements _ f (x, y, z) = (replaceElements (Proxy @a) f x, replaceElements (Proxy @b) f y, replaceElements (Proxy @c) f z)
+  replaceElementsId
+    | Refl <- replaceElementsId @a
+    , Refl <- replaceElementsId @b
+    , Refl <- replaceElementsId @c
+    = Refl
+
+instance (FinDiff a, FinDiff b, FinDiff c, FinDiff d, Element a ~ Element b, Element a ~ Element c, Element a ~ Element d) => FinDiff (a, b, c, d) where
+  type Element (a, b, c, d) = Element a
+  type ReplaceElements (a, b, c, d) s = (ReplaceElements a s, ReplaceElements b s, ReplaceElements c s, ReplaceElements d s)
+  elements' _ (x, y, z, w) = elements' (Proxy @a) x ++ elements' (Proxy @b) y ++ elements' (Proxy @c) z ++ elements' (Proxy @d) w
+  rebuild' _ p (refx, refy, refz, refw) l =
+    let (x, l1) = rebuild' (Proxy @a) p refx l
+        (y, l2) = rebuild' (Proxy @b) p refy l1
+        (z, l3) = rebuild' (Proxy @c) p refz l2
+        (w, l4) = rebuild' (Proxy @d) p refw l3
+    in ((x, y, z, w), l4)
+  oneElement _ = oneElement (Proxy @a)
+  zero p (refx, refy, refz, refw) = (zero p refx, zero p refy, zero p refz, zero p refw)
+  replaceElements _ f (x, y, z, w) = (replaceElements (Proxy @a) f x, replaceElements (Proxy @b) f y, replaceElements (Proxy @c) f z, replaceElements (Proxy @d) f w)
+  replaceElementsId
+    | Refl <- replaceElementsId @a
+    , Refl <- replaceElementsId @b
+    , Refl <- replaceElementsId @c
+    , Refl <- replaceElementsId @d
+    = Refl
+
 instance FinDiff Double where
   type Element Double = Double
   type ReplaceElements Double s = s
