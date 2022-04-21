@@ -485,7 +485,10 @@ ddr env idName = \case
 
   ConE name
     | name `elem` ['[]] -> return (pair (ConE name) (VarE idName))
-    | otherwise -> fail $ "Data constructor not supported in reverseAD: " ++ show name
+    | otherwise -> do
+        checkDatacon name
+        let todo = "TODO: kleisli-transform every arrow in the type of the data constructor into the id generation monad"
+        fail $ "Data constructor not supported in reverseAD: " ++ show name
 
   LitE lit -> case lit of
     RationalL _ -> return (pair (pair (LitE lit)
@@ -671,33 +674,8 @@ ddrPat = \case
     | not (null tyapps) -> notSupported "Type applications in patterns" (Just (show p))
     | name `elem` ['(:), '[]] -> ConP name [] <$> traverse ddrPat args
     | otherwise -> do
-        conty <- reifyType name
-        appliedType <- case typeApplyN conty (length args) of
-          Just ty -> return ty
-          Nothing -> fail $ show (length args) ++ " arguments given to " ++ show conty ++ " but not a function type"
-        tyargs <- case extractTypeCon appliedType of
-                    Just (_, tyargs)
-                      | Just tyargs' <- traverse (\case VarT n -> Just n
-                                                        _ -> Nothing)
-                                                 tyargs
-                      -> return tyargs'
-                      | otherwise
-                      -> fail "Normal constructor has GADT properties?"
-                    Nothing -> fail $ "Unknown type format " ++ show appliedType
-        -- liftIO (print appliedType)
-        -- liftIO (print tyargs)
-        -- The fact that 'deriveStructure' returns successfully implies that the type is fine
-        _ <- deriveStructure (Map.fromList (zip tyargs (repeat (STag ())))) appliedType
+        checkDatacon name
         ConP name [] <$> traverse ddrPat args
-        -- typename <- case extractTypeCon appliedType of
-        --   Just ty -> return ty
-        --   Nothing -> fail $ "Unknown type format " ++ show appliedType
-        -- typedecl <- reify typename >>= \case
-        --   TyConI decl -> return decl
-        --   info -> fail $ "Constructor of " ++ show name ++ " used in pattern, but not a type? " ++ show info
-        -- if checkStructuralType typedecl
-        --   then ConP name [] <$> traverse ddrPat args
-        --   else notSupported "Pattern matching on this type" (Just (show typename))
   InfixP p1 name p2
     | name == '(:) -> InfixP <$> ddrPat p1 <*> return name <*> ddrPat p2
     | otherwise -> notSupported "This constructor in a pattern" (Just (show name))
@@ -712,13 +690,32 @@ ddrPat = \case
   p@SigP{} -> notSupported "Type signatures in patterns, because then I need to rewrite types and I'm lazy" (Just (show p))
   p@ViewP{} -> notSupported "View patterns" (Just (show p))
 
-typeApplyN :: Type -> Int -> Maybe Type
-typeApplyN t 0 = Just t
-typeApplyN (ForallT _ _ t) n = typeApplyN t n
-typeApplyN (ArrowT `AppT` _ `AppT` t) n = typeApplyN t (n - 1)
-typeApplyN (MulArrowT `AppT` PromotedT multi `AppT` _ `AppT` t) n
-  | multi == 'One = typeApplyN t (n - 1)
-typeApplyN _ _ = Nothing
+checkDatacon :: Name -> Q ()
+checkDatacon name = do
+  conty <- reifyType name
+  (tycon, tyargs) <- case fromDataconType conty of
+    Just ty -> return ty
+    Nothing -> fail $ "Could not deduce root type from type of data constructor " ++ pprint name
+  tyvars <- case traverse (\case VarT n -> Just n
+                                 _ -> Nothing)
+                          tyargs of
+              Just vars -> return vars
+              Nothing -> fail "Normal constructor has GADT properties?"
+  let appliedType = foldl AppT (ConT tycon) (map VarT tyvars)
+  -- The fact that 'deriveStructure' returns successfully implies that the type is fine
+  _ <- deriveStructure (Map.fromList (zip tyvars (repeat (STag ())))) appliedType
+  return ()
+
+-- | Given the type of a data constructor, return the name of the type it is a
+-- constructor of, together with the instantiations of the type parameters of
+-- that type.
+fromDataconType :: Type -> Maybe (Name, [Type])
+fromDataconType (ForallT _ _ t) = fromDataconType t
+fromDataconType (ArrowT `AppT` _ `AppT` t) = fromDataconType t
+fromDataconType (MulArrowT `AppT` PromotedT multi `AppT` _ `AppT` t)
+  | multi == 'One = fromDataconType t
+  | otherwise = Nothing
+fromDataconType t = extractTypeCon t
 
 extractTypeCon :: Type -> Maybe (Name, [Type])
 extractTypeCon (AppT t arg) = second (++ [arg]) <$> extractTypeCon t
@@ -914,6 +911,33 @@ numberInput topstruc input nextid = case topstruc of
                             ,Just (InfixE (Just (ConE conname)) (VarE '(.)) (Just (VarE fvar)))
                             ,Just (VarE i'var)]))
              []]
+
+  SData datacons -> do
+    let maxlen = maximum [length fieldstrucs | (_, fieldstrucs) <- datacons]
+    innames  <- mapM (\i -> newName ("x"  ++ show i)) [1 .. maxlen]
+    outnames <- mapM (\i -> newName ("x'" ++ show i)) [1 .. maxlen]
+    fnames   <- mapM (\i -> newName ("f"  ++ show i)) [1 .. maxlen]
+    idnames  <- mapM (\i -> newName ("i"  ++ show i)) [1 .. maxlen]
+    arrname <- newName "arr"
+    matches <- sequence
+      [do let takeN = take (length fieldstrucs)
+              outid = case fieldstrucs of [] -> nextid ; _ -> idnames !! (length fieldstrucs - 1)
+          exprs <- zipWithM3 numberInput fieldstrucs (map VarE innames) (nextid : idnames)
+          return $ Match (ConP conname [] (map VarP (takeN innames)))
+                         (NormalB
+                            (LetE [ValD (TupP [VarP outname, VarP fname, VarP outidname])
+                                        (NormalB expr)
+                                        []
+                                  | (outname, fname, outidname, expr)
+                                      <- zip4 outnames fnames idnames exprs] $
+                               triple (TupE (map (Just . VarE) (takeN outnames)))
+                                      (LamE [VarP arrname] $
+                                         TupE (map (\f -> Just (VarE f `AppE` VarE arrname))
+                                                   (takeN fnames)))
+                                      (VarE outid)))
+                         []
+      | (conname, fieldstrucs) <- datacons]
+    return $ CaseE input matches
 
 fst3 :: (a, b, c) -> a
 fst3 (a, _, _) = a
