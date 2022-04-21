@@ -19,6 +19,7 @@ module FinDiff (
   newtypeFinDiff,
 ) where
 
+import Data.Bifunctor (first)
 import Data.Monoid (Sum(..))
 import Data.Proxy
 import Data.List (transpose, foldl')
@@ -153,18 +154,50 @@ newtypeFinDiff :: Name -> Q [Dec]
 newtypeFinDiff tyname = do
   reify tyname >>= \case
     TyConI (NewtypeD [] _ tvbs _ constr _) -> do
-      (tyvars, fieldty) <- case constr of
-        NormalC _ [(_, fieldty)] -> return (map tvbName tvbs, fieldty)
-        RecC _ [(_, _, fieldty)] -> return (map tvbName tvbs, fieldty)
+      (tyvars, conname, fieldty) <- case constr of
+        NormalC conname [(_, fieldty)] -> return (map tvbName tvbs, conname, fieldty)
+        RecC conname [(_, _, fieldty)] -> return (map tvbName tvbs, conname, fieldty)
         _ -> error "newtypeFinDiff: Unknown newtype form"
+
+      svar <- newName "s"
+      xvar <- newName "x"
+      refvar <- newName "ref"
+      pvar <- newName "p"
+      eltsvar <- newName "elts"
+      fvar <- newName "f"
+
+      let funD' name pats body = FunD name [Clause pats (NormalB body) []]
 
       let context = map (\n -> ConT ''FinDiff `AppT` VarT n) tyvars
                     ++ map (\n -> EqualityT `AppT` (ConT ''Element `AppT` VarT n)
                                             `AppT` ConT ''Double)
                            tyvars
           targetType = foldl' AppT (ConT tyname) (map VarT tyvars)
+          replacedType = foldl' AppT (ConT tyname) (map (\n -> ConT ''ReplaceElements `AppT` VarT n `AppT` VarT svar) tyvars)
           body =
-            [TySynInstD (TySynEqn Nothing (ConT ''Element `AppT` targetType) (ConT ''Element `AppT` fieldty))]
+            [TySynInstD (TySynEqn Nothing (ConT ''Element `AppT` targetType) (ConT ''Element `AppT` fieldty))
+            ,TySynInstD (TySynEqn Nothing (ConT ''ReplaceElements `AppT` targetType `AppT` VarT svar) replacedType)
+            ,funD' 'elements' [WildP, ConP conname [] [VarP xvar]] $
+               VarE 'elements' `AppE` (ConE 'Proxy `AppTypeE` fieldty) `AppE` VarE xvar
+            ,funD' 'rebuild' [WildP, VarP pvar, ConP conname [] [VarP refvar], VarP eltsvar] $
+               VarE 'first
+                 `AppE` ConE conname
+                 `AppE` (VarE 'rebuild'
+                           `AppE` (ConE 'Proxy `AppTypeE` fieldty)
+                           `AppE` VarE pvar
+                           `AppE` VarE refvar
+                           `AppE` VarE eltsvar)
+            ,funD' 'oneElement [WildP] $
+               VarE 'oneElement `AppE` (ConE 'Proxy `AppTypeE` fieldty)
+            ,funD' 'zero [VarP pvar, ConP conname [] [VarP refvar]] $
+               ConE conname `AppE` (VarE 'zero `AppE` VarE pvar `AppE` VarE refvar)
+            ,funD' 'replaceElements [WildP, VarP fvar, ConP conname [] [VarP xvar]] $
+               ConE conname `AppE` (VarE 'replaceElements `AppE` (ConE 'Proxy `AppTypeE` fieldty) `AppE` VarE fvar `AppE` VarE xvar)
+            ,FunD 'replaceElementsId
+               [Clause []
+                       (GuardedB [(PatG [BindS (ConP 'Refl [] []) (VarE 'replaceElementsId `AppTypeE` fieldty)], ConE 'Refl)])
+                       []]
+            ]
 
       return $ pure $ InstanceD Nothing context (ConT ''FinDiff `AppT` targetType) body
 

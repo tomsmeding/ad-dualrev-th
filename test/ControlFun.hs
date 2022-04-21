@@ -11,8 +11,6 @@
 module ControlFun where
 
 import Data.Monoid (Sum(..))
-import Data.Proxy
-import Data.Type.Equality
 import Language.Haskell.TH (Q, Code, Type)
 import Language.Haskell.TH.Syntax (unTypeCode, unsafeCodeCoerce)
 import Test.QuickCheck

@@ -2,6 +2,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 module Main where
 
 import Prelude hiding ((^))
@@ -116,6 +117,9 @@ data Quaternion a = Quaternion a a a a deriving (Show)
 
 newtype Vec3N a = Vec3N (a, a, a) deriving (Show)
 newtype QuaternionN a = QuaternionN (a, a, a, a) deriving (Show)
+
+newtypeFinDiff ''Vec3N
+newtypeFinDiff ''QuaternionN
 
 main :: IO ()
 main =
