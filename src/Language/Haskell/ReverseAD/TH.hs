@@ -131,7 +131,7 @@ data Structure' tag
              (Structure' tag)
   | -- | Instantiation of a data type, with type arguments inlined.
     SData [(Name, [Structure' tag])]
-  | STag tag
+  | STag !tag
   deriving (Show)
 
 type Structure = Structure' Void
@@ -450,6 +450,21 @@ deinterleave topstruc outexp = case topstruc of
              (NormalB (pair (ConE conname `AppE` VarE primalname)
                             (InfixE (Just (VarE dualname)) (VarE '(.)) (Just (ConE conname)))))
              []]
+
+  SData [] ->
+    return $ CaseE outexp []
+
+  SData datacons -> do
+    let maxlen = maximum [length fieldstrucs | (_, fieldstrucs) <- datacons]
+    allvars <- mapM (\i -> newName ("x" ++ show i)) [1 .. maxlen]
+    matches <- sequence
+      [do let vars = take (length fieldstrucs) allvars
+          exprs <- zipWithM deinterleave fieldstrucs (map VarE vars)
+          return $ Match (ConP conname [] (map VarP vars))
+                         (NormalB (foldl AppE (ConE conname) exprs))
+                         []
+      | (conname, fieldstrucs) <- datacons]
+    return $ CaseE outexp matches
 
 reconstructList :: (Int -> s -> (s, Int)) -> [s] -> Int -> ([s], Int)
 reconstructList f primal i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 primal)
