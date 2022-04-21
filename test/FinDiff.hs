@@ -1,5 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
@@ -13,14 +15,16 @@ module FinDiff (
   jacobianByFinDiff,
   jacobianByElts,
   finiteDifference,
-  FinDiff(..)
+  FinDiff(..),
+  newtypeFinDiff,
 ) where
 
 import Data.Monoid (Sum(..))
 import Data.Proxy
-import Data.List (transpose)
+import Data.List (transpose, foldl')
 -- import qualified Data.Vector as V
 import Data.Type.Equality
+import Language.Haskell.TH
 
 
 class FinDiff a where
@@ -144,6 +148,30 @@ instance FinDiff a => FinDiff (Sum a) where
   zero p (Sum ref) = Sum (zero p ref)
   replaceElements _ f (Sum x) = Sum (replaceElements (Proxy @a) f x)
   replaceElementsId | Refl <- replaceElementsId @a = Refl
+
+newtypeFinDiff :: Name -> Q [Dec]
+newtypeFinDiff tyname = do
+  reify tyname >>= \case
+    TyConI (NewtypeD [] _ tvbs _ constr _) -> do
+      (tyvars, fieldty) <- case constr of
+        NormalC _ [(_, fieldty)] -> return (map tvbName tvbs, fieldty)
+        RecC _ [(_, _, fieldty)] -> return (map tvbName tvbs, fieldty)
+        _ -> error "newtypeFinDiff: Unknown newtype form"
+
+      let context = map (\n -> ConT ''FinDiff `AppT` VarT n) tyvars
+                    ++ map (\n -> EqualityT `AppT` (ConT ''Element `AppT` VarT n)
+                                            `AppT` ConT ''Double)
+                           tyvars
+          targetType = foldl' AppT (ConT tyname) (map VarT tyvars)
+          body =
+            [TySynInstD (TySynEqn Nothing (ConT ''Element `AppT` targetType) (ConT ''Element `AppT` fieldty))]
+
+      return $ pure $ InstanceD Nothing context (ConT ''FinDiff `AppT` targetType) body
+
+    _ -> error "newtypeFinDiff: Only newtypes supported"
+  where
+    tvbName (PlainTV n _) = n
+    tvbName (KindedTV n _ _) = n
 
 -- | Given the reverse derivative of some function of type @a -> b@, return the
 -- Jacobian of the function at the given input.

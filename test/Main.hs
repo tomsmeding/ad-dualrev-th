@@ -111,6 +111,12 @@ checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
                             show refJac ++ " /= " ++ show programJac)
                          (refJac ~= programJac)]
 
+data Vec3 a = Vec3 a a a deriving (Show)
+data Quaternion a = Quaternion a a a a deriving (Show)
+
+newtype Vec3N a = Vec3N (a, a, a) deriving (Show)
+newtype QuaternionN a = QuaternionN (a, a, a, a) deriving (Show)
+
 main :: IO ()
 main =
   runTestsExit $
@@ -230,4 +236,36 @@ main =
                   in sum' (iterate' (if count > 10 then 10 else count) mul l) ||])
        Nothing
        YesFD
+    ,checkFDcontrol "quaternion newtype"
+       $$(reverseADandControl @(Vec3N Double, QuaternionN Double) @(Vec3N Double) (parseType "(Vec3N Double, QuaternionN Double)") (parseType "Vec3N Double")
+            [|| \(topv, topq) ->
+                  let q_to_vec (QuaternionN (x, y, z, _)) = Vec3N (x, y, z)
+                      dot (Vec3N (px, py, pz)) (Vec3N (qx, qy, qz)) = px * qx + py * qy + pz * qz
+                      vadd (Vec3N (px, py, pz)) (Vec3N (qx, qy, qz)) = Vec3N (px + qx, py + qy, pz + qz)
+                      scale k (Vec3N (x, y, z)) = Vec3N (k * x, k * y, k * z)
+                      cross (Vec3N (ax, ay, az)) (Vec3N (bx, by, bz)) = Vec3N (ay*bz - az*by, az*bz - ax*bz, ax*by - ay*bx)
+                      norm x = sqrt (dot x x)
+                      rotate_vec_by_quat v q =
+                        let u = q_to_vec q
+                            s = case q of QuaternionN (_, _, _, s) -> s
+                        in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
+                  in rotate_vec_by_quat topv topq ||])
+       Nothing
+       YesFD
+    -- ,checkFDcontrol "quaternion data"
+    --    $$(reverseADandControl @(Vec3 Double, Quaternion Double) @(Vec3 Double) (parseType "(Vec3 Double, Quaternion Double)") (parseType "Vec3 Double")
+    --         [|| \(topv, topq) ->
+    --               let q_to_vec (Quaternion x y z _) = Vec3 x y z
+    --                   dot (Vec3 px py pz) (Vec3 qx qy qz) = px * qx + py * qy + pz * qz
+    --                   vadd (Vec3 px py pz) (Vec3 qx qy qz) = Vec3 (px + qx) (py + qy) (pz + qz)
+    --                   scale k (Vec3 x y z) = Vec3 (k * x) (k * y) (k * z)
+    --                   cross (Vec3 ax ay az) (Vec3 bx by bz) = Vec3 (ay*bz - az*by) (az*bz - ax*bz) (ax*by - ay*bx)
+    --                   norm x = sqrt (dot x x)
+    --                   rotate_vec_by_quat v q =
+    --                     let u = q_to_vec q
+    --                         Quaternion _ _ _ s = q
+    --                     in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
+    --               in rotate_vec_by_quat topv topq ||])
+    --    Nothing
+    --    YesFD
     ]
