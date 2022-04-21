@@ -28,11 +28,11 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Applicative (asum)
-import Data.Bifunctor (first, second)
+import Data.Bifunctor (second)
 import Control.Monad (forM, zipWithM, when)
 import Data.Foldable (toList)
 import Data.Function ((&))
-import Data.List (tails, mapAccumL)
+import Data.List (tails, mapAccumL, zip4)
 import Data.Int
 import Data.Proxy
 import Data.Map.Strict (Map)
@@ -346,6 +346,7 @@ transform inpStruc outStruc (LamE [pat] expr) = do
   argvar <- newName "arg"
   onevar <- newName "one"
   inp <- numberInput inpStruc (VarE argvar) onevar
+  rebuildvar <- newName "rebuild"
   idvar <- newName "i0"
   patbound <- boundVars pat
   ddrexpr <- ddr patbound idvar expr
@@ -354,15 +355,12 @@ transform inpStruc outStruc (LamE [pat] expr) = do
   dualname <- newName "dual"
   adjname <- newName "adjoint"
   stagedvecname <- newName "stagedvec"
-  vecname <- newName "vec"
   let composeLinearFuns :: [Exp] -> Exp
       composeLinearFuns [] = VarE 'PL.id
       composeLinearFuns l = foldl1 (\a b -> InfixE (Just a) (VarE '(PL..)) (Just b)) l
-  (reconstructExp', _) <- reconstruct inpStruc (VarE argvar) (VarE vecname) onevar
-  let reconstructExp = AppE (VarE 'fst) reconstructExp'
   return (LamE [VarP argvar] $
             LetE [ValD (VarP onevar) (NormalB (SigE (LitE (IntegerL 1)) (ConT ''Int))) []
-                 ,ValD (TupP [pat, VarP idvar]) (NormalB inp) []
+                 ,ValD (TupP [pat, VarP rebuildvar, VarP idvar]) (NormalB inp) []
                  ,ValD (TupP [VarP primalname, VarP dualname]) (NormalB deinterexpr) []] $
               pair (VarE primalname)
                    (LamE [VarP adjname] $
@@ -376,11 +374,8 @@ transform inpStruc outStruc (LamE [pat] expr) = do
                                                    [VarE 'GA.freeze
                                                    ,VarE 'resolve
                                                    ,AppE (VarE dualname) (VarE adjname)]]))
-                                 []
-                           ,ValD (VarP vecname)
-                                 (NormalB (VarE 'V.map `AppE` VarE 'snd `AppE` VarE stagedvecname))
-                                 []]
-                        reconstructExp))
+                                 []] $
+                        VarE rebuildvar `AppE` (VarE 'V.map `AppE` VarE 'snd `AppE` VarE stagedvecname)))
 transform inpStruc outStruc (LamE [] body) =
   transform inpStruc outStruc body
 transform inpStruc outStruc (LamE (pat : pats) body) =
@@ -465,59 +460,6 @@ deinterleave topstruc outexp = case topstruc of
                          []
       | (conname, fieldstrucs) <- datacons]
     return $ CaseE outexp matches
-
-reconstructList :: (Int -> s -> (s, Int)) -> [s] -> Int -> ([s], Int)
-reconstructList f primal i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 primal)
-
--- struc :: Structure s                -- input structure
--- inexp :: s                          -- primal input (duplicable)
--- vecexp :: Vector (Contrib, Double)  -- resolved input adjoint vector (duplicable)
--- startid :: Name Int                 -- first ID in this substructure
--- ~> result :: (s, Int)               -- final input adjoint plus next ID after this substructure
--- In ID generation monad; also returns whether the inexp argument was actually used
-reconstruct :: Quote m => Structure -> Exp -> Exp -> Name -> m (Exp, Bool)
-reconstruct topstruc inexp vecexp startid = case topstruc of
-  SDiscrete -> return (pair inexp (VarE startid), True)
-
-  SScalar -> return (pair (InfixE (Just vecexp) (VarE '(V.!)) (Just (VarE startid)))
-                          (AppE (VarE 'succ) (VarE startid))
-                    ,False)
-
-  STuple strucs -> do
-    innames <- zipWithM (\_ i -> newName ("in" ++ show i)) strucs [1::Int ..]
-    recnames <- zipWithM (\_ i -> newName ("y" ++ show i)) strucs [1::Int ..]
-    idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) strucs [1::Int ..]
-    (recexps, useds) <-
-      unzip <$> zipWithM3 (\str inn idn -> reconstruct str inn vecexp idn)
-                          strucs (map VarE innames) (startid : idnames)
-    let outid = case strucs of [] -> startid ; _ -> last idnames
-    return $
-      (LetE ((if or useds
-                then [ValD (TupP (zipWith (\n u -> if u then VarP n else WildP)
-                                          innames useds))
-                           (NormalB inexp) []]
-                else [])
-             ++ [ValD (TupP [VarP recname, VarP idname]) (NormalB recexp) []
-                | (recname, idname, recexp) <- zip3 recnames idnames recexps]) $
-         pair (TupE (map (Just . VarE) recnames))
-              (VarE outid)
-      ,or useds)
-
-  SList struc -> do
-    argvar <- newName "x"
-    idvar <- newName "i"
-    (body, used) <- reconstruct struc (VarE argvar) vecexp idvar
-    return (VarE 'reconstructList
-              `AppE` LamE [VarP idvar, if used then VarP argvar else WildP] body
-              `AppE` inexp
-              `AppE` VarE startid
-           ,True)
-
-  SNewtype conname struc -> do
-    inexp' <- unNewtype conname inexp  -- strip off the newtype wrapper first
-    (expr, used) <- reconstruct struc inexp' vecexp startid
-    return (VarE 'first `AppE` ConE conname `AppE` expr
-           ,used)
 
 -- Set of names bound in the program at this point
 type Env = Set Name
@@ -693,6 +635,9 @@ ddr env idName = \case
 
 pair :: Exp -> Exp -> Exp
 pair e1 e2 = TupE [Just e1, Just e2]
+
+triple :: Exp -> Exp -> Exp -> Exp
+triple e1 e2 e3 = TupE [Just e1, Just e2, Just e3]
 
 -- | Given list of expressions and the input ID, returns a let-wrapper that
 -- defines a variable for each item in the list (differentiated), the names of
@@ -907,33 +852,46 @@ checkDecsNonRecursive decs = do
     then return (Just tups)
     else return Nothing
 
-numberList :: (Int -> a -> (da, Int)) -> [a] -> Int -> ([da], Int)
-numberList f l i0 = swap (mapAccumL (\i x -> swap (f i x)) i0 l)
+numberList :: (Int -> a -> (da, V.Vector Double -> a, Int)) -> [a] -> Int -> ([da], V.Vector Double -> [a], Int)
+numberList f l i0 =
+  let (outi, pairslist) = mapAccumL (\i x -> let (dx, f', i') = f i x in (i', (dx, f'))) i0 l
+      (dlist, funs) = unzip pairslist
+  in (dlist, \arr -> map ($ arr) funs, outi)
 
 -- input :: a
 -- nextid :: Name Int
--- result :: (Dt[a], Int)
+-- result :: (Dt[a], Vector Double -> a, Int)
 numberInput :: Quote m => Structure -> Exp -> Name -> m Exp
 numberInput topstruc input nextid = case topstruc of
-  SDiscrete -> return (pair input (VarE nextid))
+  SDiscrete -> do
+    var <- newName "inpx"
+    return $ LetE [ValD (VarP var) (NormalB input) []] $
+               triple (VarE var) (LamE [WildP] (VarE var)) (VarE nextid)
 
-  SScalar -> return $
-    pair (pair input
-               (pair (VarE nextid)
-                     (ConE 'Contrib `AppE` ListE [])))
-         (AppE (VarE 'succ) (VarE nextid))
+  SScalar -> do
+    var <- newName "arr"
+    return $
+      triple (pair input
+                   (pair (VarE nextid)
+                         (ConE 'Contrib `AppE` ListE [])))
+             (LamE [VarP var] (InfixE (Just (VarE var)) (VarE '(V.!)) (Just (VarE nextid))))
+             (AppE (VarE 'succ) (VarE nextid))
 
   STuple strucs -> do
     names <- mapM (const (newName "inp")) strucs
     postnames <- mapM (const (newName "inp'")) strucs
+    rebuildnames <- mapM (const (newName "reb")) strucs
     idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) strucs [1::Int ..]
     let outid = case idnames of [] -> nextid ; _ -> last idnames
-    exps <- zipWithM3 (\str -> numberInput str) strucs (map VarE names) (nextid : idnames)
+    exps <- zipWithM3 numberInput strucs (map VarE names) (nextid : idnames)
+    arrname <- newName "arr"
     return (LetE (ValD (TupP (map VarP names)) (NormalB input) []
-                 : [ValD (TupP [VarP postname, VarP idname]) (NormalB expr) []
-                   | (postname, idname, expr) <- zip3 postnames idnames exps])
-                 (pair (TupE (map (Just . VarE) postnames))
-                       (VarE outid)))
+                 : [ValD (TupP [VarP postname, VarP rebuildname, VarP idname]) (NormalB expr) []
+                   | (postname, rebuildname, idname, expr) <- zip4 postnames rebuildnames idnames exps])
+                 (triple (TupE (map (Just . VarE) postnames))
+                         (LamE [VarP arrname] $
+                            TupE (map (\f -> Just (VarE f `AppE` VarE arrname)) rebuildnames))
+                         (VarE outid)))
 
   SList eltstruc -> do
     idxarg <- newName "i"
@@ -947,7 +905,15 @@ numberInput topstruc input nextid = case topstruc of
   SNewtype conname struc -> do
     input' <- unNewtype conname input  -- strip off the newtype wrapper first
     expr <- numberInput struc input' nextid
-    return (VarE 'first `AppE` ConE conname `AppE` expr)
+    dxvar <- newName "dx"
+    fvar <- newName "f"
+    i'var <- newName "i'"
+    return $ CaseE expr
+      [Match (TupP [VarP dxvar, VarP fvar, VarP i'var])
+             (NormalB (TupE [Just (ConE conname `AppE` VarE dxvar)
+                            ,Just (InfixE (Just (ConE conname)) (VarE '(.)) (Just (VarE fvar)))
+                            ,Just (VarE i'var)]))
+             []]
 
 fst3 :: (a, b, c) -> a
 fst3 (a, _, _) = a
@@ -1025,6 +991,3 @@ notSupported descr mthing = fail $ descr ++ " not supported in reverseAD" ++ may
 
 zipWithM3 :: Applicative m => (a -> b -> c -> m d) -> [a] -> [b] -> [c] -> m [d]
 zipWithM3 f a b c = traverse (\(x,y,z) -> f x y z) (zip3 a b c)
-
-swap :: (a, b) -> (b, a)
-swap (a, b) = (b, a)
