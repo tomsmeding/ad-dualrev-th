@@ -20,7 +20,7 @@ import Language.Haskell.TH.Stupid.Parser
 
 
 parseType :: String -> Q Type
-parseType s = runParser (pType <* pspaces) s >>= \case
+parseType s = runParser' (pType <* pspaces) s >>= \case
                 Right (ty, "") -> return ty
                 Right (_, _) -> fail $ "Extra unparsed input at end of " ++ show s
                 Left err -> fail $ "Could not parse type from " ++ show s ++ ": " ++ err
@@ -30,7 +30,7 @@ pType = (foldl1' AppT <$> some pTypeAtom)
 
 pTypeAtom :: Parser Q Type
 pTypeAtom = pspaces >> choice
-  [do pchar '('
+  [do label "parentheses" $ pchar '('
       ty <- pType
       choice [do l <- some (pspaces >> pchar ',' >> pType)
                  pspaces
@@ -38,7 +38,7 @@ pTypeAtom = pspaces >> choice
                  return (foldl' AppT (TupleT (length l + 1)) (ty : l))
              ,do pchar ')'
                  return ty]
-  ,do pchar '['
+  ,do label "list type" $ pchar '['
       ty <- pType
       pspaces
       pchar ']'
@@ -48,14 +48,14 @@ pTypeAtom = pspaces >> choice
 
 pCon :: Parser Q Name
 pCon = do
-  c1 <- psatisfy isUpper
+  c1 <- label "constructor" $ psatisfy isUpper
   cs <- many (psatisfy (\c -> isAlphaNum c || c `elem` "_'"))
   liftParser (lookupTypeName (c1 : cs)) >>= \case
     Just name -> return name
-    Nothing -> fail $ "Type name out of scope: " ++ show (c1 : cs)
+    Nothing -> fatal $ "Type name out of scope: " ++ show (c1 : cs)
 
 pVar :: Monad m => Parser m Name
 pVar = do
-  c1 <- psatisfy isLower
+  c1 <- label "variable" $ psatisfy isLower
   cs <- many (psatisfy (\c -> isAlphaNum c || c `elem` "_'"))
   return (mkName (c1 : cs))

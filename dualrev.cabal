@@ -35,6 +35,20 @@ library
     , vector
   default-language: Haskell2010
 
+library test-framework
+  hs-source-dirs: test-framework
+  exposed-modules:
+    Test.Approx
+    Test.Framework
+    Test.Parallel
+  ghc-options: -Wall -O2
+  build-depends:
+      base >=4.7 && <4.17
+    , clock
+    , containers
+    , QuickCheck
+  default-language: Haskell2010
+
 test-suite test
   type: exitcode-stdio-1.0
   main-is: Main.hs
@@ -43,12 +57,11 @@ test-suite test
     ControlFun
     FinDiff
     ForwardAD
-    Test.Framework
-    Test.Parallel
   ghc-options: -Wall -O2 -threaded -rtsopts
   build-depends:
       base >=4.7 && <4.17
     , dualrev
+    , test-framework
     , clock
     , containers
     , QuickCheck
@@ -65,7 +78,10 @@ benchmark bench
   build-depends:
       base >=4.7 && <4.17
     , dualrev
+    , test-framework
     , ad
-    , criterion-measurement
+    , criterion
+    , deepseq
+    , QuickCheck
     , template-haskell
   default-language: Haskell2010

@@ -10,13 +10,13 @@
     separate module from where it is used. -}
 module ControlFun where
 
-import Data.Monoid (Sum(..))
 import Language.Haskell.TH (Q, Code, Type)
 import Language.Haskell.TH.Syntax (unTypeCode, unsafeCodeCoerce)
 import Test.QuickCheck
 
 import FinDiff
 import Language.Haskell.ReverseAD.TH
+import Test.Approx
 
 
 newtype ControlFun a b = ControlFun (forall s. (Floating s, Ord s) => ReplaceElements a s -> ReplaceElements b s)
@@ -57,3 +57,6 @@ newtypeFinDiff ''WeirdType
 
 instance (Arbitrary a, Arbitrary b) => Arbitrary (WeirdType a b) where
   arbitrary = MkWeirdType <$> arbitrary
+
+instance (Approx a, Approx b) => Approx (WeirdType a b) where
+  approx absdelta reldelta (MkWeirdType (_, l)) (MkWeirdType (_, l')) = approx absdelta reldelta l l'
