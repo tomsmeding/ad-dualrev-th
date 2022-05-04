@@ -17,7 +17,7 @@ import FinDiff
 import ForwardAD
 import Language.Haskell.TH.Stupid
 import Test.Approx
-import Test.Framework hiding (elements)
+import Test.Framework hiding (elements, scale)
 
 
 (^) :: Num a => a -> Int -> a
@@ -84,6 +84,49 @@ checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
 data Vec3 a = Vec3 a a a deriving (Show)
 data Quaternion a = Quaternion a a a a deriving (Show)
 
+instance FinDiff a => FinDiff (Vec3 a) where
+  type Element (Vec3 a) = Element a
+  type ReplaceElements (Vec3 a) s = Vec3 (ReplaceElements a s)
+  elements' _ (Vec3 x y z) = concatMap (elements' (Proxy @a)) [x, y, z]
+  rebuild' _ p (Vec3 rx ry rz) l =
+    let (x, l1) = rebuild' (Proxy @a) p rx l
+        (y, l2) = rebuild' (Proxy @a) p ry l1
+        (z, l3) = rebuild' (Proxy @a) p rz l2
+    in (Vec3 x y z, l3)
+  oneElement _ = oneElement (Proxy @a)
+  zero p (Vec3 rx ry rz) = Vec3 (zero p rx) (zero p ry) (zero p rz)
+  replaceElements _ f (Vec3 x y z) = Vec3 (replaceElements (Proxy @a) f x)
+                                          (replaceElements (Proxy @a) f y)
+                                          (replaceElements (Proxy @a) f z)
+  replaceElementsId | Refl <- replaceElementsId @a = Refl
+
+instance FinDiff a => FinDiff (Quaternion a) where
+  type Element (Quaternion a) = Element a
+  type ReplaceElements (Quaternion a) s = Quaternion (ReplaceElements a s)
+  elements' _ (Quaternion x y z w) = concatMap (elements' (Proxy @a)) [x, y, z, w]
+  rebuild' _ p (Quaternion rx ry rz rw) l =
+    let (x, l1) = rebuild' (Proxy @a) p rx l
+        (y, l2) = rebuild' (Proxy @a) p ry l1
+        (z, l3) = rebuild' (Proxy @a) p rz l2
+        (w, l4) = rebuild' (Proxy @a) p rw l3
+    in (Quaternion x y z w, l4)
+  oneElement _ = oneElement (Proxy @a)
+  zero p (Quaternion rx ry rz rw) = Quaternion (zero p rx) (zero p ry) (zero p rz) (zero p rw)
+  replaceElements _ f (Quaternion x y z w) = Quaternion (replaceElements (Proxy @a) f x)
+                                                        (replaceElements (Proxy @a) f y)
+                                                        (replaceElements (Proxy @a) f z)
+                                                        (replaceElements (Proxy @a) f w)
+  replaceElementsId | Refl <- replaceElementsId @a = Refl
+
+instance Arbitrary a => Arbitrary (Vec3 a) where arbitrary = Vec3 <$> arbitrary <*> arbitrary <*> arbitrary
+instance Arbitrary a => Arbitrary (Quaternion a) where arbitrary = Quaternion <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
+
+instance Approx a => Approx (Vec3 a) where
+  approx absdelta reldelta (Vec3 a b c) (Vec3 a' b' c') = approx absdelta reldelta [a, b, c] [a', b', c']
+
+instance Approx a => Approx (Quaternion a) where
+  approx absdelta reldelta (Quaternion a b c d) (Quaternion a' b' c' d') = approx absdelta reldelta [a, b, c, d] [a', b', c', d']
+
 newtype Vec3N a = Vec3N (a, a, a) deriving (Show)
 newtype QuaternionN a = QuaternionN (a, a, a, a) deriving (Show)
 
@@ -109,6 +152,11 @@ main =
        $$(reverseADandControl @Double @Double (parseType "Double") (parseType "Double")
             [|| \x -> x ||])
        (Just (\_ d -> d))
+       YesFD
+    ,checkFDcontrol "dup"
+       $$(reverseADandControl @Double @(Double, Double) (parseType "Double") (parseType "(Double, Double)")
+            [|| \x -> (x, x) ||])
+       (Just (\_ (d1, d2) -> d1 + d2))
        YesFD
     ,checkFDcontrol "plus"
        $$(reverseADandControl @(Double, Double) @Double (parseType "(Double, Double)") (parseType "Double")
@@ -218,6 +266,16 @@ main =
                   in sum' (iterate' (if count > 10 then 10 else count) mul l) ||])
        Nothing
        YesFD
+    ,checkFDcontrol "Sum newtype constr"
+       $$(reverseADandControl @(Sum Double) @Double (parseType "Sum Double") (parseType "Double")
+            [|| \s -> case s of Sum x -> (case Sum 2.0 of Sum two -> two) * x ||])
+       (Just (\_ d -> Sum (2 * d)))
+       YesFD
+    ,checkFDcontrol "Sum newtype constr2"
+       $$(reverseADandControl @(Sum Double) @(Sum Double) (parseType "Sum Double") (parseType "Sum Double")
+            [|| \(Sum x) -> Sum (2.0 * x) ||])
+       (Just (\_ (Sum d) -> Sum (2 * d)))
+       YesFD
     ,checkFDcontrol "quaternion newtype"
        $$(reverseADandControl @(Vec3N Double, QuaternionN Double) @(Vec3N Double) (parseType "(Vec3N Double, QuaternionN Double)") (parseType "Vec3N Double")
             [|| \(topv, topq) ->
@@ -226,28 +284,28 @@ main =
                       vadd (Vec3N (px, py, pz)) (Vec3N (qx, qy, qz)) = Vec3N (px + qx, py + qy, pz + qz)
                       scale k (Vec3N (x, y, z)) = Vec3N (k * x, k * y, k * z)
                       cross (Vec3N (ax, ay, az)) (Vec3N (bx, by, bz)) = Vec3N (ay*bz - az*by, az*bz - ax*bz, ax*by - ay*bx)
-                      norm x = sqrt (dot x x)
+                      -- norm x = sqrt (dot x x)  -- present in code in paper, but unused
                       rotate_vec_by_quat v q =
                         let u = q_to_vec q
-                            s = case q of QuaternionN (_, _, _, s) -> s
+                            s = case q of QuaternionN (_, _, _, w) -> w
                         in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
                   in rotate_vec_by_quat topv topq ||])
        Nothing
        YesFD
-    -- ,checkFDcontrol "quaternion data"
-    --    $$(reverseADandControl @(Vec3 Double, Quaternion Double) @(Vec3 Double) (parseType "(Vec3 Double, Quaternion Double)") (parseType "Vec3 Double")
-    --         [|| \(topv, topq) ->
-    --               let q_to_vec (Quaternion x y z _) = Vec3 x y z
-    --                   dot (Vec3 px py pz) (Vec3 qx qy qz) = px * qx + py * qy + pz * qz
-    --                   vadd (Vec3 px py pz) (Vec3 qx qy qz) = Vec3 (px + qx) (py + qy) (pz + qz)
-    --                   scale k (Vec3 x y z) = Vec3 (k * x) (k * y) (k * z)
-    --                   cross (Vec3 ax ay az) (Vec3 bx by bz) = Vec3 (ay*bz - az*by) (az*bz - ax*bz) (ax*by - ay*bx)
-    --                   norm x = sqrt (dot x x)
-    --                   rotate_vec_by_quat v q =
-    --                     let u = q_to_vec q
-    --                         Quaternion _ _ _ s = q
-    --                     in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
-    --               in rotate_vec_by_quat topv topq ||])
-    --    Nothing
-    --    YesFD
+    ,checkFDcontrol "quaternion data"
+       $$(reverseADandControl @(Vec3 Double, Quaternion Double) @(Vec3 Double) (parseType "(Vec3 Double, Quaternion Double)") (parseType "Vec3 Double")
+            [|| \(topv, topq) ->
+                  let q_to_vec (Quaternion x y z _) = Vec3 x y z
+                      dot (Vec3 px py pz) (Vec3 qx qy qz) = px * qx + py * qy + pz * qz
+                      vadd (Vec3 px py pz) (Vec3 qx qy qz) = Vec3 (px + qx) (py + qy) (pz + qz)
+                      scale k (Vec3 x y z) = Vec3 (k * x) (k * y) (k * z)
+                      cross (Vec3 ax ay az) (Vec3 bx by bz) = Vec3 (ay*bz - az*by) (az*bz - ax*bz) (ax*by - ay*bx)
+                      norm x = sqrt (dot x x)
+                      rotate_vec_by_quat v q =
+                        let u = q_to_vec q
+                            s = case q of Quaternion _ _ _ w -> w
+                        in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
+                  in rotate_vec_by_quat topv topq ||])
+       Nothing
+       YesFD
     ]

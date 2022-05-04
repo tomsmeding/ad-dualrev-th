@@ -32,7 +32,7 @@ import Data.Bifunctor (second)
 import Control.Monad (forM, zipWithM, when)
 import Data.Foldable (toList)
 import Data.Function ((&))
-import Data.List (tails, mapAccumL, zip4)
+import Data.List (tails, mapAccumL, zip4, unzip5)
 import Data.Int
 import Data.Proxy
 import Data.Map.Strict (Map)
@@ -413,20 +413,23 @@ deinterleave topstruc outexp = case topstruc of
              (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
 
   STuple strucs -> do
-    (funs, outnames, adjnames) <- fmap unzip3 . forM (zip strucs [1::Int ..]) $ \(struc', index) -> do
+    (exprs, outnames, primnames, bpnames, adjnames) <- fmap unzip5 . forM (zip strucs [1::Int ..]) $ \(struc', index) -> do
       outn <- newName ("out" ++ show index)
+      primn <- newName ("prim" ++ show index)
+      bpn <- newName ("bp" ++ show index)
       adjn <- newName ("adj" ++ show index)
-      fun <- deinterleave struc' (VarE outn)
-      return (fun, outn, adjn)
-    fulloutname <- newName "out"
+      expr <- deinterleave struc' (VarE outn)
+      return (expr, outn, primn, bpn, adjn)
     case strucs of
       [] -> return (pair (TupE []) (LamE [WildP] (VarE 'PL.id)))
       _ -> return $
-        LetE [ValD (AsP fulloutname (TupP (map VarP outnames))) (NormalB outexp) []] $
-          pair (VarE fulloutname)
+        LetE (ValD (TupP (map VarP outnames)) (NormalB outexp) []
+             :[ValD (TupP [VarP primn, VarP bpn]) (NormalB expr) []
+              | (expr, primn, bpn) <- zip3 exprs primnames bpnames]) $
+          pair (TupE (map (Just . VarE) primnames))
                (LamE [TupP (map VarP adjnames)] $
                   foldr1 (\e1 e2 -> VarE '(PL..) `AppE` e1 `AppE` e2)
-                         (zipWith AppE funs (map VarE adjnames)))
+                         (zipWith AppE (map VarE bpnames) (map VarE adjnames)))
 
   SList struc -> do
     argvar <- newName "x"
@@ -440,10 +443,12 @@ deinterleave topstruc outexp = case topstruc of
     expr <- deinterleave struc outexp'
     primalname <- newName "primal"
     dualname <- newName "dualf"
+    tempvar <- newName "temp"
+    unnewtypetemp <- LamE [VarP tempvar] <$> unNewtype conname (VarE tempvar)
     return $ CaseE expr
       [Match (TupP [VarP primalname, VarP dualname])
              (NormalB (pair (ConE conname `AppE` VarE primalname)
-                            (InfixE (Just (VarE dualname)) (VarE '(.)) (Just (ConE conname)))))
+                            (InfixE (Just (VarE dualname)) (VarE '(.)) (Just unnewtypetemp))))
              []]
 
   SData [] ->
@@ -481,14 +486,26 @@ ddr env idName = \case
                 ,LamE [WildP] (LitE (IntegerL (-1)))
                 ,VarE iname]
         return (pair function (VarE idName))
+    | name == 'sqrt -> do
+        xname <- newName "x"
+        iname <- newName "i"
+        let function = LamE [VarP xname, VarP iname] $
+              foldl AppE (VarE 'applyUnaryOp)
+                [VarE xname
+                ,VarE 'sqrt
+                ,LamE [VarP xname] (InfixE (Just (LitE (IntegerL 1))) (VarE '(/)) (Just (InfixE (Just (LitE (IntegerL 2))) (VarE '(*)) (Just (AppE (VarE 'sqrt) (VarE xname))))))
+                ,VarE iname]
+        return (pair function (VarE idName))
     | otherwise -> fail $ "Free variables not supported in reverseAD: " ++ show name ++ " (env = " ++ show env ++ ")"
 
   ConE name
     | name `elem` ['[]] -> return (pair (ConE name) (VarE idName))
     | otherwise -> do
         fieldtys <- checkDatacon name
-        let todo = "TODO: kleisli-transform every arrow in the type of the data constructor into the id generation monad"
-        fail $ "Data constructor not supported in reverseAD: " ++ show name
+        -- let todo = "TODO: kleisli-transform every arrow in the type of the data constructor into the id generation monad"
+        conexpr <- liftKleisliN (length fieldtys) (ConE name)
+        return (pair conexpr (VarE idName))
+        -- fail $ "Data constructor not supported in reverseAD: " ++ show name
 
   LitE lit -> case lit of
     RationalL _ -> return (pair (pair (LitE lit)
@@ -541,7 +558,10 @@ ddr env idName = \case
                      (VarE outid)
             else Nothing
 
-    case asum [handleNum, handleOrd] of
+        handleOther =
+          Just $ ddr env idName (AppE (AppE (VarE opname) e1) e2)
+
+    case asum [handleNum, handleOrd, handleOther] of
       Nothing -> fail ("Unsupported infix operator " ++ show opname)
       Just act -> act
 
@@ -731,6 +751,11 @@ extractTypeCon _ = Nothing
 -- > \x1 i1 -> (\x2 i2 -> (... \xn in -> (e x1 ... xn, in), i2), i1)
 liftKleisliN :: Int -> Exp -> Q Exp
 liftKleisliN 0 e = return e
+liftKleisliN n e = do
+  name <- newName "x"
+  e' <- liftKleisliN (n - 1) (AppE e (VarE name))
+  iname <- newName "i"
+  return (LamE [VarP name, VarP iname] $ pair e' (VarE iname))
 
 -- -- | Checks that the type with this declaration is isomorphic to nested
 -- -- products/sums plus possibly some discrete literal types. This is a
