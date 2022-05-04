@@ -486,7 +486,7 @@ ddr env idName = \case
   ConE name
     | name `elem` ['[]] -> return (pair (ConE name) (VarE idName))
     | otherwise -> do
-        checkDatacon name
+        fieldtys <- checkDatacon name
         let todo = "TODO: kleisli-transform every arrow in the type of the data constructor into the id generation monad"
         fail $ "Data constructor not supported in reverseAD: " ++ show name
 
@@ -674,7 +674,8 @@ ddrPat = \case
     | not (null tyapps) -> notSupported "Type applications in patterns" (Just (show p))
     | name `elem` ['(:), '[]] -> ConP name [] <$> traverse ddrPat args
     | otherwise -> do
-        checkDatacon name
+        -- ignore the field types; just validity is good enough, assuming that the user's code was okay
+        _ <- checkDatacon name
         ConP name [] <$> traverse ddrPat args
   InfixP p1 name p2
     | name == '(:) -> InfixP <$> ddrPat p1 <*> return name <*> ddrPat p2
@@ -690,10 +691,11 @@ ddrPat = \case
   p@SigP{} -> notSupported "Type signatures in patterns, because then I need to rewrite types and I'm lazy" (Just (show p))
   p@ViewP{} -> notSupported "View patterns" (Just (show p))
 
-checkDatacon :: Name -> Q ()
+-- | Returns the types of the fields of the data constructor if valid
+checkDatacon :: Name -> Q [Type]
 checkDatacon name = do
   conty <- reifyType name
-  (tycon, tyargs) <- case fromDataconType conty of
+  (tycon, tyargs, fieldtys) <- case fromDataconType conty of
     Just ty -> return ty
     Nothing -> fail $ "Could not deduce root type from type of data constructor " ++ pprint name
   tyvars <- case traverse (\case VarT n -> Just n
@@ -704,23 +706,31 @@ checkDatacon name = do
   let appliedType = foldl AppT (ConT tycon) (map VarT tyvars)
   -- The fact that 'deriveStructure' returns successfully implies that the type is fine
   _ <- deriveStructure (Map.fromList (zip tyvars (repeat (STag ())))) appliedType
-  return ()
+  return fieldtys
 
--- | Given the type of a data constructor, return the name of the type it is a
--- constructor of, together with the instantiations of the type parameters of
--- that type.
-fromDataconType :: Type -> Maybe (Name, [Type])
+-- | Given the type of a data constructor, return:
+-- - the name of the type it is a constructor of;
+-- - the instantiations of the type parameters of that type in the types of the constructor's fields;
+-- - the types of the fields of the constructor
+fromDataconType :: Type -> Maybe (Name, [Type], [Type])
 fromDataconType (ForallT _ _ t) = fromDataconType t
-fromDataconType (ArrowT `AppT` _ `AppT` t) = fromDataconType t
-fromDataconType (MulArrowT `AppT` PromotedT multi `AppT` _ `AppT` t)
-  | multi == 'One = fromDataconType t
+fromDataconType (ArrowT `AppT` ty `AppT` t) =
+  (\(n, typarams, tys) -> (n, typarams, ty : tys)) <$> fromDataconType t
+fromDataconType (MulArrowT `AppT` PromotedT multi `AppT` ty `AppT` t)
+  | multi == 'One = (\(n, typarams, tys) -> (n, typarams, ty : tys)) <$> fromDataconType t
   | otherwise = Nothing
-fromDataconType t = extractTypeCon t
+fromDataconType t = (\(n, typarams) -> (n, typarams, [])) <$> extractTypeCon t
 
 extractTypeCon :: Type -> Maybe (Name, [Type])
 extractTypeCon (AppT t arg) = second (++ [arg]) <$> extractTypeCon t
 extractTypeCon (ConT n) = Just (n, [])
 extractTypeCon _ = Nothing
+
+-- | Given an expression `e`, wraps it in `n` kleisli-lifted lambdas like
+--
+-- > \x1 i1 -> (\x2 i2 -> (... \xn in -> (e x1 ... xn, in), i2), i1)
+liftKleisliN :: Int -> Exp -> Q Exp
+liftKleisliN 0 e = return e
 
 -- -- | Checks that the type with this declaration is isomorphic to nested
 -- -- products/sums plus possibly some discrete literal types. This is a
