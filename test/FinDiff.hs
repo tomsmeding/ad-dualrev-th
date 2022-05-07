@@ -16,13 +16,13 @@ module FinDiff (
   jacobianByElts,
   finiteDifference,
   FinDiff(..),
-  newtypeFinDiff,
+  dataFinDiff,
 ) where
 
-import Data.Bifunctor (first)
+import Control.Monad (zipWithM)
 import Data.Monoid (Sum(..))
 import Data.Proxy
-import Data.List (transpose, foldl')
+import Data.List (transpose, foldl', zip5)
 -- import qualified Data.Vector as V
 import Data.Type.Equality
 import Language.Haskell.TH
@@ -188,58 +188,80 @@ instance FinDiff a => FinDiff (Sum a) where
   replaceElements _ f (Sum x) = Sum (replaceElements (Proxy @a) f x)
   replaceElementsId | Refl <- replaceElementsId @a = Refl
 
-newtypeFinDiff :: Name -> Q [Dec]
-newtypeFinDiff tyname = do
-  reify tyname >>= \case
+dataFinDiff :: Name -> Q [Dec]
+dataFinDiff tyname = do
+  (tyvars, conname, fieldtys) <- reify tyname >>= \case
     TyConI (NewtypeD [] _ tvbs _ constr _) -> do
-      (tyvars, conname, fieldty) <- case constr of
-        NormalC conname [(_, fieldty)] -> return (map tvbName tvbs, conname, fieldty)
-        RecC conname [(_, _, fieldty)] -> return (map tvbName tvbs, conname, fieldty)
-        _ -> error "newtypeFinDiff: Unknown newtype form"
+      case constr of
+        NormalC conname [(_, fieldty)] -> return (map tvbName tvbs, conname, [fieldty])
+        RecC conname [(_, _, fieldty)] -> return (map tvbName tvbs, conname, [fieldty])
+        _ -> fail "dataFinDiff: Unknown newtype form"
 
-      svar <- newName "s"
-      xvar <- newName "x"
-      refvar <- newName "ref"
-      pvar <- newName "p"
-      eltsvar <- newName "elts"
-      fvar <- newName "f"
+    TyConI (DataD [] _ tvbs _ constrs _) -> do
+      case constrs of
+        [NormalC conname fieldtys] -> return (map tvbName tvbs, conname, [t | (_, t) <- fieldtys])
+        [RecC conname fieldtys] -> return (map tvbName tvbs, conname, [t | (_, _, t) <- fieldtys])
+        _ -> fail "dataFinDiff: Multiple data constructors not yet supported"
 
-      let funD' name pats body = FunD name [Clause pats (NormalB body) []]
+    _ -> fail "dataFinDiff: Not newtype or data"
 
-      let context = map (\n -> ConT ''FinDiff `AppT` VarT n) tyvars
-                    ++ map (\n -> EqualityT `AppT` (ConT ''Element `AppT` VarT n)
-                                            `AppT` ConT ''Double)
-                           tyvars
-          targetType = foldl' AppT (ConT tyname) (map VarT tyvars)
-          replacedType = foldl' AppT (ConT tyname) (map (\n -> ConT ''ReplaceElements `AppT` VarT n `AppT` VarT svar) tyvars)
-          body =
-            [TySynInstD (TySynEqn Nothing (ConT ''Element `AppT` targetType) (ConT ''Element `AppT` fieldty))
-            ,TySynInstD (TySynEqn Nothing (ConT ''ReplaceElements `AppT` targetType `AppT` VarT svar) replacedType)
-            ,funD' 'elements' [WildP, ConP conname [] [VarP xvar]] $
-               VarE 'elements' `AppE` (ConE 'Proxy `AppTypeE` fieldty) `AppE` VarE xvar
-            ,funD' 'rebuild' [WildP, VarP pvar, ConP conname [] [VarP refvar], VarP eltsvar] $
-               VarE 'first
-                 `AppE` ConE conname
-                 `AppE` (VarE 'rebuild'
-                           `AppE` (ConE 'Proxy `AppTypeE` fieldty)
-                           `AppE` VarE pvar
-                           `AppE` VarE refvar
-                           `AppE` VarE eltsvar)
-            ,funD' 'oneElement [WildP] $
-               VarE 'oneElement `AppE` (ConE 'Proxy `AppTypeE` fieldty)
-            ,funD' 'zero [VarP pvar, ConP conname [] [VarP refvar]] $
-               ConE conname `AppE` (VarE 'zero `AppE` VarE pvar `AppE` VarE refvar)
-            ,funD' 'replaceElements [WildP, VarP fvar, ConP conname [] [VarP xvar]] $
-               ConE conname `AppE` (VarE 'replaceElements `AppE` (ConE 'Proxy `AppTypeE` fieldty) `AppE` VarE fvar `AppE` VarE xvar)
-            ,FunD 'replaceElementsId
-               [Clause []
-                       (GuardedB [(PatG [BindS (ConP 'Refl [] []) (VarE 'replaceElementsId `AppTypeE` fieldty)], ConE 'Refl)])
-                       []]
-            ]
+  fieldty0 <- case fieldtys of
+    [] -> fail "dataFinDiff: Empty data declarations not supported"
+    t:_ -> return t
 
-      return $ pure $ InstanceD Nothing context (ConT ''FinDiff `AppT` targetType) body
+  svar <- newName "s"
+  xvars <- mapM (\_ -> newName "x") fieldtys
+  refvars <- mapM (\_ -> newName "ref") fieldtys
+  pvar <- newName "p"
+  eltsvar <- newName "elts"
+  lvars <- zipWithM (\_ i -> newName ("l" ++ show i)) fieldtys [1::Int ..]
+  fvar <- newName "f"
 
-    _ -> error "newtypeFinDiff: Only newtypes supported"
+  let funD' name pats body = FunD name [Clause pats (NormalB body) []]
+
+  let context = map (ConT ''FinDiff `AppT`) fieldtys
+                ++ map (\t -> EqualityT `AppT` (ConT ''Element `AppT` t)
+                                        `AppT` ConT ''Double)
+                       fieldtys
+      targetType = foldl' AppT (ConT tyname) (map VarT tyvars)
+      replacedType = foldl' AppT (ConT tyname) (map (\n -> ConT ''ReplaceElements `AppT` VarT n `AppT` VarT svar) tyvars)
+      body =
+        [TySynInstD (TySynEqn Nothing (ConT ''Element `AppT` targetType) (ConT ''Element `AppT` fieldty0))
+        ,TySynInstD (TySynEqn Nothing (ConT ''ReplaceElements `AppT` targetType `AppT` VarT svar) replacedType)
+        ,funD' 'elements' [WildP, ConP conname [] (map VarP xvars)] $
+           foldr1 (\a b -> InfixE (Just a) (VarE '(++)) (Just b))
+             [VarE 'elements' `AppE` (ConE 'Proxy `AppTypeE` fieldty) `AppE` VarE xvar
+             | (fieldty, xvar) <- zip fieldtys xvars]
+        ,funD' 'rebuild' [WildP, VarP pvar, ConP conname [] (map VarP refvars), VarP eltsvar] $
+           LetE [ValD (TupP [VarP xvar, VarP lvar])
+                      (NormalB (VarE 'rebuild'
+                                  `AppE` (ConE 'Proxy `AppTypeE` fieldty)
+                                  `AppE` VarE pvar
+                                  `AppE` VarE refvar
+                                  `AppE` VarE prevlvar))
+                      []
+                | (xvar, lvar, refvar, prevlvar, fieldty) <- zip5 xvars lvars refvars (eltsvar : lvars) fieldtys] $
+             TupE [Just (foldl' AppE (ConE conname) (map VarE xvars))
+                  ,Just (VarE (last lvars))]
+        ,funD' 'oneElement [WildP] $
+           VarE 'oneElement `AppE` (ConE 'Proxy `AppTypeE` fieldty0)
+        ,funD' 'zero [VarP pvar, ConP conname [] (map VarP refvars)] $
+           foldl' AppE (ConE conname)
+             [VarE 'zero `AppE` VarE pvar `AppE` VarE refvar
+             | refvar <- refvars]
+        ,funD' 'replaceElements [WildP, VarP fvar, ConP conname [] (map VarP xvars)] $
+           foldl' AppE (ConE conname)
+             [VarE 'replaceElements `AppE` (ConE 'Proxy `AppTypeE` fieldty) `AppE` VarE fvar `AppE` VarE xvar
+             | (xvar, fieldty) <- zip xvars fieldtys]
+        ,FunD 'replaceElementsId
+           [Clause []
+                   (GuardedB [(PatG [BindS (ConP 'Refl [] []) (VarE 'replaceElementsId `AppTypeE` fieldty)]
+                              ,ConE 'Refl)
+                             | fieldty <- fieldtys])
+                   []]
+        ]
+
+  return $ pure $ InstanceD Nothing context (ConT ''FinDiff `AppT` targetType) body
   where
     tvbName (PlainTV n _) = n
     tvbName (KindedTV n _ _) = n

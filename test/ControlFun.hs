@@ -53,7 +53,7 @@ newtype WeirdType a b = MkWeirdType (Int, [(a, b)])
 --   replaceElements _ f (MkWeirdType x) = MkWeirdType (replaceElements (Proxy @(Int, [(a, b)])) f x)
 --   replaceElementsId | Refl <- replaceElementsId @(Int, [(a, b)]) = Refl
 
-newtypeFinDiff ''WeirdType
+dataFinDiff ''WeirdType
 
 instance (Arbitrary a, Arbitrary b) => Arbitrary (WeirdType a b) where
   arbitrary = MkWeirdType <$> arbitrary

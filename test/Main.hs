@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
@@ -84,39 +85,8 @@ checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
 data Vec3 a = Vec3 a a a deriving (Show)
 data Quaternion a = Quaternion a a a a deriving (Show)
 
-instance FinDiff a => FinDiff (Vec3 a) where
-  type Element (Vec3 a) = Element a
-  type ReplaceElements (Vec3 a) s = Vec3 (ReplaceElements a s)
-  elements' _ (Vec3 x y z) = concatMap (elements' (Proxy @a)) [x, y, z]
-  rebuild' _ p (Vec3 rx ry rz) l =
-    let (x, l1) = rebuild' (Proxy @a) p rx l
-        (y, l2) = rebuild' (Proxy @a) p ry l1
-        (z, l3) = rebuild' (Proxy @a) p rz l2
-    in (Vec3 x y z, l3)
-  oneElement _ = oneElement (Proxy @a)
-  zero p (Vec3 rx ry rz) = Vec3 (zero p rx) (zero p ry) (zero p rz)
-  replaceElements _ f (Vec3 x y z) = Vec3 (replaceElements (Proxy @a) f x)
-                                          (replaceElements (Proxy @a) f y)
-                                          (replaceElements (Proxy @a) f z)
-  replaceElementsId | Refl <- replaceElementsId @a = Refl
-
-instance FinDiff a => FinDiff (Quaternion a) where
-  type Element (Quaternion a) = Element a
-  type ReplaceElements (Quaternion a) s = Quaternion (ReplaceElements a s)
-  elements' _ (Quaternion x y z w) = concatMap (elements' (Proxy @a)) [x, y, z, w]
-  rebuild' _ p (Quaternion rx ry rz rw) l =
-    let (x, l1) = rebuild' (Proxy @a) p rx l
-        (y, l2) = rebuild' (Proxy @a) p ry l1
-        (z, l3) = rebuild' (Proxy @a) p rz l2
-        (w, l4) = rebuild' (Proxy @a) p rw l3
-    in (Quaternion x y z w, l4)
-  oneElement _ = oneElement (Proxy @a)
-  zero p (Quaternion rx ry rz rw) = Quaternion (zero p rx) (zero p ry) (zero p rz) (zero p rw)
-  replaceElements _ f (Quaternion x y z w) = Quaternion (replaceElements (Proxy @a) f x)
-                                                        (replaceElements (Proxy @a) f y)
-                                                        (replaceElements (Proxy @a) f z)
-                                                        (replaceElements (Proxy @a) f w)
-  replaceElementsId | Refl <- replaceElementsId @a = Refl
+dataFinDiff ''Vec3
+dataFinDiff ''Quaternion
 
 instance Arbitrary a => Arbitrary (Vec3 a) where arbitrary = Vec3 <$> arbitrary <*> arbitrary <*> arbitrary
 instance Arbitrary a => Arbitrary (Quaternion a) where arbitrary = Quaternion <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
@@ -130,8 +100,8 @@ instance Approx a => Approx (Quaternion a) where
 newtype Vec3N a = Vec3N (a, a, a) deriving (Show)
 newtype QuaternionN a = QuaternionN (a, a, a, a) deriving (Show)
 
-newtypeFinDiff ''Vec3N
-newtypeFinDiff ''QuaternionN
+dataFinDiff ''Vec3N
+dataFinDiff ''QuaternionN
 
 instance Arbitrary a => Arbitrary (Vec3N a) where arbitrary = Vec3N <$> arbitrary
 instance Arbitrary a => Arbitrary (QuaternionN a) where arbitrary = QuaternionN <$> arbitrary
@@ -276,6 +246,16 @@ main =
             [|| \(Sum x) -> Sum (2.0 * x) ||])
        (Just (\_ (Sum d) -> Sum (2 * d)))
        YesFD
+    ,checkFDcontrol "Vec3 data"
+       $$(reverseADandControl @(Vec3 Double) @Double (parseType "Vec3 Double") (parseType "Double")
+            [|| \(Vec3 x y z) -> x + y + z ||])
+       (Just (\_ d -> Vec3 d d d))
+       YesFD
+    ,checkFDcontrol "Vec3 data constr"
+       $$(reverseADandControl @(Vec3 Double) @(Vec3 Double) (parseType "Vec3 Double") (parseType "Vec3 Double")
+            [|| \(Vec3 x y z) -> Vec3 (x + y) (y + z) (z + x) ||])
+       (Just (\_ (Vec3 a b c) -> Vec3 (a + c) (a + b) (b + c)))
+       YesFD
     ,checkFDcontrol "quaternion newtype"
        $$(reverseADandControl @(Vec3N Double, QuaternionN Double) @(Vec3N Double) (parseType "(Vec3N Double, QuaternionN Double)") (parseType "Vec3N Double")
             [|| \(topv, topq) ->
@@ -300,7 +280,7 @@ main =
                       vadd (Vec3 px py pz) (Vec3 qx qy qz) = Vec3 (px + qx) (py + qy) (pz + qz)
                       scale k (Vec3 x y z) = Vec3 (k * x) (k * y) (k * z)
                       cross (Vec3 ax ay az) (Vec3 bx by bz) = Vec3 (ay*bz - az*by) (az*bz - ax*bz) (ax*by - ay*bx)
-                      norm x = sqrt (dot x x)
+                      -- norm x = sqrt (dot x x)  -- present in code in paper, but unused
                       rotate_vec_by_quat v q =
                         let u = q_to_vec q
                             s = case q of Quaternion _ _ _ w -> w
