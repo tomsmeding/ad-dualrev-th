@@ -68,24 +68,21 @@ main = do
     [bgroup "fmult"
       [bench "TH" (nf (radWithTH fmult) (MkFMult (3.0, 4.0)))
       ,bench "ad" (nf (radWithAD fmult) (MkFMult (3.0, 4.0)))]
-    ,bgroup "fdotprod"
-      [bench "TH" (toBenchmarkable $ \n ->
-                     let l1 = take (fromIntegral n) [1..]
-                         l2 = take (fromIntegral n) [3,5..]
-                     in radWithTH fdotprod (FDotProd (l1, l2)) `deepseq` return ())
-      ,bench "ad" (toBenchmarkable $ \n ->
-                     let l1 = take (fromIntegral n) [1..]
-                         l2 = take (fromIntegral n) [3,5..]
-                     in radWithAD fdotprod (FDotProd (l1, l2)) `deepseq` return ())]
-    ,bgroup "fsummatvec"
-      [bench "TH" (toBenchmarkable $ \n ->
-                     let l1 = take (fromIntegral n) (blockN (fromIntegral n) [1..])
-                         l2 = take (fromIntegral n) [3,5..]
-                     in radWithTH fsummatvec (FSumMatVec (l1, l2)) `deepseq` return ())
-      ,bench "ad" (toBenchmarkable $ \n ->
-                     let l1 = take (fromIntegral n) (blockN (fromIntegral n) [1..])
-                         l2 = take (fromIntegral n) [3,5..]
-                     in radWithAD fsummatvec (FSumMatVec (l1, l2)) `deepseq` return ())]
+    ,bgroup "fdotprod" $
+      let run f n =
+            let l1 = take (fromIntegral n) [1..]
+                l2 = take (fromIntegral n) [3,5..]
+            in f fdotprod (FDotProd (l1, l2)) `deepseq` return ()
+      in [bench "TH" (toBenchmarkable (run radWithTH))
+         ,bench "ad" (toBenchmarkable (run radWithAD))]
+    ,bgroup "fsummatvec" $
+      let run f n2 =
+            let n = round (sqrt (fromIntegral n2 :: Double))
+                l1 = take n (blockN n [1..])
+                l2 = take n [3,5..]
+            in f fsummatvec (FSumMatVec (l1, l2)) `deepseq` return ()
+      in [bench "TH" (toBenchmarkable (run radWithTH))
+         ,bench "ad" (toBenchmarkable (run radWithAD))]
     ]
   where
     blockN :: Int -> [a] -> [[a]]
