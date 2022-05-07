@@ -456,13 +456,27 @@ deinterleave topstruc outexp = case topstruc of
 
   SData datacons -> do
     let maxlen = maximum [length fieldstrucs | (_, fieldstrucs) <- datacons]
-    allvars <- mapM (\i -> newName ("x" ++ show i)) [1 .. maxlen]
+    allvars      <- mapM (\i -> newName ("x"     ++ show i)) [1 .. maxlen]
+    allresvars   <- mapM (\i -> newName ("res"   ++ show i)) [1 .. maxlen]
+    allbuildvars <- mapM (\i -> newName ("build" ++ show i)) [1 .. maxlen]
+    alladjvars   <- mapM (\i -> newName ("adj"   ++ show i)) [1 .. maxlen]
     matches <- sequence
-      [do let vars = take (length fieldstrucs) allvars
+      [do let vars      = take (length fieldstrucs) allvars
+              resvars   = take (length fieldstrucs) allresvars
+              buildvars = take (length fieldstrucs) allbuildvars
+              adjvars   = take (length fieldstrucs) alladjvars
           exprs <- zipWithM deinterleave fieldstrucs (map VarE vars)
-          return $ Match (ConP conname [] (map VarP vars))
-                         (NormalB (foldl AppE (ConE conname) exprs))
-                         []
+          return $ Match
+            (ConP conname [] (map VarP vars))
+            (NormalB $
+               LetE [ValD (TupP [VarP resvar, VarP buildvar]) (NormalB expr) []
+                    | (resvar, buildvar, expr) <- zip3 resvars buildvars exprs] $
+                 pair (foldl AppE (ConE conname) (map VarE resvars))
+                      (LamE [ConP conname [] (map VarP adjvars)] $
+                         VarE 'composeL
+                           `AppE` ListE [VarE buildvar `AppE` VarE adjvar
+                                        | (buildvar, adjvar) <- zip buildvars adjvars]))
+            []
       | (conname, fieldstrucs) <- datacons]
     return $ CaseE outexp matches
 
@@ -949,26 +963,29 @@ numberInput topstruc input nextid = case topstruc of
 
   SData datacons -> do
     let maxlen = maximum [length fieldstrucs | (_, fieldstrucs) <- datacons]
-    innames  <- mapM (\i -> newName ("x"  ++ show i)) [1 .. maxlen]
-    outnames <- mapM (\i -> newName ("x'" ++ show i)) [1 .. maxlen]
-    fnames   <- mapM (\i -> newName ("f"  ++ show i)) [1 .. maxlen]
-    idnames  <- mapM (\i -> newName ("i"  ++ show i)) [1 .. maxlen]
+    allinnames  <- mapM (\i -> newName ("x"  ++ show i)) [1 .. maxlen]
+    alloutnames <- mapM (\i -> newName ("x'" ++ show i)) [1 .. maxlen]
+    allfnames   <- mapM (\i -> newName ("f"  ++ show i)) [1 .. maxlen]
+    allidnames  <- mapM (\i -> newName ("i"  ++ show i)) [1 .. maxlen]
     arrname <- newName "arr"
     matches <- sequence
-      [do let takeN = take (length fieldstrucs)
-              outid = case fieldstrucs of [] -> nextid ; _ -> idnames !! (length fieldstrucs - 1)
+      [do let innames  = take (length fieldstrucs) allinnames
+              outnames = take (length fieldstrucs) alloutnames
+              fnames   = take (length fieldstrucs) allfnames
+              idnames  = take (length fieldstrucs) allidnames
+              outid = case fieldstrucs of [] -> nextid ; _ -> last idnames
           exprs <- zipWithM3 numberInput fieldstrucs (map VarE innames) (nextid : idnames)
-          return $ Match (ConP conname [] (map VarP (takeN innames)))
+          return $ Match (ConP conname [] (map VarP innames))
                          (NormalB
                             (LetE [ValD (TupP [VarP outname, VarP fname, VarP outidname])
                                         (NormalB expr)
                                         []
                                   | (outname, fname, outidname, expr)
                                       <- zip4 outnames fnames idnames exprs] $
-                               triple (TupE (map (Just . VarE) (takeN outnames)))
+                               triple (foldl AppE (ConE conname) (map VarE outnames))
                                       (LamE [VarP arrname] $
-                                         TupE (map (\f -> Just (VarE f `AppE` VarE arrname))
-                                                   (takeN fnames)))
+                                         foldl AppE (ConE conname)
+                                           (map (\f -> VarE f `AppE` VarE arrname) fnames))
                                       (VarE outid)))
                          []
       | (conname, fieldstrucs) <- datacons]
