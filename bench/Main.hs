@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
@@ -11,11 +12,12 @@ module Main where
 import Control.DeepSeq (NFData, deepseq)
 import Criterion
 import qualified Criterion.Main as Criterion
+import GHC.Generics (Generic)
 
 import DFunction
 import Language.Haskell.TH.Stupid
 import Test.Approx
-import Test.Framework
+import Test.Framework hiding (scale)
 
 
 newtype FMult s = MkFMult (s, s)
@@ -52,6 +54,42 @@ fsummatvec = $$(makeFunction (parseType "FSumMatVec Double")
             map' f (x:xs) = f x : map' f xs
         in sum' (map' (dotp v) m) ||])
 
+data Vec3 s = Vec3 s s s
+  deriving (Show, Functor, Foldable, Traversable, Generic)
+data Quaternion s = Quaternion s s s s
+  deriving (Show, Functor, Foldable, Traversable, Generic)
+newtype FRotVecQuat s = FRotVecQuat (Vec3 s, Quaternion s)
+  deriving (Show, Functor, Foldable, Traversable)
+  deriving (Approx, Arbitrary, NFData) via (Vec3 s, Quaternion s)
+
+instance NFData s => NFData (Vec3 s)
+instance NFData s => NFData (Quaternion s)
+
+instance Arbitrary s => Arbitrary (Vec3 s) where arbitrary = Vec3 <$> arbitrary <*> arbitrary <*> arbitrary
+instance Arbitrary s => Arbitrary (Quaternion s) where arbitrary = Quaternion <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
+
+instance Approx s => Approx (Vec3 s) where
+  approx absdelta reldelta (Vec3 a b c) (Vec3 a' b' c') = approx absdelta reldelta [a,b,c] [a',b',c']
+instance Approx s => Approx (Quaternion s) where
+  approx absdelta reldelta (Quaternion a b c d) (Quaternion a' b' c' d') = approx absdelta reldelta [a,b,c,d] [a',b',c',d']
+
+-- The example function from [Krawiec et al. 2022], with the output vector
+-- summed in order to return a 'Double'.
+frotvecquat :: DFunction FRotVecQuat
+frotvecquat = $$(makeFunction (parseType "FRotVecQuat Double")
+  [|| \(FRotVecQuat (topv, topq)) ->
+        let q_to_vec (Quaternion x y z _) = Vec3 x y z
+            dot (Vec3 px py pz) (Vec3 qx qy qz) = px * qx + py * qy + pz * qz
+            vadd (Vec3 px py pz) (Vec3 qx qy qz) = Vec3 (px + qx) (py + qy) (pz + qz)
+            scale k (Vec3 x y z) = Vec3 (k * x) (k * y) (k * z)
+            cross (Vec3 ax ay az) (Vec3 bx by bz) = Vec3 (ay*bz - az*by) (az*bz - ax*bz) (ax*by - ay*bx)
+            -- norm x = sqrt (dot x x)  -- present in code in paper, but unused
+            rotate_vec_by_quat v q =
+              let u = q_to_vec q
+                  s = case q of Quaternion _ _ _ w -> w
+              in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
+        in (\(Vec3 x y z) -> x + y + z) $ rotate_vec_by_quat topv topq ||])
+
 main :: IO ()
 main = do
   -- runTestsExit $
@@ -62,7 +100,8 @@ main = do
   --        ,property "fdotprod" (\x -> radWithTH fdotprod x ~= radWithAD fdotprod x)]
   --     ,changeArgs (\args -> args { maxSuccess = 5000 }) $
   --      tree "slow"
-  --        [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)]]
+  --        [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)
+  --        ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)]]
 
   Criterion.defaultMain
     [bgroup "fmult"
@@ -83,6 +122,9 @@ main = do
             in f fsummatvec (FSumMatVec (l1, l2)) `deepseq` return ()
       in [bench "TH" (toBenchmarkable (run radWithTH))
          ,bench "ad" (toBenchmarkable (run radWithAD))]
+    ,bgroup "frotvecquat" $
+      [bench "TH" (nf (radWithTH frotvecquat) (FRotVecQuat (Vec3 1 2 3, Quaternion 4 5 6 7)))
+      ,bench "ad" (nf (radWithAD frotvecquat) (FRotVecQuat (Vec3 1 2 3, Quaternion 4 5 6 7)))]
     ]
   where
     blockN :: Int -> [a] -> [[a]]
