@@ -45,12 +45,11 @@ import Data.Word
 import GHC.TypeLits (TypeError, ErrorMessage(Text))
 import GHC.Types (Multiplicity(One))
 import Language.Haskell.TH
-import Language.Haskell.TH.Syntax (Lift(..))
 import Language.Haskell.TH.Lift ()  -- for Lift Name
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
-import Control.Monad.IO.Class
+-- import Control.Monad.IO.Class
 -- import Debug.Trace
 
 import qualified Data.Array.Growable as GA
@@ -510,6 +509,10 @@ ddr env idName = \case
                 ,LamE [VarP xname] (InfixE (Just (LitE (IntegerL 1))) (VarE '(/)) (Just (InfixE (Just (LitE (IntegerL 2))) (VarE '(*)) (Just (AppE (VarE 'sqrt) (VarE xname))))))
                 ,VarE iname]
         return (pair function (VarE idName))
+    | name == '($) -> do
+        fname <- newName "f"
+        xname <- newName "x"
+        ddr env idName (LamE [VarP fname, VarP xname] (AppE (VarE fname) (VarE xname)))
     | otherwise -> fail $ "Free variables not supported in reverseAD: " ++ show name ++ " (env = " ++ show env ++ ")"
 
   ConE name
