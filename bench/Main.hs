@@ -10,14 +10,19 @@
 module Main where
 
 import Control.DeepSeq (NFData, deepseq)
+import Control.Monad (when)
 import Criterion
 import qualified Criterion.Main as Criterion
+import qualified Criterion.Main.Options as Criterion
 import GHC.Generics (Generic)
+import System.Environment (getArgs)
+import System.Exit (die, exitSuccess, exitFailure)
 
 import DFunction
 import Language.Haskell.TH.Stupid
 import Test.Approx
 import Test.Framework hiding (scale)
+import Criterion.Types (Config(..))
 
 
 newtype FMult s = MkFMult (s, s)
@@ -90,20 +95,48 @@ frotvecquat = $$(makeFunction (parseType "FRotVecQuat Double")
               in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
         in (\(Vec3 x y z) -> x + y + z) $ rotate_vec_by_quat topv topq ||])
 
+data Options = Options
+  { argsPatternsRev :: [String]
+  , argsOutput :: Maybe FilePath
+  , argsHelp :: Bool }
+  deriving (Show)
+
+parseArgs :: [String] -> Options -> Either String Options
+parseArgs [] a = return a
+parseArgs ("-o" : path : ss) a = parseArgs ss (a { argsOutput = Just path })
+parseArgs ("-h" : _) a = return $ a { argsHelp = True }
+parseArgs ("--help" : _) a = return $ a { argsHelp = True }
+parseArgs ("" : _) _ = Left "Unexpected empty argument"
+parseArgs (s@(c0:_) : ss) a
+  | c0 /= '-' = parseArgs ss (a { argsPatternsRev = s : argsPatternsRev a })
+parseArgs (s : _) _ = Left ("Unrecognised argument '" ++ s ++ "'")
+
 main :: IO ()
 main = do
-  -- runTestsExit $
-  --   tree "correctness"
-  --     [changeArgs (\args -> args { maxSuccess = 50000 }) $
-  --      tree "fast"
-  --        [property "fmult" (\x -> radWithTH fmult x ~= radWithAD fmult x)
-  --        ,property "fdotprod" (\x -> radWithTH fdotprod x ~= radWithAD fdotprod x)]
-  --     ,changeArgs (\args -> args { maxSuccess = 5000 }) $
-  --      tree "slow"
-  --        [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)
-  --        ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)]]
+  options <- getArgs >>= \args -> case parseArgs args (Options [] Nothing False) of
+               Left err -> die err
+               Right opts -> return opts
 
-  Criterion.defaultMain
+  when (argsHelp options) $ do
+    putStrLn "Usage: bench [-o <criterion-output.html>] [test patterns...]"
+    exitSuccess
+
+  checksOK <- runTestsPatterns (reverse (argsPatternsRev options)) $
+    tree "correctness"
+      [changeArgs (\args -> args { maxSuccess = 50000 }) $
+       tree "fast"
+         [property "fmult" (\x -> radWithTH fmult x ~= radWithAD fmult x)
+         ,property "fdotprod" (\x -> radWithTH fdotprod x ~= radWithAD fdotprod x)
+         ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)]
+      ,changeArgs (\args -> args { maxSuccess = 5000 }) $
+       tree "slow"
+         [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)]]
+
+  when (not checksOK) exitFailure
+
+  let crconfig = Criterion.defaultConfig { reportFile = argsOutput options }
+  Criterion.runMode
+    (Criterion.Run crconfig Criterion.Pattern (reverse (argsPatternsRev options)))
     [bgroup "fmult"
       [bench "TH" (nf (radWithTH fmult) (MkFMult (3.0, 4.0)))
       ,bench "ad" (nf (radWithAD fmult) (MkFMult (3.0, 4.0)))]

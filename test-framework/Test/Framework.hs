@@ -3,6 +3,7 @@ module Test.Framework (
   -- * Running test trees
   runTestsExit,
   runTests,
+  runTestsPatterns,
   -- Building test trees
   tree,
   property,
@@ -32,11 +33,11 @@ import Test.Parallel
 
 data Settings = Settings
   { setShowDuration :: Bool
-  , setPattern :: Maybe String }
+  , setPatterns :: [String] }
   deriving (Show)
 
 defaultSettings :: Settings
-defaultSettings = Settings False Nothing
+defaultSettings = Settings False []
 
 data Test = Prop Property
           | Unit (IO Bool)
@@ -69,7 +70,17 @@ runTestsExit = runTests >=> (\case True -> exitSuccess
 -- | Returns whether all tests were successful. Reads command-line arguments.
 runTests :: Tree -> IO Bool
 runTests t = do
-  settings <- getArgs >>= parseCmdLine defaultSettings
+  settings' <- getArgs >>= parseCmdLine defaultSettings
+  let settings = settings' { setPatterns = reverse (setPatterns settings') }
+  runWithSettings settings t
+
+-- | Returns whether all tests were successful. Runs only the tests whose name
+-- (joined on '.') includes one of the given pattern strings.
+runTestsPatterns :: [String] -> Tree -> IO Bool
+runTestsPatterns pats = runWithSettings defaultSettings { setPatterns = pats }
+
+runWithSettings :: Settings -> Tree -> IO Bool
+runWithSettings settings t = do
   -- TODO: evalParallel
   failed <- evalSequential $ runTestsTree (maxLeftWidth t) settings stdArgs [] t
   if Set.null failed
@@ -84,7 +95,8 @@ runTestsTree leftwid settings args path = \case
     run (putStrLn (replicate indent ' ' ++ name ++ ":"))
     *> (mconcat <$> traverse (runTestsTree leftwid settings args (name : path)) ts)
   Leaf name test
-    | maybe True (`isInfixOf` intercalate "." (reverse (name : path))) (setPattern settings) ->
+    | null (setPatterns settings) ||
+          any (`isInfixOf` intercalate "." (reverse (name : path))) (setPatterns settings) ->
         let padding = leftwid - indent - length name
         in run (do putStr (replicate indent ' ' ++ name ++ ": " ++
                              replicate padding ' ')
@@ -124,14 +136,16 @@ maxLeftWidth (Leaf name _) = length name
 maxLeftWidth (ChangeArgs _ t) = maxLeftWidth t
 maxLeftWidth (ChangeSettings _ t) = maxLeftWidth t
 
+-- | Returned patterns are in reverse order!
 parseCmdLine :: Settings -> [String] -> IO Settings
 parseCmdLine s [] = return s
 parseCmdLine _ ["-h"] = do
-  putStrLn "Options:\n\
-           \  -h          Show this help\n\
-           \  -p PATTERN  Run only tests whose path (joined on '.') contains this substring"
+  putStrLn "Usage: test [-h] [test patterns...]\n\
+           \If patterns are given, runs only tests whose path (joined on '.') contains any\n\
+           \of these substrings."
   exitSuccess
-parseCmdLine s ("-p" : pat : args) = parseCmdLine s { setPattern = Just pat } args
+parseCmdLine s (pat : args) | take 1 pat /= "-" =
+  parseCmdLine s { setPatterns = pat : setPatterns s } args
 parseCmdLine _ (arg : _) = do
   putStrLn $ "Unrecognised argument: " ++ arg
   exitFailure
