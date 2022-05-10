@@ -231,7 +231,7 @@ unNewtype conname expr = do
 -- This ought to be 'Typeable' instead, because a 'Type' can be derived from a
 -- 'TypeRep' in the same circumstances as 'KnownType' works currently, and
 -- 'Typeable' is auto-derived by GHC. However, due to
--- [an issue](https://gitlab.haskell.org/ghc/ghc/-/issues/21547) with the
+-- [an issue (GHC #21547)](https://gitlab.haskell.org/ghc/ghc/-/issues/21547) with the
 -- interaction between TemplateHaskell and Typeable, that currently does not
 -- work.
 class KnownType a where knownType :: Proxy a -> Type
@@ -319,8 +319,8 @@ reverseAD = reverseAD' (knownStructure (Proxy @a)) (knownStructure (Proxy @b))
 
 -- | Same as 'reverseAD', but with user-supplied 'Structure's.
 reverseAD' :: forall a b.
-              Q Structure  -- ^ a
-           -> Q Structure  -- ^ b
+              Q Structure  -- ^ Structure of @a@
+           -> Q Structure  -- ^ Structure of @b@
            -> Code Q (a -> b)
            -> Code Q (a -> (b, b -> a))
 reverseAD' inpStruc outStruc (unTypeCode -> inputCode) =
