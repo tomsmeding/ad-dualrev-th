@@ -18,8 +18,6 @@ source-repository head
 library
   exposed-modules:
     Language.Haskell.ReverseAD.TH
-    Language.Haskell.TH.Stupid
-    Language.Haskell.TH.Stupid.Parser
   hs-source-dirs:
     src
   ghc-options: -Wall
@@ -56,6 +54,7 @@ test-suite test
     ControlFun
     FinDiff
     ForwardAD
+    Types
   ghc-options: -Wall -O2 -threaded -rtsopts
   build-depends:
       base >=4.7 && <4.17
@@ -73,6 +72,7 @@ benchmark bench
   main-is: Main.hs
   other-modules:
     DFunction
+    Types
   ghc-options: -Wall -O2 -threaded -rtsopts
   build-depends:
       base >=4.7 && <4.17

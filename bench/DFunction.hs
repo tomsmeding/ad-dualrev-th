@@ -8,8 +8,7 @@
 {-# LANGUAGE TypeApplications #-}
 module DFunction where
 
-import Data.Proxy
-import Language.Haskell.TH (Q, Code, Type, unsafeCodeCoerce, unTypeCode)
+import Language.Haskell.TH (Q, Code, unsafeCodeCoerce, unTypeCode)
 
 import qualified Numeric.AD as AD
 import qualified Language.Haskell.ReverseAD.TH as DR
@@ -23,15 +22,15 @@ newtype GenericFunction f = GenericFunction
   { runGF :: forall s. (Floating s, Ord s) => f s -> s }
 
 makeFunction :: forall f.
-                Q Type  -- ^ `f Double`
-             -> Code Q (f Double -> Double)
+                DR.KnownType (f Double)
+             => Code Q (f Double -> Double)
              -> Code Q (DFunction f)
-makeFunction struc code =
+makeFunction code =
   let code1 = unsafeCodeCoerce [| GenericFunction $(unTypeCode code) |] :: Code Q (GenericFunction f)
   in [|| DFunction
            { funOriginal = runGF $$(code1)
            , radWithTH = \x ->
-               case $$(DR.reverseAD' (DR.deriveStructureT struc) (DR.knownStructure (Proxy @Double)) [|| \y -> $$(code) y ||]) x of
+               case $$(DR.reverseAD [|| \y -> $$(code) y ||]) x of
                  (out, df) -> (out, df 1.0) } ||]
 
 radWithAD :: Traversable f => DFunction f -> f Double -> (Double, f Double)

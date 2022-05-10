@@ -16,6 +16,7 @@ module Language.Haskell.ReverseAD.TH (
   reverseAD,
   reverseAD',
   KnownType,
+  makeKnownType,
   Structure,
   knownStructure,
   deriveStructureT,
@@ -39,6 +40,8 @@ import Data.Word
 import GHC.TypeLits (TypeError, ErrorMessage(Text))
 import GHC.Types (Multiplicity(One))
 import Language.Haskell.TH
+import Language.Haskell.TH.Syntax (lift)
+import Language.Haskell.TH.Lift ()  -- for Lift Name
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
@@ -237,6 +240,48 @@ instance (KnownType a, KnownType b, KnownType c, KnownType d) => KnownType (a, b
 
 instance KnownType a => KnownType [a] where
   knownType _ = ListT `AppT` knownType (Proxy @a)
+
+-- | Use on the top level for a data type that you wish to use in 'reverseAD'.
+-- For example:
+--
+--     {-# LANGUAGE ScopedTypeVariables, TemplateHaskell, TypeApplications #-}
+--     data Foo a = Foo Int (a, Bool)
+--     makeKnownType ''Foo
+--
+-- This will generate an instance that looks as follows:
+--
+--     instance KnownType a => KnownType (Foo a) where
+--       knownType _ = ConT ''Foo `AppT` knownType (Proxy @a)
+--
+-- Note that, due to the GHC stage restriction, you cannot put the
+-- 'makeKnownType' invocation and the usage of the datatype in a 'reverseAD'
+-- splice in the same file. Put the 'knownType' invocation in a different
+-- module and import that.
+makeKnownType :: Name -> Q [Dec]
+makeKnownType tyname = do
+  typedecl <- reify tyname >>= \case
+    TyConI decl -> return decl
+    info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
+  tyvars <- case typedecl of
+    NewtypeD [] _ tyvars _ _ _ -> return (map tvbName tyvars)
+    DataD [] _ tyvars _ _ _ -> return (map tvbName tyvars)
+    _ -> fail "makeKnownType: Only simple 'newtype' and 'data' types supported"
+  lifttyname <- lift tyname
+  return [InstanceD Nothing
+                    [ConT ''KnownType `AppT` VarT tyvar | tyvar <- tyvars]
+                    (ConT ''KnownType
+                       `AppT` foldl AppT (ConT tyname) (map VarT tyvars))
+                    [FunD 'knownType
+                       [Clause [WildP]
+                               (NormalB (foldl (\a b -> InfixE (Just a) (ConE 'AppT) (Just b))
+                                               (ConE 'ConT `AppE` lifttyname)
+                                               [VarE 'knownType `AppE` (ConE 'Proxy `AppTypeE` VarT tyvar)
+                                               | tyvar <- tyvars]))
+                               []]]]
+  where
+    tvbName :: TyVarBndr () -> Name
+    tvbName (PlainTV n _) = n
+    tvbName (KindedTV n _ _) = n
 
 
 -- | Use as follows:
