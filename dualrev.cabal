@@ -17,7 +17,6 @@ source-repository head
 
 library
   exposed-modules:
-    Data.Array.Growable
     Language.Haskell.ReverseAD.TH
     Language.Haskell.TH.Stupid
     Language.Haskell.TH.Stupid.Parser

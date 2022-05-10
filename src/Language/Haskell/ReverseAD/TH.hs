@@ -52,8 +52,8 @@ import Prelude.Linear (Ur(..))
 -- import Control.Monad.IO.Class
 -- import Debug.Trace
 
-import qualified Data.Array.Growable as GA
-import Data.Array.Growable (GrowArray)
+import qualified Data.Array.Mutable.Linear as A
+import Data.Array.Mutable.Linear (Array)
 
 
 type QuoteFail m = (Quote m, MonadFail m)
@@ -93,31 +93,29 @@ type QuoteFail m = (Quote m, MonadFail m)
 --       ,(in, Contrib [(di1, cb1, dop_1 x1..xn), ..., (din, cbn, dop_n x1..xn)]))
 --      ,in + 1)
 
-type BuildState = GrowArray (Contrib, Double)
+type BuildState = Array (Contrib, Double)
 newtype Contrib = Contrib [(Int, Contrib, Double)]
 
-resolve :: BuildState %1-> BuildState
-resolve = \arr ->
-  GA.size arr PL.& \(Ur n, arr1) ->
-    loop (n - 1) arr1
+resolve :: Int -> BuildState %1-> BuildState
+resolve iout = \arr -> loop (iout - 1) arr
   where
     loop :: Int -> BuildState %1-> BuildState
     loop 0 arr = arr
     loop i arr =
-      GA.get i arr PL.& \(Ur (cb, adj), arr1) ->
+      A.get i arr PL.& \(Ur (cb, adj), arr1) ->
         loop (i - 1) (apply cb adj arr1)
 
     apply :: Contrib -> Double -> BuildState %1-> BuildState
     apply (Contrib []) _ arr = arr
     apply (Contrib ((i, cb, d) : cbs)) a arr =
-      GA.get i arr PL.& \(Ur (_, acc), arr1) ->
-      GA.set i (cb, acc + a * d) arr1 PL.& \arr2 ->
+      A.get i arr PL.& \(Ur (_, acc), arr1) ->  -- acc = backpropagator argument (i.e. adjoint) accumulator
+      A.set i (cb, acc + a * d) arr1 PL.& \arr2 ->
         apply (Contrib cbs) a arr2
 
 addContrib :: Int -> Contrib -> Double -> BuildState %1-> BuildState
 addContrib i cb adj arr =
-  GA.get i arr PL.& \(Ur (_, acc), arr1) ->
-    GA.set i (cb, acc + adj) arr1
+  A.get i arr PL.& \(Ur (_, acc), arr1) ->
+    A.set i (cb, acc + adj) arr1
 
 
 data Structure' tag
@@ -349,7 +347,9 @@ transform inpStruc outStruc (LamE [pat] expr) = do
   idvar <- newName "i0"
   patbound <- boundVars pat
   ddrexpr <- ddr patbound idvar expr
-  deinterexpr <- deinterleave outStruc (AppE (VarE 'fst) ddrexpr)
+  outname <- newName "out"
+  idvar' <- newName "i'"
+  deinterexpr <- deinterleave outStruc (VarE outname)
   primalname <- newName "primal"
   dualname <- newName "dual"
   adjname <- newName "adjoint"
@@ -360,19 +360,20 @@ transform inpStruc outStruc (LamE [pat] expr) = do
   return (LamE [VarP argvar] $
             LetE [ValD (VarP onevar) (NormalB (SigE (LitE (IntegerL 1)) (ConT ''Int))) []
                  ,ValD (TupP [pat, VarP rebuildvar, VarP idvar]) (NormalB inp) []
+                 ,ValD (TupP [VarP outname, VarP idvar']) (NormalB ddrexpr) []
                  ,ValD (TupP [VarP primalname, VarP dualname]) (NormalB deinterexpr) []] $
               pair (VarE primalname)
                    (LamE [VarP adjname] $
                       LetE [ValD (ConP 'Ur [] [VarP stagedvecname])
                                  (NormalB
-                                    (foldl AppE (VarE 'GA.alloc)
-                                                [LitE (IntegerL 0)
-                                                ,pair (AppE (ConE 'Contrib) (ListE []))
-                                                      (LitE (RationalL 0.0))
-                                                ,composeLinearFuns
-                                                   [VarE 'GA.freeze
-                                                   ,VarE 'resolve
-                                                   ,AppE (VarE dualname) (VarE adjname)]]))
+                                    (VarE 'A.alloc
+                                       `AppE` VarE idvar'
+                                       `AppE` pair (AppE (ConE 'Contrib) (ListE []))
+                                                   (LitE (RationalL 0.0))
+                                       `AppE` composeLinearFuns
+                                                [VarE 'A.freeze
+                                                ,AppE (VarE 'resolve) (VarE idvar')
+                                                ,AppE (VarE dualname) (VarE adjname)]))
                                  []] $
                         VarE rebuildvar `AppE` (VarE 'V.map `AppE` VarE 'snd `AppE` VarE stagedvecname)))
 transform inpStruc outStruc (LamE [] body) =
