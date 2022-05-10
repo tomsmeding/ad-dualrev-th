@@ -1,26 +1,20 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE LinearTypes #-}
 {-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
-{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS -Wno-incomplete-uni-patterns #-}
 module Language.Haskell.ReverseAD.TH (
   reverseAD,
   reverseAD',
-  -- useTypeForReverseAD,
   KnownType,
   Structure,
   knownStructure,
@@ -45,7 +39,6 @@ import Data.Word
 import GHC.TypeLits (TypeError, ErrorMessage(Text))
 import GHC.Types (Multiplicity(One))
 import Language.Haskell.TH
-import Language.Haskell.TH.Lift ()  -- for Lift Name
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
@@ -54,9 +47,6 @@ import Prelude.Linear (Ur(..))
 
 import qualified Data.Array.Mutable.Linear as A
 import Data.Array.Mutable.Linear (Array)
-
-
-type QuoteFail m = (Quote m, MonadFail m)
 
 
 -- Dt[Double] = (Double, (Int, Contrib))
@@ -247,73 +237,6 @@ instance (KnownType a, KnownType b, KnownType c, KnownType d) => KnownType (a, b
 
 instance KnownType a => KnownType [a] where
   knownType _ = ListT `AppT` knownType (Proxy @a)
-
--- | Use on the top level for a newtype that you wish to use in 'reverseAD'.
--- For example:
---
---     {-# LANGUAGE FlexibleContexts, TemplateHaskell, UndecidableInstances #-}
---     import Data.Monoid (Sum(..))
---     useTypeForReverseAD ''Sum
---
--- Note that, due to the GHC stage restriction, you cannot put the
--- 'useTypeForReverseAD' invocation and the usage of the datatype in a
--- 'reverseAD' splice in the same file. Put the 'useTypeForReverseAD'
--- invocation in a different module and import that.
--- useTypeForReverseAD :: Name -> Q [Dec]
--- useTypeForReverseAD tyname = do
---   typedecl <- reify tyname >>= \case
---     TyConI decl -> return decl
---     info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
---   (conname, tyvars, fieldty) <- case typedecl of
---     NewtypeD [] _ tyvars _ constr _ -> case constr of
---       NormalC conname [(_, fieldty)] -> return (conname, map tvbName tyvars, fieldty)
---       RecC conname [(_, _, fieldty)] -> return (conname, map tvbName tyvars, fieldty)
---       _ -> fail $ "Unsupported constructor format on newtype: " ++ show constr
---     _ -> fail "Only newtypes supported for now"
---   checkNoScalars fieldty
---   connameexp <- lift conname
---   buildname <- newName "build"
---   let builddecs =
---         [SigD buildname (ArrowT `AppT` (ConT ''Structure `AppT` fieldty)
---                                 `AppT` (ConT ''Structure
---                                           `AppT` foldl AppT (ConT tyname) (map VarT tyvars)))
---         ,ValD (VarP buildname)
---               (NormalB (ConE 'SNewtype `AppE` connameexp))
---               []]
---   return [InstanceD Nothing
---                     [ConT ''KnownStructure `AppT` fieldty]
---                     (ConT ''KnownStructure
---                        `AppT` foldl AppT (ConT tyname) (map VarT tyvars))
---                     [ValD (VarP 'knownStructure)
---                           (NormalB (LetE builddecs
---                                          (AppE (VarE buildname) (VarE 'knownStructure))))
---                           []]]
---   where
---     tvbName :: TyVarBndr () -> Name
---     tvbName (PlainTV n _) = n
---     tvbName (KindedTV n _ _) = n
-
---     checkNoScalars :: MonadFail m => Type -> m ()
---     checkNoScalars (ForallT _ [] t) = checkNoScalars t
---     checkNoScalars (AppT t1 t2) = checkNoScalars t1 >> checkNoScalars t2
---     checkNoScalars (SigT t _) = checkNoScalars t
---     checkNoScalars (VarT _) = return ()
---     checkNoScalars (ConT n)
---       | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
---                  ,''Word, ''Word8, ''Word16, ''Word32, ''Word64]
---       = return ()
---       | n == ''Double
---       = fail "No literal Double scalars allowed in type used in reverse AD; replace them with a type parameter."
---     checkNoScalars (ParensT t) = checkNoScalars t
---     checkNoScalars (TupleT _) = return ()
---     checkNoScalars ArrowT = return ()
---     checkNoScalars MulArrowT = return ()
---     checkNoScalars ListT = return ()
---     checkNoScalars t@(ForallT _ (_:_) _) = fail $ "Contexts in foralls not supported in type: " ++ replace '\n' ' ' (pprint t)
---     checkNoScalars t = fail $ "Unsupported type in data type: " ++ replace '\n' ' ' (pprint t)
-
---     replace :: (Eq a, Functor f) => a -> a -> f a -> f a
---     replace from to = fmap (\x -> if x == from then to else x)
 
 
 -- | Use as follows:
@@ -775,26 +698,6 @@ liftKleisliN n e = do
   iname <- newName "i"
   return (LamE [VarP name, VarP iname] $ pair e' (VarE iname))
 
--- -- | Checks that the type with this declaration is isomorphic to nested
--- -- products/sums plus possibly some discrete literal types. This is a
--- -- sufficient criterion for the constructors of the type being allowable in
--- -- expressions and patterns under 'reverseAD'.
--- checkStructuralType :: Dec -> Bool
--- checkStructuralType = \case
---   NewtypeD [] _ _ _ constr _ -> goCon constr
---   DataD [] _ _ _ constrs _ -> all goCon constrs
---   _ -> False
---   where
---     goCon :: Con -> Bool
---     goCon = \case
---       NormalC _ tys -> all goField [ty | (_, ty) <- tys]
---       RecC _ tys -> all goField [ty | (_, _, ty) <- tys]
---       _ -> False
-
---     goField :: Type -> Bool
---     goField (VarT _) = True
---     goField _ = False
-
 class NumOperation a where
   type DualNum a = r | r -> a
   applyBinaryOp
@@ -832,7 +735,7 @@ instance NumOperation Int where
   applyUnaryOp x primal _ nextid = (primal x, nextid)
   applyCmpOp x y f = f x y
 
-desugarDec :: QuoteFail m => Dec -> m Dec
+desugarDec :: (Quote m, MonadFail m) => Dec -> m Dec
 desugarDec = \case
   dec@(ValD (VarP _) (NormalB _) []) -> return $ dec
 

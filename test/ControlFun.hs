@@ -35,23 +35,8 @@ reverseADandControl inpStruc outStruc program =
   [|| ($$(reverseAD' (deriveStructureT inpStruc) (deriveStructureT outStruc) program)
       ,ControlFun $$(unsafeCodeCoerce (unTypeCode program))) ||]
 
--- useTypeForReverseAD ''Sum
-
 newtype WeirdType a b = MkWeirdType (Int, [(a, b)])
   deriving (Show)
-
--- useTypeForReverseAD ''WeirdType
-
--- instance (FinDiff a, FinDiff b, Element a ~ Double, Element a ~ Element b) => FinDiff (WeirdType a b) where
---   type Element (WeirdType a b) = Element (Int, [(a, b)])
---   type ReplaceElements (WeirdType a b) s = WeirdType (ReplaceElements a s) (ReplaceElements b s)
---   elements' _ (MkWeirdType x) = elements' (Proxy @(Int, [(a, b)])) x
---   rebuild' _ p (MkWeirdType ref) elts =
---     let (x, rest) = rebuild' (Proxy @(Int, [(a, b)])) p ref elts in (MkWeirdType x, rest)
---   oneElement _ = oneElement (Proxy @(Int, [(a, b)]))
---   zero p (MkWeirdType ref) = MkWeirdType (zero p ref)
---   replaceElements _ f (MkWeirdType x) = MkWeirdType (replaceElements (Proxy @(Int, [(a, b)])) f x)
---   replaceElementsId | Refl <- replaceElementsId @(Int, [(a, b)]) = Refl
 
 dataFinDiff ''WeirdType
 
