@@ -482,6 +482,20 @@ ddr :: Env -> Name -> Exp -> Q Exp
 ddr env idName = \case
   VarE name
     | name `Set.member` env -> return (pair (VarE name) (VarE idName))
+    | name == 'fromIntegral -> do  -- TODO: this assumes this produces a Double...
+        xname <- newName "x"
+        iname <- newName "i"
+        -- We add a type signature on the Double in the tuple not because this
+        -- is super necessary, but to hopefully make the error message a bit
+        -- better if we mis-guessed the result type of fromIntegral.
+        return (pair (LamE [VarP xname, VarP iname] $
+                        pair (pair (SigE (VarE 'fromIntegral `AppE` VarE xname)
+                                         (ConT ''Double))
+                                   (pair (VarE iname) (AppE (ConE 'Contrib) (ListE []))))
+                             (InfixE (Just (VarE iname))
+                                     (VarE '(+))
+                                     (Just (LitE (IntegerL 1)))))
+                     (VarE idName))
     | name == 'negate -> do
         xname <- newName "x"
         iname <- newName "i"
