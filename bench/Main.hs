@@ -4,7 +4,6 @@
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
-{-# LANGUAGE ImpredicativeTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
@@ -17,6 +16,7 @@ import Criterion
 import Criterion.Types (Config(..))
 import qualified Criterion.Main as Criterion
 import qualified Criterion.Main.Options as Criterion
+import Data.Functor.Identity
 import System.Environment (getArgs)
 import System.Exit (die, exitSuccess, exitFailure)
 
@@ -26,20 +26,20 @@ import Test.Framework hiding (scale)
 import Types
 
 
-fmult :: DFunction FMult
+fmult :: DFunction FMult Identity
 fmult = $$(makeFunction
-  [|| \arg -> case arg of MkFMult (x, y) -> x * y ||])
+  [|| \arg -> Identity $ case arg of MkFMult (x, y) -> x * y ||])
 
-fdotprod :: DFunction FDotProd
+fdotprod :: DFunction FDotProd Identity
 fdotprod = $$(makeFunction
   [|| \(FDotProd (l1, l2)) ->
         let zipWith' f (x:xs) (y:ys) = f x y : zipWith' f xs ys
             zipWith' _ _ _ = []
             sum' [] = 0.0
             sum' (x:xs) = x + sum' xs
-        in sum' (zipWith' (\x y -> x * y) l1 l2) ||])
+        in Identity $ sum' (zipWith' (\x y -> x * y) l1 l2) ||])
 
-fsummatvec :: DFunction FSumMatVec
+fsummatvec :: DFunction FSumMatVec Identity
 fsummatvec = $$(makeFunction
   [|| \(FSumMatVec (m, v)) ->
         let zipWith' f (x:xs) (y:ys) = f x y : zipWith' f xs ys
@@ -49,11 +49,10 @@ fsummatvec = $$(makeFunction
             dotp v1 v2 = sum' (zipWith' (\x y -> x * y) v1 v2)
             map' _ [] = []
             map' f (x:xs) = f x : map' f xs
-        in sum' (map' (dotp v) m) ||])
+        in Identity $ sum' (map' (dotp v) m) ||])
 
--- The example function from [Krawiec et al. 2022], with the output vector
--- summed in order to return a 'Double'.
-frotvecquat :: DFunction FRotVecQuat
+-- The example function from [Krawiec et al. 2022].
+frotvecquat :: DFunction FRotVecQuat Vec3
 frotvecquat = $$(makeFunction
   [|| \(FRotVecQuat (topv, topq)) ->
         let q_to_vec (Quaternion x y z _) = Vec3 x y z
@@ -66,7 +65,7 @@ frotvecquat = $$(makeFunction
               let u = q_to_vec q
                   s = case q of Quaternion _ _ _ w -> w
               in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
-        in (\(Vec3 x y z) -> x + y + z) $ rotate_vec_by_quat topv topq ||])
+        in rotate_vec_by_quat topv topq ||])
 
 data Options = Options
   { argsPatternsRev :: [String]

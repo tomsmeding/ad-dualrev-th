@@ -1,6 +1,8 @@
 module Test.Approx where
 
+import Data.Functor.Identity
 import Data.Monoid
+import Test.QuickCheck
 
 
 class Approx a where
@@ -26,9 +28,17 @@ instance Approx a => Approx [a] where
 instance Approx a => Approx (Sum a) where
   approx absdelta reldelta (Sum a) (Sum b) = approx absdelta reldelta a b
 
-(~=) :: Approx a => a -> a -> Bool
-(~=) = approx 0.01 0.01
+instance Approx a => Approx (Identity a) where
+  approx absdelta reldelta (Identity a) (Identity b) = approx absdelta reldelta a b
 
-(~~=) :: Approx a => a -> a -> Bool
-(~~=) = approx 0.1 0.1
+(~=) :: (Approx a, Show a) => a -> a -> Property
+a ~= b | approx 0.01 0.01 a b = property True
+       | otherwise = counterexample s (property False)
+  where s = "Left arg to ~= : " ++ show a ++ "\n\
+            \Right arg to ~=: " ++ show b
 
+(~~=) :: (Approx a, Show a) => a -> a -> Property
+a ~~= b | approx 0.1 0.1 a b = property True
+        | otherwise = counterexample s (property False)
+  where s = "Left arg to ~~= : " ++ show a ++ "\n\
+            \Right arg to ~~=: " ++ show b
