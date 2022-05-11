@@ -45,4 +45,18 @@ makeKnownType ''QuaternionN
 instance Arbitrary a => Arbitrary (QuaternionN a) where arbitrary = QuaternionN <$> arbitrary
 instance Approx a => Approx (QuaternionN a) where approx absdelta reldelta (QuaternionN (a, b, c, d)) (QuaternionN (a', b', c', d')) = approx absdelta reldelta [a, b, c, d] [a', b', c', d']
 
+data WeirdSum a b = WSOne a Int a | WSTwo (b, a) deriving (Show)
+dataFinDiff ''WeirdSum
+makeKnownType ''WeirdSum
+instance (Arbitrary a, Arbitrary b) => Arbitrary (WeirdSum a b) where
+  arbitrary = oneof [WSOne <$> arbitrary <*> arbitrary <*> arbitrary
+                    ,WSTwo <$> arbitrary]
+instance (Approx a, Approx b) => Approx (WeirdSum a b) where
+  approx absdelta reldelta (WSOne a i b) (WSOne a' i' b') =
+    approx absdelta reldelta ([a, b], i) ([a', b'], i')
+  approx absdelta reldelta (WSTwo a) (WSTwo a') =
+    approx absdelta reldelta a a'
+  approx _ _ _ _ = False
+
+dataFinDiff ''Sum
 makeKnownType ''Sum

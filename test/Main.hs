@@ -259,4 +259,17 @@ main =
                   in rotate_vec_by_quat topv topq ||])
        Nothing
        YesFD
+    ,checkFDcontrol "WeirdSum data"
+       $$(reverseADandControl @(WeirdSum Double Int) @Double
+            [|| \v -> case v of WSOne x i y -> fromIntegral i * x * y
+                                WSTwo (i, x) -> fromIntegral i + x ||])
+       (Just (\inp d -> case inp of WSOne x i y -> WSOne (d * fromIntegral i * y) i (d * fromIntegral i * x)
+                                    WSTwo (i, _) -> WSTwo (i, d)))
+       YesFD
+    ,checkFDcontrol "WeirdSum data constr"
+       $$(reverseADandControl @Double @(WeirdSum Int Double)
+            [|| \x -> if x < 0.0 then WSOne 0 1 2 else WSTwo (3.0*x, 0) ||])
+       (Just (\_ d -> case d of WSOne _ _ _ -> 0.0
+                                WSTwo (d', _) -> 3.0 * d'))
+       YesFD
     ]
