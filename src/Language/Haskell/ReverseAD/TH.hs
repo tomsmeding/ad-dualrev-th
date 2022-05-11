@@ -26,6 +26,8 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Applicative (asum)
+import qualified Data.Array.Mutable.Linear as A
+import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
 import Control.Monad (forM, zipWithM, when)
 import Data.Foldable (toList)
@@ -43,15 +45,13 @@ import Data.Word
 import GHC.Types (Multiplicity(One))
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax (lift)
-import Language.Haskell.TH.Lift ()  -- for Lift Name
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
 -- import Control.Monad.IO.Class
 -- import Debug.Trace
 
-import qualified Data.Array.Mutable.Linear as A
-import Data.Array.Mutable.Linear (Array)
+import Language.Haskell.ReverseAD.TH.Orphans ()
 
 
 -- Dt[Double] = (Double, (Int, Contrib))
