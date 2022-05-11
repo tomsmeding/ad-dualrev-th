@@ -30,7 +30,7 @@ checkControl :: (Arbitrary a, Arbitrary b, Approx a, Approx b, Show a, Show b)
 checkControl name program controlfun controlgrad =
   property name $ \x adj ->
     let (y1, df1) = program x
-    in y1 ~= controlfun x && df1 adj ~= controlgrad x adj
+    in y1 ~= controlfun x .&&. df1 adj ~= controlgrad x adj
 
 data DoCheckFinDiff = YesFD | NoFD
   deriving (Show)
