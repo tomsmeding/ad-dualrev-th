@@ -44,6 +44,7 @@ checkFDcontrol :: forall a b.
                -> DoCheckFinDiff
                -> Tree
 checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
+  | Nothing <- mcontrolgrad, NoFD <- dofindiff = error "checkFDcontrol: should check against _something_"
   | Refl <- replaceElementsId @a
   , Refl <- replaceElementsId @b
   = property name $ \x ->
