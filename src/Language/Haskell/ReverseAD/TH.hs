@@ -23,10 +23,10 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Applicative (asum)
+import Control.Monad.State.Strict
 import qualified Data.Array.Mutable.Linear as A
 import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
-import Control.Monad (forM, zipWithM, when)
 import Data.Foldable (toList)
 import Data.Function ((&))
 import Data.List (tails, mapAccumL, zip4, unzip5)
@@ -42,7 +42,7 @@ import Data.Void
 import Data.Word
 import GHC.Types (Multiplicity(One))
 import Language.Haskell.TH
-import Language.Haskell.TH.Syntax
+import Language.Haskell.TH.Syntax hiding (lift)
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
@@ -147,6 +147,104 @@ structureFromTypeable = structureFromType . typeRepToType . typeRep
       resultArgs <- mapM typeRepToType args
       return (foldl AppT (ConT name) resultArgs)
 
+data SimpleType = VarST Name
+                | ConST Name [SimpleType]
+  deriving (Show, Eq)
+
+summariseType :: Type -> Either String SimpleType
+summariseType = \case
+  ConT n -> return $ ConST n []
+  VarT n -> return $ VarST n
+  ParensT t -> summariseType t
+  TupleT k -> return $ ConST (tupleTypeName k) []
+  ListT -> return $ ConST ''[] []
+  t@AppT{} -> collectApps t []
+    where collectApps :: Type -> [SimpleType] -> Either String SimpleType
+          collectApps (AppT t1 t2) args =
+            summariseType t2 >>= \t2' -> collectApps t1 (t2' : args)
+          collectApps t1 args =
+            summariseType t1 >>= \t1' -> smartAppsST t1' args
+  t -> Left $ "Unsupported type: " ++ pprint t
+  where
+    smartAppsST :: SimpleType -> [SimpleType] -> Either String SimpleType
+    smartAppsST (VarST n) _ = Left $ "Higher-rank type variable not supported in reverse AD: " ++ show n
+    smartAppsST (ConST n as) bs = return $ ConST n (as ++ bs)
+
+-- | This does not yet check that scalars do not appear in data types!
+--
+-- The state maps a type name to all the various instantiations under which it
+-- occurs in the type we are analysing. For each instantiation, the 'Map'
+-- contains the list of type arguments its type variables are instantiated to,
+-- as well as the structure that was computed for this intantiation of that
+-- data type.
+--
+-- The return structure tag is either a tag from the environment map, or an
+-- instantiation of a data type (indicated using its type name and its type
+-- arguments). If a tag is a data type instantiation, it refers to one of the
+-- structures from the state 'Map'.
+deriveStructureGroup
+  :: Map Name (Structure' (Either (Name, [SimpleType]) tag))
+       -- ^ Type /variables/ that are in scope
+  -> Map Name [SimpleType]  -- ^ Instantiations of /data types/ in the current stack
+                            --     (for polymorphic recursion detection)
+  -> SimpleType  -- ^ Type to inspect
+  -> StateT (Map Name [([SimpleType], Structure' (Either (Name, [SimpleType]) tag))])
+            Q (Structure' (Either (Name, [SimpleType]) tag))
+deriveStructureGroup env stack = \case
+  VarST n ->
+    case Map.lookup n env of
+      Just struc -> return struc
+      Nothing -> fail $ "Type variable out of scope: " ++ show n
+
+  ConST n []
+    | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
+               ,''Word, ''Word8, ''Word16, ''Word32, ''Word64]
+    -> return SDiscrete
+    | n == ''Double -> return SScalar
+    | n == ''Float -> fail "Only Double is an active type for now (Float isn't)"
+
+  ConST tyname argtys
+    | Just prevargtys <- Map.lookup tyname stack ->
+        if argtys == prevargtys
+          then return (STag (Left (tyname, argtys)))  -- recursion detected!
+          else fail $ "Polymorphic recursion (data type that contains itself \
+                      \with different type argument instantiations) is not \
+                      \supported in reverse AD"
+
+    | otherwise -> do
+        -- Compute the structures for the argument types; we do not yet grow
+        -- the stack, as these are not data type fields.
+        argstrucs <- mapM (deriveStructureGroup env stack) argtys
+
+        -- Get information about the data type
+        typedecl <- lift (reify tyname) >>= \case
+          TyConI decl -> return decl
+          info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
+        (tyvars, constrs) <- case typedecl of
+          NewtypeD [] _ tyvars _ constr  _ -> return (map tvbName tyvars, [constr])
+          DataD    [] _ tyvars _ constrs _ -> return (map tvbName tyvars, constrs)
+          _ -> fail $ "Type not supported: " ++ show tyname ++ " (not simple newtype or data)"
+        when (length tyvars /= length argtys) $
+          fail $ "Type not fully applied: " ++ show tyname
+
+        -- Analyse a constructor, and return (constructor name, [field structures])
+        let goConstr constr = do
+              -- Get constructor name and field types
+              (conname, fieldtys) <- case constr of
+                NormalC conname fieldtys -> return (conname, map (\(  _,ty) -> ty) fieldtys)
+                RecC    conname fieldtys -> return (conname, map (\(_,_,ty) -> ty) fieldtys)
+                _ -> fail $ "Unsupported constructor format on data: " ++ show constr
+              fieldtys' <- mapM (either fail return . summariseType) fieldtys
+              -- - In the field type, the environment contains bindings for the type
+              --   variables of the data type the constructor is a member of. In
+              --   particular, we forget any other environment bindings we had before.
+              -- - We add the current data type to the stack.
+              let env' = Map.fromList (zip tyvars argstrucs)
+                  stack' = Map.insert tyname argtys stack
+              (conname,) <$> mapM (deriveStructureGroup env' stack') fieldtys'
+
+        SData <$> mapM goConstr constrs
+
 deriveStructure :: Map Name (Structure' tag) -> Type -> Q (Structure' tag)
 deriveStructure = \env -> go env True
   where
@@ -155,7 +253,7 @@ deriveStructure = \env -> go env True
       AppT (ConT listty) eltty | listty == ''[] ->
         SList <$> go env scalarsAllowed eltty
       t@AppT{} -> do
-        (headty, argtys) <- collectApps t
+        let (headty, argtys) = collectApps t
         argstrucs <- mapM (go env scalarsAllowed) argtys
         goApplied env scalarsAllowed headty argstrucs
       SigT t _ -> go env scalarsAllowed t
@@ -219,14 +317,11 @@ deriveStructure = \env -> go env True
 
       _ -> fail $ "Type unsupported in data in reverse AD: " ++ show headty
 
-    collectApps :: Type -> Q (Type, [Type])
-    collectApps (AppT t1 t2) = do (n, ts) <- collectApps t1
-                                  return (n, ts ++ [t2])
-    collectApps t = return (t, [])
-
-    tvbName :: TyVarBndr () -> Name
-    tvbName (PlainTV n _) = n
-    tvbName (KindedTV n _ _) = n
+    collectApps = second reverse . collectAppsRev
+    collectAppsRev :: Type -> (Type, [Type])
+    collectAppsRev (AppT t1 t2) = second (t2 :) (collectAppsRev t1)
+    collectAppsRev (ParensT t) = collectAppsRev t
+    collectAppsRev t = (t, [])
 
 -- | Pattern match on the given data constructor and extract the single value.
 unNewtype :: Quote m => Name -> Exp -> m Exp
@@ -993,3 +1088,7 @@ notSupported descr mthing = fail $ descr ++ " not supported in reverseAD" ++ may
 
 zipWithM3 :: Applicative m => (a -> b -> c -> m d) -> [a] -> [b] -> [c] -> m [d]
 zipWithM3 f a b c = traverse (\(x,y,z) -> f x y z) (zip3 a b c)
+
+tvbName :: TyVarBndr () -> Name
+tvbName (PlainTV n _) = n
+tvbName (KindedTV n _ _) = n

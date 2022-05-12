@@ -27,6 +27,7 @@ library
     , containers
     , linear-base
     , ghc-prim
+    , mtl
     , some
     , template-haskell
     , vector
