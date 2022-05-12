@@ -10,6 +10,7 @@
     separate module from where it is used. -}
 module ControlFun where
 
+import Data.Typeable (Typeable)
 import Language.Haskell.TH (Q, Code)
 import Language.Haskell.TH.Syntax (unTypeCode, unsafeCodeCoerce)
 
@@ -21,7 +22,7 @@ newtype ControlFun a b = ControlFun (forall s. (Floating s, Ord s) => ReplaceEle
 
 reverseADandControl
   :: forall a b.
-     (KnownType a, KnownType b)
+     (Typeable a, Typeable b)
   => Code Q (a -> b)
   -> Code Q (a -> (b, b -> a), ControlFun a b)
 reverseADandControl program =

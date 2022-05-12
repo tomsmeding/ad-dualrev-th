@@ -16,13 +16,10 @@ module Language.Haskell.ReverseAD.TH (
   -- * Reverse AD
   reverseAD,
   reverseAD',
-  -- * Type witness
-  KnownType(..),
-  makeKnownType,
   -- * Structure descriptions
   Structure,
   knownStructure,
-  deriveStructureT,
+  deriveStructure,
 ) where
 
 import Control.Applicative (asum)
@@ -39,12 +36,13 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Typeable
 import qualified Data.Vector as V
 import Data.Void
 import Data.Word
 import GHC.Types (Multiplicity(One))
 import Language.Haskell.TH
-import Language.Haskell.TH.Syntax (lift)
+import Language.Haskell.TH.Syntax
 import qualified Prelude.Linear as PL
 import Prelude.Linear (Ur(..))
 
@@ -132,19 +130,29 @@ type Structure = Structure' Void
 
 -- | Analyse the 'Type' and give a 'Structure' that describes the type for use
 -- in 'reverseAD''.
-deriveStructureT :: Q Type -> Q Structure
-deriveStructureT ty = ty >>= deriveStructure mempty
+deriveStructure :: Q Type -> Q Structure
+deriveStructure ty = ty >>= deriveStructure' mempty
 
 -- | If a 'Type' is known, we can derive its structure. This simply uses
 -- 'deriveStructureT' on the 'Type' written in the 'KnownType' instance.
-knownStructure :: KnownType a => Proxy a -> Q Structure
-knownStructure = deriveStructureT . return . knownType
+knownStructure :: Typeable a => Proxy a -> Q Structure
+knownStructure = deriveStructure . typeRepToType . typeRep
+  where
+    -- Taken from th-utilities-0.2.4.3 by Michael Sloan
+    typeRepToType :: TypeRep -> Q Type
+    typeRepToType tr = do
+      let (con, args) = splitTyConApp tr
+          name = Name (OccName (tyConName con)) (NameG TcClsName (PkgName (tyConPackage con)) (ModName (tyConModule con)))
+      resultArgs <- mapM typeRepToType args
+      return (foldl AppT (ConT name) resultArgs)
 
-deriveStructure :: Map Name (Structure' tag) -> Type -> Q (Structure' tag)
-deriveStructure = \env -> go env True
+deriveStructure' :: Map Name (Structure' tag) -> Type -> Q (Structure' tag)
+deriveStructure' = \env -> go env True
   where
     go :: Map Name (Structure' tag) -> Bool -> Type -> Q (Structure' tag)
     go env scalarsAllowed = \case
+      AppT (ConT listty) eltty | listty == ''[] ->
+        SList <$> go env scalarsAllowed eltty
       t@AppT{} -> do
         (headty, argtys) <- collectApps t
         argstrucs <- mapM (go env scalarsAllowed) argtys
@@ -204,7 +212,7 @@ deriveStructure = \env -> go env True
                     (conname,) <$> mapM (go env' False) fieldtys
                   RecC    conname (map (\(_,_,ty) -> ty) -> fieldtys) ->
                     (conname,) <$> mapM (go env' False) fieldtys
-                  constr -> fail $ "Unsupported constructor format on newtype: " ++ show constr
+                  constr -> fail $ "Unsupported constructor format on data: " ++ show constr
             SData <$> mapM goConstr constrs
           _ -> fail $ "Type not supported: " ++ show tyname
 
@@ -225,86 +233,6 @@ unNewtype conname expr = do
   name <- newName "x"
   return $ CaseE expr [Match (ConP conname [] [VarP name]) (NormalB (VarE name)) []]
 
--- | This class simply contains a 'Type' for the type variable @a@. Use
--- 'makeKnownType' to automatically derive an instance of this class.
---
--- This ought to be 'Typeable' instead, because a 'Type' can be derived from a
--- 'TypeRep' in the same circumstances as 'KnownType' works currently, and
--- 'Typeable' is auto-derived by GHC. However, due to
--- [an issue (GHC #21547)](https://gitlab.haskell.org/ghc/ghc/-/issues/21547) with the
--- interaction between TemplateHaskell and Typeable, that currently does not
--- work.
-class KnownType a where knownType :: Proxy a -> Type
-
-instance KnownType Int where knownType _ = ConT ''Int
-instance KnownType Int8 where knownType _ = ConT ''Int8
-instance KnownType Int16 where knownType _ = ConT ''Int16
-instance KnownType Int32 where knownType _ = ConT ''Int32
-instance KnownType Int64 where knownType _ = ConT ''Int64
-instance KnownType Word where knownType _ = ConT ''Word
-instance KnownType Word8 where knownType _ = ConT ''Word8
-instance KnownType Word16 where knownType _ = ConT ''Word16
-instance KnownType Word32 where knownType _ = ConT ''Word32
-instance KnownType Word64 where knownType _ = ConT ''Word64
-instance KnownType () where knownType _ = TupleT 0
-instance KnownType Double where knownType _ = ConT ''Double
-
-instance (KnownType a, KnownType b) => KnownType (a, b) where
-  knownType _ = TupleT 2 `AppT` knownType (Proxy @a) `AppT` knownType (Proxy @b)
-instance (KnownType a, KnownType b, KnownType c) => KnownType (a, b, c) where
-  knownType _ = TupleT 3 `AppT` knownType (Proxy @a) `AppT` knownType (Proxy @b) `AppT` knownType (Proxy @c)
-instance (KnownType a, KnownType b, KnownType c, KnownType d) => KnownType (a, b, c, d) where
-  knownType _ = TupleT 3 `AppT` knownType (Proxy @a) `AppT` knownType (Proxy @b) `AppT` knownType (Proxy @c) `AppT` knownType (Proxy @d)
-
-instance KnownType a => KnownType [a] where
-  knownType _ = ListT `AppT` knownType (Proxy @a)
-
--- | Use on the top level for a data type that you wish to use in 'reverseAD'.
--- For example:
---
--- > {-# LANGUAGE ScopedTypeVariables, TemplateHaskell, TypeApplications #-}
--- > data Foo a = Foo Int (a, Bool)
--- > makeKnownType ''Foo
---
--- This will generate an instance that looks as follows:
---
--- > instance KnownType a => KnownType (Foo a) where
--- >   knownType _ = ConT ''Foo `AppT` knownType (Proxy @a)
---
--- Note that, due to the GHC stage restriction, you cannot put the
--- 'makeKnownType' invocation and the usage of the datatype in a 'reverseAD'
--- splice in the same file. Put the 'knownType' invocation in a different
--- module and import that.
-makeKnownType :: Name -> Q [Dec]
-makeKnownType tyname = do
-  extok <- and <$> traverse isExtEnabled [ScopedTypeVariables, TypeApplications]
-  when (not extok) $
-    fail "The instance declaration generated by makeKnownType needs these extensions enabled:\n\
-         \  ScopedTypeVariables, TypeApplications"
-  typedecl <- reify tyname >>= \case
-    TyConI decl -> return decl
-    info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
-  tyvars <- case typedecl of
-    NewtypeD [] _ tyvars _ _ _ -> return (map tvbName tyvars)
-    DataD [] _ tyvars _ _ _ -> return (map tvbName tyvars)
-    _ -> fail "makeKnownType: Only simple 'newtype' and 'data' types supported"
-  lifttyname <- lift tyname
-  return [InstanceD Nothing
-                    [ConT ''KnownType `AppT` VarT tyvar | tyvar <- tyvars]
-                    (ConT ''KnownType
-                       `AppT` foldl AppT (ConT tyname) (map VarT tyvars))
-                    [FunD 'knownType
-                       [Clause [WildP]
-                               (NormalB (foldl (\a b -> InfixE (Just a) (ConE 'AppT) (Just b))
-                                               (ConE 'ConT `AppE` lifttyname)
-                                               [VarE 'knownType `AppE` (ConE 'Proxy `AppTypeE` VarT tyvar)
-                                               | tyvar <- tyvars]))
-                               []]]]
-  where
-    tvbName :: TyVarBndr () -> Name
-    tvbName (PlainTV n _) = n
-    tvbName (KindedTV n _ _) = n
-
 
 -- | Use as follows:
 --
@@ -312,7 +240,7 @@ makeKnownType tyname = do
 -- > (Double, Double) -> (Double, Double -> (Double, Double))
 --
 -- The active scalar type is 'Double'. 'Double' values are differentiated; 'Float' is currently unsupported.
-reverseAD :: forall a b. (KnownType a, KnownType b)
+reverseAD :: forall a b. (Typeable a, Typeable b)
           => Code Q (a -> b)
           -> Code Q (a -> (b, b -> a))
 reverseAD = reverseAD' (knownStructure (Proxy @a)) (knownStructure (Proxy @b))
@@ -748,8 +676,8 @@ checkDatacon name = do
               Just vars -> return vars
               Nothing -> fail "Normal constructor has GADT properties?"
   let appliedType = foldl AppT (ConT tycon) (map VarT tyvars)
-  -- The fact that 'deriveStructure' returns successfully implies that the type is fine
-  _ <- deriveStructure (Map.fromList (zip tyvars (repeat (STag ())))) appliedType
+  -- The fact that 'deriveStructure'' returns successfully implies that the type is fine
+  _ <- deriveStructure' (Map.fromList (zip tyvars (repeat (STag ())))) appliedType
   return fieldtys
 
 -- | Given the type of a data constructor, return:

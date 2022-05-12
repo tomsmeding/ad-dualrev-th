@@ -15,6 +15,7 @@ module DFunction (
 ) where
 
 import Data.Bifunctor (second)
+import Data.Typeable (Typeable)
 import Language.Haskell.TH (Q, Code, unsafeCodeCoerce, unTypeCode)
 
 import qualified Numeric.AD as AD
@@ -53,7 +54,7 @@ newtype GenericFunction f g = GenericFunction
   { runGF :: forall s. (Floating s, Ord s) => f s -> g s }
 
 makeFunction :: forall f g.
-                (DR.KnownType (f Double), DR.KnownType (g Double), Traversable g)
+                (Typeable f, Typeable g, Traversable g)
              => Code Q (f Double -> g Double)
              -> Code Q (DFunction f g)
 makeFunction code =
