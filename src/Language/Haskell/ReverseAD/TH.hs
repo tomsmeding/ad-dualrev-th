@@ -760,10 +760,10 @@ desugarDec = \case
 
   FunD _ [] -> fail "Function declaration with empty list of clauses?"
 
-  FunD name clauses
+  FunD name clauses@(_:_)
     | not (allEqual [length pats | Clause pats _ _ <- clauses])
     -> fail "Clauses of a function declaration do not all have the same number of arguments"
-    | not (and [null decs | Clause _ _ decs <- clauses])
+    | length [() | Clause _ _ [] <- clauses] /= length clauses
     -> fail $ "Where blocks not supported in declaration of " ++ show name
     | length [() | Clause _ (NormalB _) _ <- clauses] /= length clauses
     -> fail $ "Guards not supported in declaration of " ++ show name
