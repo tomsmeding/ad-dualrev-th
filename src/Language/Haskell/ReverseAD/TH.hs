@@ -18,8 +18,8 @@ module Language.Haskell.ReverseAD.TH (
   reverseAD',
   -- * Structure descriptions
   Structure,
-  knownStructure,
-  deriveStructure,
+  structureFromTypeable,
+  structureFromType,
 ) where
 
 import Control.Applicative (asum)
@@ -125,18 +125,19 @@ data Structure' tag
   deriving (Show)
 
 -- | The structure of a type, as used by the AD transformation. Use
--- 'deriveStructureT' or 'knownStructure' to construct a value of this type.
+-- 'structureFromTypeable' or 'structureFromType' to construct a 'Structure'.
 type Structure = Structure' Void
 
 -- | Analyse the 'Type' and give a 'Structure' that describes the type for use
 -- in 'reverseAD''.
-deriveStructure :: Q Type -> Q Structure
-deriveStructure ty = ty >>= deriveStructure' mempty
+structureFromType :: Q Type -> Q Structure
+structureFromType ty = ty >>= deriveStructure mempty
 
--- | If a 'Type' is known, we can derive its structure. This simply uses
--- 'deriveStructureT' on the 'Type' written in the 'KnownType' instance.
-knownStructure :: Typeable a => Proxy a -> Q Structure
-knownStructure = deriveStructure . typeRepToType . typeRep
+-- | A 'TypeRep' (which we can obtain from the 'Typeable' constraint) can be
+-- used to construct a 'Type' for the type @a@, on which we can then call
+-- 'structureFromType'.
+structureFromTypeable :: Typeable a => Proxy a -> Q Structure
+structureFromTypeable = structureFromType . typeRepToType . typeRep
   where
     -- Taken from th-utilities-0.2.4.3 by Michael Sloan
     typeRepToType :: TypeRep -> Q Type
@@ -146,8 +147,8 @@ knownStructure = deriveStructure . typeRepToType . typeRep
       resultArgs <- mapM typeRepToType args
       return (foldl AppT (ConT name) resultArgs)
 
-deriveStructure' :: Map Name (Structure' tag) -> Type -> Q (Structure' tag)
-deriveStructure' = \env -> go env True
+deriveStructure :: Map Name (Structure' tag) -> Type -> Q (Structure' tag)
+deriveStructure = \env -> go env True
   where
     go :: Map Name (Structure' tag) -> Bool -> Type -> Q (Structure' tag)
     go env scalarsAllowed = \case
@@ -240,10 +241,17 @@ unNewtype conname expr = do
 -- > (Double, Double) -> (Double, Double -> (Double, Double))
 --
 -- The active scalar type is 'Double'. 'Double' values are differentiated; 'Float' is currently unsupported.
+--
+-- Note that due to the GHC stage restriction, any data types used in @a@ and
+-- @b@ must be defined in a separate module that is then imported into the
+-- module where you use 'reverseAD'. If you get a GHC panic about @$tcFoo@ not
+-- being in scope (where @Foo@ is your data type), this means that you violated
+-- this stage restriction. See
+-- [GHC #21547](https://gitlab.haskell.org/ghc/ghc/-/issues/21547).
 reverseAD :: forall a b. (Typeable a, Typeable b)
           => Code Q (a -> b)
           -> Code Q (a -> (b, b -> a))
-reverseAD = reverseAD' (knownStructure (Proxy @a)) (knownStructure (Proxy @b))
+reverseAD = reverseAD' (structureFromTypeable (Proxy @a)) (structureFromTypeable (Proxy @b))
 
 -- | Same as 'reverseAD', but with user-supplied 'Structure's.
 reverseAD' :: forall a b.
@@ -676,8 +684,8 @@ checkDatacon name = do
               Just vars -> return vars
               Nothing -> fail "Normal constructor has GADT properties?"
   let appliedType = foldl AppT (ConT tycon) (map VarT tyvars)
-  -- The fact that 'deriveStructure'' returns successfully implies that the type is fine
-  _ <- deriveStructure' (Map.fromList (zip tyvars (repeat (STag ())))) appliedType
+  -- The fact that 'deriveStructure' returns successfully implies that the type is fine
+  _ <- deriveStructure (Map.fromList (zip tyvars (repeat (STag ())))) appliedType
   return fieldtys
 
 -- | Given the type of a data constructor, return:
