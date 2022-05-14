@@ -1,4 +1,4 @@
-cabal-version: 1.12
+cabal-version: 2.0
 name:          dualrev
 version:       0.1.0.0
 description:   Implementation of dual-numbers reverse AD for Haskell
@@ -79,7 +79,7 @@ benchmark bench
       base >=4.7 && <4.17
     , dualrev
     , test-framework
-    , ad
+    , ad ^>= 4.5
     , criterion
     , deepseq
     , QuickCheck
