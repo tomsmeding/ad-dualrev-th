@@ -1,5 +1,6 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveLift #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE LinearTypes #-}
@@ -20,6 +21,13 @@ module Language.Haskell.ReverseAD.TH (
   Structure,
   structureFromTypeable,
   structureFromType,
+  -- * Misc
+  SimpleType(..),
+  MonoType(..),
+  Structure'(..),
+  deriveStructureGroup,
+  summariseType,
+  stReplaceVarsF,
 ) where
 
 import Control.Applicative (asum)
@@ -29,7 +37,7 @@ import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
 import Data.Foldable (toList)
 import Data.Function ((&))
-import Data.List (tails, mapAccumL, zip4, unzip5)
+import Data.List (tails, mapAccumL, zip4, unzip5, intercalate)
 import Data.Int
 import Data.Proxy
 import Data.Map.Strict (Map)
@@ -122,7 +130,7 @@ data Structure' tag
   | -- | Instantiation of a data type, with type arguments inlined.
     SData [(Name, [Structure' tag])]
   | STag !tag
-  deriving (Show)
+  deriving (Show, Eq, Lift)
 
 -- | The structure of a type, as used by the AD transformation. Use
 -- 'structureFromTypeable' or 'structureFromType' to construct a 'Structure'.
@@ -149,9 +157,16 @@ structureFromTypeable = structureFromType . typeRepToType . typeRep
 
 data SimpleType = VarST Name
                 | ConST Name [SimpleType]
-  deriving (Show, Eq)
+  deriving (Show, Eq, Lift)
 
-summariseType :: Type -> Either String SimpleType
+data MonoType = ConMT Name [MonoType]
+  deriving (Show, Eq, Ord, Lift)
+
+stReplaceVarsF :: Applicative f => (Name -> f MonoType) -> SimpleType -> f MonoType
+stReplaceVarsF f (VarST n) = f n
+stReplaceVarsF f (ConST n ts) = ConMT n <$> traverse (stReplaceVarsF f) ts
+
+summariseType :: MonadFail m => Type -> m SimpleType
 summariseType = \case
   ConT n -> return $ ConST n []
   VarT n -> return $ VarST n
@@ -159,15 +174,15 @@ summariseType = \case
   TupleT k -> return $ ConST (tupleTypeName k) []
   ListT -> return $ ConST ''[] []
   t@AppT{} -> collectApps t []
-    where collectApps :: Type -> [SimpleType] -> Either String SimpleType
-          collectApps (AppT t1 t2) args =
-            summariseType t2 >>= \t2' -> collectApps t1 (t2' : args)
-          collectApps t1 args =
-            summariseType t1 >>= \t1' -> smartAppsST t1' args
-  t -> Left $ "Unsupported type: " ++ pprint t
+  t -> fail $ "Unsupported type: " ++ pprint t
   where
-    smartAppsST :: SimpleType -> [SimpleType] -> Either String SimpleType
-    smartAppsST (VarST n) _ = Left $ "Higher-rank type variable not supported in reverse AD: " ++ show n
+    collectApps :: MonadFail m => Type -> [SimpleType] -> m SimpleType
+    collectApps (AppT t1 t2) args =
+      summariseType t2 >>= \t2' -> collectApps t1 (t2' : args)
+    collectApps t1 args = summariseType t1 >>= \t1' -> smartAppsST t1' args
+
+    smartAppsST :: MonadFail m => SimpleType -> [SimpleType] -> m SimpleType
+    smartAppsST (VarST n) _ = fail $ "Higher-rank type variable not supported in reverse AD: " ++ show n
     smartAppsST (ConST n as) bs = return $ ConST n (as ++ bs)
 
 -- | This does not yet check that scalars do not appear in data types!
@@ -183,67 +198,106 @@ summariseType = \case
 -- arguments). If a tag is a data type instantiation, it refers to one of the
 -- structures from the state 'Map'.
 deriveStructureGroup
-  :: Map Name (Structure' (Either (Name, [SimpleType]) tag))
-       -- ^ Type /variables/ that are in scope
-  -> Map Name [SimpleType]  -- ^ Instantiations of /data types/ in the current stack
-                            --     (for polymorphic recursion detection)
-  -> SimpleType  -- ^ Type to inspect
-  -> StateT (Map Name [([SimpleType], Structure' (Either (Name, [SimpleType]) tag))])
-            Q (Structure' (Either (Name, [SimpleType]) tag))
-deriveStructureGroup env stack = \case
-  VarST n ->
-    case Map.lookup n env of
-      Just struc -> return struc
-      Nothing -> fail $ "Type variable out of scope: " ++ show n
-
-  ConST n []
+  :: (Eq tag, Show tag)
+  => Map Name [MonoType]  -- ^ Instantiations of /data types/ in the current stack
+                          --     (for polymorphic recursion detection)
+  -> MonoType  -- ^ Type to inspect
+  -> Q (Structure' (Either (Name, [MonoType]) tag)
+       ,Map Name (Map [MonoType] (Structure' (Either (Name, [MonoType]) tag))))
+deriveStructureGroup stack = \case
+  ConMT n []
     | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
-               ,''Word, ''Word8, ''Word16, ''Word32, ''Word64]
-    -> return SDiscrete
-    | n == ''Double -> return SScalar
+               ,''Word, ''Word8, ''Word16, ''Word32, ''Word64
+               ,''Char]
+    -> return (SDiscrete, mempty)
+    | n == ''Double -> return (SScalar, mempty)
     | n == ''Float -> fail "Only Double is an active type for now (Float isn't)"
 
-  ConST tyname argtys
+  ConMT tyname argtys
     | Just prevargtys <- Map.lookup tyname stack ->
         if argtys == prevargtys
-          then return (STag (Left (tyname, argtys)))  -- recursion detected!
+          then -- Recursion detected!
+               -- This reference comes from the stack, and we made sure to put the type
+               -- instantiation in Map at the place where we put the instantiation in
+               -- the Map. Hence the 'mempty' is okay here.
+               return (STag (Left (tyname, argtys)), mempty)
           else fail $ "Polymorphic recursion (data type that contains itself \
                       \with different type argument instantiations) is not \
-                      \supported in reverse AD"
+                      \supported in reverse AD.\n\
+                      \Type constructor: " ++ show tyname ++ "\n\
+                      \Previously seen: " ++ intercalate " " (map show prevargtys) ++ "\n\
+                      \Current:         " ++ intercalate " " (map show argtys)
 
     | otherwise -> do
-        -- Compute the structures for the argument types; we do not yet grow
-        -- the stack, as these are not data type fields.
-        argstrucs <- mapM (deriveStructureGroup env stack) argtys
+        -- -- Compute the structures for the argument types; we do not yet grow
+        -- -- the stack, as these are not data type fields.
+        -- (argstrucs, argsmaps) <- unzip <$> mapM (deriveStructureGroup stack) argtys
+        -- argsmap <- mergeTypeMaps argsmaps
 
-        -- Get information about the data type
-        typedecl <- lift (reify tyname) >>= \case
-          TyConI decl -> return decl
-          info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
-        (tyvars, constrs) <- case typedecl of
-          NewtypeD [] _ tyvars _ constr  _ -> return (map tvbName tyvars, [constr])
-          DataD    [] _ tyvars _ constrs _ -> return (map tvbName tyvars, constrs)
-          _ -> fail $ "Type not supported: " ++ show tyname ++ " (not simple newtype or data)"
-        when (length tyvars /= length argtys) $
-          fail $ "Type not fully applied: " ++ show tyname
-
-        -- Analyse a constructor, and return (constructor name, [field structures])
-        let goConstr constr = do
+        let -- Given
+            -- - structures of the type arguments
+            -- - type variables of the data type declaration
+            -- - the constructor
+            -- analyse the constructor and return (constructor name, [field structures])
+            analyseConstructor tyvars constr = do
               -- Get constructor name and field types
               (conname, fieldtys) <- case constr of
                 NormalC conname fieldtys -> return (conname, map (\(  _,ty) -> ty) fieldtys)
                 RecC    conname fieldtys -> return (conname, map (\(_,_,ty) -> ty) fieldtys)
+                InfixC (_, ty1) conname (_, ty2) -> return (conname, [ty1, ty2])
                 _ -> fail $ "Unsupported constructor format on data: " ++ show constr
-              fieldtys' <- mapM (either fail return . summariseType) fieldtys
-              -- - In the field type, the environment contains bindings for the type
-              --   variables of the data type the constructor is a member of. In
-              --   particular, we forget any other environment bindings we had before.
-              -- - We add the current data type to the stack.
-              let env' = Map.fromList (zip tyvars argstrucs)
-                  stack' = Map.insert tyname argtys stack
-              (conname,) <$> mapM (deriveStructureGroup env' stack') fieldtys'
+              fieldtys' <- mapM summariseType fieldtys
+              fieldtys'' <- mapM (stReplaceVarsF
+                                    (\n -> case lookup n (zip tyvars argtys) of
+                                             Just mt -> return mt
+                                             Nothing -> fail $ "Type variable out of scope: " ++ show n))
+                                 fieldtys'
+              let stack' = Map.insert tyname argtys stack
+              (fieldstrucs, fieldmaps) <-
+                unzip <$> mapM (deriveStructureGroup stack') fieldtys''
+              fieldmap <- mergeTypeMaps fieldmaps
+              return ((conname, fieldstrucs), fieldmap)
 
-        SData <$> mapM goConstr constrs
+        -- Get information about the data type
+        typedecl <- reify tyname >>= \case
+          TyConI decl -> return decl
+          info -> fail $ "Name " ++ show tyname ++ " is not a lifted type name: " ++ show info
+        case typedecl of
+          NewtypeD [] _ tyvars _ constr  _
+            | length tyvars == length argtys -> do
+                (resstruc, resmaps) <-
+                  unzip <$> mapM (analyseConstructor (map tvbName tyvars)) [constr]
+                resmap <- mergeTypeMaps resmaps
+                let resmap' = Map.singleton tyname (Map.singleton argtys (SData resstruc)) <> resmap
+                return (SData resstruc, resmap')
+            | otherwise -> fail $ "Type not fully applied: " ++ show tyname
+          DataD    [] _ tyvars _ constrs _
+            | length tyvars == length argtys -> do
+                (resstruc, resmaps) <-
+                  unzip <$> mapM (analyseConstructor (map tvbName tyvars)) constrs
+                resmap <- mergeTypeMaps resmaps
+                let resmap' = Map.singleton tyname (Map.singleton argtys (SData resstruc)) <> resmap
+                return (SData resstruc, resmap')
+            | otherwise -> fail $ "Type not fully applied: " ++ show tyname
+          TySynD _ tyvars rhs -> do
+            srhs <- summariseType rhs
+            mrhs <- stReplaceVarsF (\n -> case lookup n (zip (map tvbName tyvars) argtys) of
+                                            Just mt -> return mt
+                                            Nothing -> fail $ "Type variable out of scope: " ++ show n)
+                                   srhs
+            deriveStructureGroup stack mrhs
+          _ -> fail $ "Type not supported: " ++ show tyname ++ " (not simple newtype or data)"
+  where
+    mergeTypeMaps :: (Eq a, Ord k1, Ord k2, Show k1, Show k2, Show a, MonadFail m)
+                  => [Map k1 (Map k2 a)] -> m (Map k1 (Map k2 a))
+    mergeTypeMaps maps =
+      let f n as s1 s2
+            | s1 == s2 = pure s1
+            | otherwise = fail $ "Type " ++ show n ++ " applied to " ++ show as ++ " \
+                                 \yielded two different structures:\n\
+                                 \- " ++ show s1 ++ "\n\
+                                 \- " ++ show s2
+      in foldM (mapUnionWithKeyF (mapUnionWithKeyF . f)) mempty maps
 
 deriveStructure :: Map Name (Structure' tag) -> Type -> Q (Structure' tag)
 deriveStructure = \env -> go env True
@@ -1092,3 +1146,12 @@ zipWithM3 f a b c = traverse (\(x,y,z) -> f x y z) (zip3 a b c)
 tvbName :: TyVarBndr () -> Name
 tvbName (PlainTV n _) = n
 tvbName (KindedTV n _ _) = n
+
+mapUnionWithKeyF :: (Ord k, Applicative f) => (k -> a -> a -> f a) -> Map k a -> Map k a -> f (Map k a)
+mapUnionWithKeyF f m1 m2 = Map.fromAscList <$> merge (Map.toAscList m1) (Map.toAscList m2)
+  where merge [] l = pure l
+        merge l [] = pure l
+        merge ((k1,x1):l1) ((k2,x2):l2) = case compare k1 k2 of
+          LT -> ((k1,x1) :) <$> merge l1 ((k2,x2):l2)
+          EQ -> (:) <$> ((k1,) <$> f k1 x1 x2) <*> merge l1 l2
+          GT -> ((k2,x2) :) <$> merge ((k1,x2):l1) l2
