@@ -1,6 +1,7 @@
 -- TODO:
 -- - Recursive data types
 -- - Put numeric literals in the type classes for numeric operator overloading
+-- - Polymorphically recursive data types
 
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
