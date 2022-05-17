@@ -41,6 +41,7 @@ import Control.Monad.State.Strict
 import qualified Data.Array.Mutable.Linear as A
 import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
+import Data.Char (isAlphaNum)
 import Data.Foldable (toList)
 import Data.Function ((&))
 import Data.List (tails, mapAccumL, zip4, unzip5)
@@ -140,12 +141,13 @@ data Structure' tag
 
 -- | The structure of a type, as used by the AD transformation. Use
 -- 'structureFromTypeable' or 'structureFromType' to construct a 'Structure'.
-type Structure = Structure' Void
+data Structure = Structure MonoType DataTypes
+  deriving (Show)
 
 -- | Analyse the 'Type' and give a 'Structure' that describes the type for use
 -- in 'reverseAD''.
 structureFromType :: Q Type -> Q Structure
-structureFromType ty = ty >>= deriveStructure mempty
+structureFromType ty = ty >>= fmap (uncurry Structure) . exploreRecursiveType
 
 -- | A 'TypeRep' (which we can obtain from the 'Typeable' constraint) can be
 -- used to construct a 'Type' for the type @a@, on which we can then call
@@ -281,10 +283,10 @@ exploreType stack tysynstack = \case
 
     multipleErr tyname = error $ "Multiple explorations of the same data type? " ++ show tyname
 
-exploreResultType :: Type -> Q (MonoType, DataTypes)
-exploreResultType tau = do
+exploreRecursiveType :: Type -> Q (MonoType, DataTypes)
+exploreRecursiveType tau = do
   sty <- summariseType tau
-  mty <- toMonoType (\n -> fail $ "Reverse AD computation result type is polymorphic \
+  mty <- toMonoType (\n -> fail $ "Reverse AD input or output type is polymorphic \
                                   \(contains type variable " ++ show n ++ ")")
                     sty
   dtypes <- exploreType mempty mempty mty
@@ -1088,7 +1090,56 @@ numberList f l i0 =
 -- nextid :: Name Int
 -- result :: (Dt[a], Vector Double -> a, Int)
 numberInput :: Quote m => Structure -> Exp -> Name -> m Exp
-numberInput topstruc input nextid = case topstruc of
+numberInput (Structure monotype dtypemap) input nextid = do
+  let dtypes = Map.keys dtypemap
+  helpernames <- Map.fromAscList <$>
+                   sequence [((n, ts),) <$> newName (genDataNameTag n ts)
+                            | (n, ts) <- dtypes]
+  helperfuns <- sequence [numberDataType helpernames constrs
+                         | ((n, ts), constrs) <- Map.assocs dtypemap]
+  _
+
+-- Given constructors of type T, returns expression of type
+-- 'T -> Int -> (Dt[T], Vector Double -> T, Int)'
+numberDataType :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
+numberDataType helpernames constrs = do
+  inputvar <- newName "input"
+  idvar0 <- newName "i0"
+  allinpvars <- zipWithM (\_ i -> newName ("inp" ++ show i)) constrs [1::Int ..]
+  allpostvars <- zipWithM (\_ i -> newName ("inp'" ++ show i)) constrs [1::Int ..]
+  allrebuildvars <- zipWithM (\_ i -> newName ("reb" ++ show i)) constrs [1::Int ..]
+  allidvars <- zipWithM (\_ i -> newName ("i" ++ show i)) constrs [1::Int ..]
+
+  -- These have the inpvars and idvar0 in scope.
+  bodies <- sequence
+    [do let inpvars = take (length fieldtys) allinpvars
+            postvars = take (length fieldtys) allpostvars
+            rebuildvars = take (length fieldtys) allrebuildvars
+            idvars = take (length fieldtys) allidvars
+        let outidvar = case idvars of [] -> idvar0 ; _ -> last idvars
+        exps <- zipWithM3 (numberType helpernames) fieldtys (map VarE inpvars) (idvar0 : idvars)
+        arrname <- newName "arr"
+        return (LetE [ValD (TupP [VarP postvar, VarP rebuildvar, VarP idvar]) (NormalB expr) []
+                     | (postvar, rebuildvar, idvar, expr) <- zip4 postvars rebuildvars idvars exps]
+                     (triple (foldl AppE (ConE conname) (map VarE postvars))
+                             (LamE [VarP arrname] $
+                                foldl AppE (ConE conname)
+                                      [VarE f `AppE` VarE arrname | f <- rebuildvars])
+                             (VarE outidvar)))
+    | (conname, fieldtys) <- constrs]
+
+  return $ LamE [VarP inputvar, VarP idvar0] $ CaseE (VarE inputvar)
+    [Match (ConP conname [] (map VarP (take (length fieldtys) inpvars)))
+           (NormalB body)
+           []
+    | ((conname, fieldtys), body) <- zip constrs bodies
+    , let inpvars = take (length fieldtys) allinpvars]
+
+-- input :: a
+-- nextid :: Name Int
+-- result :: (Dt[a], Vector Double -> a, Int)
+numberInput' :: Quote m => Structure -> Exp -> Name -> m Exp
+numberInput' topstruc input nextid = case topstruc of
   SDiscrete -> do
     var <- newName "inpx"
     return $ LetE [ValD (VarP var) (NormalB input) []] $
@@ -1109,7 +1160,7 @@ numberInput topstruc input nextid = case topstruc of
     rebuildnames <- mapM (const (newName "reb")) strucs
     idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) strucs [1::Int ..]
     let outid = case idnames of [] -> nextid ; _ -> last idnames
-    exps <- zipWithM3 numberInput strucs (map VarE names) (nextid : idnames)
+    exps <- zipWithM3 numberInput' strucs (map VarE names) (nextid : idnames)
     arrname <- newName "arr"
     return (LetE (ValD (TupP (map VarP names)) (NormalB input) []
                  : [ValD (TupP [VarP postname, VarP rebuildname, VarP idname]) (NormalB expr) []
@@ -1122,7 +1173,7 @@ numberInput topstruc input nextid = case topstruc of
   SList eltstruc -> do
     idxarg <- newName "i"
     eltarg <- newName "x"
-    body <- numberInput eltstruc (VarE eltarg) idxarg
+    body <- numberInput' eltstruc (VarE eltarg) idxarg
     return $ foldl AppE (VarE 'numberList)
       [LamE [VarP idxarg, VarP eltarg] body
       ,input
@@ -1130,7 +1181,7 @@ numberInput topstruc input nextid = case topstruc of
 
   SNewtype conname struc -> do
     input' <- unNewtype conname input  -- strip off the newtype wrapper first
-    expr <- numberInput struc input' nextid
+    expr <- numberInput' struc input' nextid
     dxvar <- newName "dx"
     fvar <- newName "f"
     i'var <- newName "i'"
@@ -1154,7 +1205,7 @@ numberInput topstruc input nextid = case topstruc of
               fnames   = take (length fieldstrucs) allfnames
               idnames  = take (length fieldstrucs) allidnames
               outid = case fieldstrucs of [] -> nextid ; _ -> last idnames
-          exprs <- zipWithM3 numberInput fieldstrucs (map VarE innames) (nextid : idnames)
+          exprs <- zipWithM3 numberInput' fieldstrucs (map VarE innames) (nextid : idnames)
           return $ Match (ConP conname [] (map VarP innames))
                          (NormalB
                             (LetE [ValD (TupP [VarP outname, VarP fname, VarP outidname])
@@ -1170,6 +1221,18 @@ numberInput topstruc input nextid = case topstruc of
                          []
       | (conname, fieldstrucs) <- datacons]
     return $ CaseE input matches
+
+-- | Not necessarily unique.
+genDataNameTag :: Name -> [MonoType] -> String
+genDataNameTag tyname argtys = goN tyname ++ concatMap (('_':) . goT) argtys
+  where
+    goN :: Name -> String
+    goN n = filter isAlphaNum (show n)
+
+    goT :: MonoType -> String
+    goT DiscreteST = "i"
+    goT ScalarST = "s"
+    goT (ConST n ts) = goN n ++ concatMap goT ts
 
 fst3 :: (a, b, c) -> a
 fst3 (a, _, _) = a
