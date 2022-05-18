@@ -19,7 +19,6 @@ library
   exposed-modules:
     Language.Haskell.ReverseAD.TH
     Language.Haskell.ReverseAD.TH.Orphans
-    Kaas
   hs-source-dirs:
     src
   ghc-options: -Wall

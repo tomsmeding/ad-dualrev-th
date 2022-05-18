@@ -44,7 +44,7 @@ import Data.Bifunctor (second)
 import Data.Char (isAlphaNum)
 import Data.Foldable (toList)
 import Data.Function ((&))
-import Data.List (tails, mapAccumL, zip4, unzip5)
+import Data.List (tails, zip6, zip4)
 import Data.Int
 import Data.Proxy
 import Data.Map.Strict (Map)
@@ -53,7 +53,6 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Typeable
 import qualified Data.Vector as V
-import Data.Void
 import Data.Word
 import GHC.Types (Multiplicity(One))
 import Language.Haskell.TH
@@ -226,19 +225,23 @@ type DataTypes = Map (Name, [MonoType]) [(Name, [MonoType])]
 -- - The monotype to explore
 -- returns the transitive closure of datatypes included in the input monotype.
 exploreType :: Map Name [MonoType] -> Set Name -> MonoType -> Q DataTypes
+exploreType stack tysynstack
+  | Map.size stack >= 20 = \_ -> fail "Very deep data type hierarchy (depth 20); polymorphic recursion?"
+  | Set.size tysynstack >= 20 = \_ -> fail "Very deep type synonym hierarchy (depth 20); self-recursive type synonym?"
 exploreType stack tysynstack = \case
   DiscreteST -> return mempty
   ScalarST -> return mempty
   ConST tyname argtys
-    | Just prevargtys <- Map.lookup tyname stack ->
-        if argtys == prevargtys
-          then return mempty  -- regular recursion, don't need to expand again
-          else fail $ "Polymorphic recursion (data type that contains itself \
-                      \with different type argument instantiations) is not \
-                      \supported in reverse AD.\n\
-                      \Type constructor: " ++ show tyname ++ "\n\
-                      \Previously seen: " ++ show prevargtys ++ "\n\
-                      \Current:         " ++ show argtys
+    | Just prevargtys <- Map.lookup tyname stack
+    , argtys == prevargtys -> return mempty
+        -- if argtys == prevargtys
+        --   then return mempty  -- regular recursion, don't need to expand again
+        --   else fail $ "Polymorphic recursion (data type that contains itself \
+        --               \with different type argument instantiations) is not \
+        --               \supported in reverse AD.\n\
+        --               \Type constructor: " ++ show tyname ++ "\n\
+        --               \Previously seen: " ++ show prevargtys ++ "\n\
+        --               \Current:         " ++ show argtys
     | otherwise -> do
         typedecl <- reify tyname >>= \case
           TyConI decl -> return decl
@@ -255,19 +258,19 @@ exploreType stack tysynstack = \case
                   fieldtys'' <- mapM (monomorphiseField tyname tyvars argtys) fieldtys'
                   let stack' = Map.insert tyname argtys stack
                   typesets <- mapM (exploreType stack' mempty) fieldtys''
-                  return ((conname, fieldtys''), Map.unionsWith (multipleErr tyname) typesets)
+                  return ((conname, fieldtys''), mapUnionsWithKey mergeIfEqual typesets)
               | otherwise = fail $ "Type not fully applied: " ++ show tyname
         case typedecl of
           NewtypeD [] _ tyvars _ constr  _ -> do
             (condescr, typeset) <- analyseConstructor (map tvbName tyvars) constr
-            return (Map.insertWith (multipleErr tyname) (tyname, argtys) [condescr] typeset)
+            return (Map.insertWithKey mergeIfEqual (tyname, argtys) [condescr] typeset)
           DataD    [] _ tyvars _ constrs _ -> do
             (condescrs, typesets) <- unzip <$> mapM (analyseConstructor (map tvbName tyvars)) constrs
-            let typeset = Map.unionsWith (multipleErr tyname) typesets
-            return (Map.insertWith (multipleErr tyname) (tyname, argtys) condescrs typeset)
+            let typeset = mapUnionsWithKey mergeIfEqual typesets
+            return (Map.insertWithKey mergeIfEqual (tyname, argtys) condescrs typeset)
           TySynD _ tyvars rhs -> do
-            when (tyname `Set.member` tysynstack) $
-              fail $ "Infinite type synonym recursion in " ++ show tyname
+            -- when (tyname `Set.member` tysynstack) $
+            --   fail $ "Infinite type synonym recursion in " ++ show tyname
             srhs <- summariseType rhs
             mrhs <- monomorphiseField tyname (map tvbName tyvars) argtys srhs
             exploreType stack (Set.insert tyname tysynstack) mrhs
@@ -281,7 +284,12 @@ exploreType stack tysynstack = \case
         Nothing -> fail $ "Type variable out of scope in definition of \
                           \data type " ++ show tyname ++ ": " ++ show n
 
-    multipleErr tyname = error $ "Multiple explorations of the same data type? " ++ show tyname
+    mergeIfEqual key v1 v2
+      | v1 == v2 = v1
+      | otherwise = error $ "Conflicting explorations of the same data type!\n\
+                            \Key: " ++ show key ++ "\n\
+                            \Val 1: " ++ show v1 ++ "\n\
+                            \Val 2: " ++ show v2
 
 exploreRecursiveType :: Type -> Q (MonoType, DataTypes)
 exploreRecursiveType tau = do
@@ -484,12 +492,6 @@ deriveStructure = \env -> go env True
     collectAppsRev (ParensT t) = collectAppsRev t
     collectAppsRev t = (t, [])
 
--- | Pattern match on the given data constructor and extract the single value.
-unNewtype :: Quote m => Name -> Exp -> m Exp
-unNewtype conname expr = do
-  name <- newName "x"
-  return $ CaseE expr [Match (ConP conname [] [VarP name]) (NormalB (VarE name)) []]
-
 
 -- | Use as follows:
 --
@@ -526,7 +528,7 @@ transform :: Structure -> Structure -> Exp -> Q Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
   argvar <- newName "arg"
   onevar <- newName "one"
-  inp <- numberInput inpStruc (VarE argvar) onevar
+  inp <- interleave inpStruc (VarE argvar) onevar
   rebuildvar <- newName "rebuild"
   idvar <- newName "i0"
   patbound <- boundVars pat
@@ -567,102 +569,88 @@ transform inpStruc outStruc (LamE (pat : pats) body) =
 transform _ _ expr =
   fail $ "Top-level expression in reverseAD must be lambda, but is: " ++ show expr
 
-composeL :: [a %1-> a] -> a %1-> a
-composeL [] = PL.id
-composeL [f] = f
-composeL (f:fs) = f PL.. composeL fs
-
-deinterleaveList :: (da -> (a, a -> BuildState %1-> BuildState))
-                 -> [da] -> ([a], [a] -> BuildState %1-> BuildState)
-deinterleaveList f l =
-  let (l', funs) = unzip (map f l)
-  in (l', \adjs -> composeL (zipWith ($) funs adjs))
-
--- outexp :: Dt[a]                            -- expression returning the output of the transformed program
--- result :: (a                               -- primal result
---           ,a -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+-- outexp :: Dt[T]                            -- interleaved program output
+-- result :: (T                               -- primal result
+--           ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
 deinterleave :: Quote m => Structure -> Exp -> m Exp
-deinterleave topstruc outexp = case topstruc of
-  SDiscrete -> return (pair outexp (LamE [WildP] (VarE 'PL.id)))
+deinterleave (Structure monotype dtypemap) outexp = do
+  let dtypes = Map.keys dtypemap
+  helpernames <- Map.fromAscList <$>
+                   sequence [((n, ts),) <$> newName (genDataNameTag "deinter" n ts)
+                            | (n, ts) <- dtypes]
+  helperfuns <- sequence [(helpernames Map.! (n, ts),) <$> deinterleaveData helpernames constrs
+                         | ((n, ts), constrs) <- Map.assocs dtypemap]
+  mainfun <- deinterleaveType helpernames monotype
+  return $ LetE [ValD (VarP name) (NormalB fun) []
+                | (name, fun) <- helperfuns] $
+             mainfun `AppE` outexp
 
-  SScalar -> do
-    -- outexp :: (Double, (Int, Contrib))
-    -- adjexp :: Double
+-- Dt[T]                                 -- interleaved program output
+--   -> (T                               -- primal result
+--      ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+-- The Map contains for each (type name T', type arguments As') combination
+-- that occurs (transitively) in T, the name of a function with type
+-- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -o BuildState)'.
+deinterleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
+deinterleaveData helpernames constrs = do
+  dualvar <- newName "out"
+  let maxn = maximum (map (length . snd) constrs)
+  alldvars <- mapM (\i -> newName ("d" ++ show i)) [1..maxn]
+  allpvars <- mapM (\i -> newName ("p" ++ show i)) [1..maxn]
+  allfvars <- mapM (\i -> newName ("f" ++ show i)) [1..maxn]
+  allavars <- mapM (\i -> newName ("a" ++ show i)) [1..maxn]
+
+  let composeLfuns [] = VarE 'PL.id
+      composeLfuns l = foldr1 (\a b -> InfixE (Just a) (VarE '(PL..)) (Just b)) l
+
+  bodies <- sequence
+    [do let dvars = take (length fieldtys) alldvars
+            pvars = take (length fieldtys) allpvars
+            fvars = take (length fieldtys) allfvars
+            avars = take (length fieldtys) allavars
+        exps <- mapM (deinterleaveType helpernames) fieldtys
+        return $ LetE [ValD (TupP [VarP pvar, VarP fvar]) (NormalB (expr `AppE` VarE dvar)) []
+                      | (dvar, pvar, fvar, expr) <- zip4 dvars pvars fvars exps] $
+                   pair (foldl AppE (ConE conname) (map VarE pvars))
+                        -- irrefutable (partial) pattern: that's what you get with sum types in
+                        -- a non-dependent context.
+                        (LamE [ConP conname [] (map VarP avars)] $
+                           SigE (composeLfuns [VarE fvar `AppE` VarE avar
+                                              | (fvar, avar) <- zip fvars avars])
+                                (MulArrowT `AppT` ConT 'One `AppT` ConT ''BuildState `AppT` ConT ''BuildState))
+    | (conname, fieldtys) <- constrs]
+
+  return $ LamE [VarP dualvar] $ CaseE (VarE dualvar)
+    [Match (ConP conname [] (map VarP dvars))
+           (NormalB body)
+           []
+    | ((conname, fieldtys), body) <- zip constrs bodies
+    , let dvars = take (length fieldtys) alldvars]
+
+-- Dt[T]                                 -- interleaved program output
+--   -> (T                               -- primal result
+--      ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+-- The Map contains for each (type name T', type arguments As') combination
+-- that occurs (transitively) in T, the name of a function with type
+-- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -o BuildState)'.
+deinterleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
+deinterleaveType helpernames = \case
+  DiscreteST -> do
+    dname <- newName "d"
+    return $ LamE [VarP dname] $ pair (VarE dname) (LamE [WildP] (VarE 'PL.id))
+
+  ScalarST -> do
     primalname <- newName "prim"
     idname <- newName "id"
     cbname <- newName "cb"
-    return $
-      LetE [ValD (TupP [VarP primalname, TupP [VarP idname, VarP cbname]]) (NormalB outexp) []] $
-        pair (VarE primalname)
-             (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
+    return $ LamE [TupP [VarP primalname, TupP [VarP idname, VarP cbname]]] $
+      pair (VarE primalname)
+           (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
 
-  STuple strucs -> do
-    (exprs, outnames, primnames, bpnames, adjnames) <- fmap unzip5 . forM (zip strucs [1::Int ..]) $ \(struc', index) -> do
-      outn <- newName ("out" ++ show index)
-      primn <- newName ("prim" ++ show index)
-      bpn <- newName ("bp" ++ show index)
-      adjn <- newName ("adj" ++ show index)
-      expr <- deinterleave struc' (VarE outn)
-      return (expr, outn, primn, bpn, adjn)
-    case strucs of
-      [] -> return (pair (TupE []) (LamE [WildP] (VarE 'PL.id)))
-      _ -> return $
-        LetE (ValD (TupP (map VarP outnames)) (NormalB outexp) []
-             :[ValD (TupP [VarP primn, VarP bpn]) (NormalB expr) []
-              | (expr, primn, bpn) <- zip3 exprs primnames bpnames]) $
-          pair (TupE (map (Just . VarE) primnames))
-               (LamE [TupP (map VarP adjnames)] $
-                  foldr1 (\e1 e2 -> VarE '(PL..) `AppE` e1 `AppE` e2)
-                         (zipWith AppE (map VarE bpnames) (map VarE adjnames)))
-
-  SList struc -> do
-    argvar <- newName "x"
-    body <- deinterleave struc (VarE argvar)
-    return $ VarE 'deinterleaveList
-              `AppE` LamE [VarP argvar] body
-              `AppE` outexp
-
-  SNewtype conname struc -> do
-    outexp' <- unNewtype conname outexp  -- strip off the newtype wrapper first
-    expr <- deinterleave struc outexp'
-    primalname <- newName "primal"
-    dualname <- newName "dualf"
-    tempvar <- newName "temp"
-    unnewtypetemp <- LamE [VarP tempvar] <$> unNewtype conname (VarE tempvar)
-    return $ CaseE expr
-      [Match (TupP [VarP primalname, VarP dualname])
-             (NormalB (pair (ConE conname `AppE` VarE primalname)
-                            (InfixE (Just (VarE dualname)) (VarE '(.)) (Just unnewtypetemp))))
-             []]
-
-  SData [] ->
-    return $ CaseE outexp []
-
-  SData datacons -> do
-    let maxlen = maximum [length fieldstrucs | (_, fieldstrucs) <- datacons]
-    allvars      <- mapM (\i -> newName ("x"     ++ show i)) [1 .. maxlen]
-    allresvars   <- mapM (\i -> newName ("res"   ++ show i)) [1 .. maxlen]
-    allbuildvars <- mapM (\i -> newName ("build" ++ show i)) [1 .. maxlen]
-    alladjvars   <- mapM (\i -> newName ("adj"   ++ show i)) [1 .. maxlen]
-    matches <- sequence
-      [do let vars      = take (length fieldstrucs) allvars
-              resvars   = take (length fieldstrucs) allresvars
-              buildvars = take (length fieldstrucs) allbuildvars
-              adjvars   = take (length fieldstrucs) alladjvars
-          exprs <- zipWithM deinterleave fieldstrucs (map VarE vars)
-          return $ Match
-            (ConP conname [] (map VarP vars))
-            (NormalB $
-               LetE [ValD (TupP [VarP resvar, VarP buildvar]) (NormalB expr) []
-                    | (resvar, buildvar, expr) <- zip3 resvars buildvars exprs] $
-                 pair (foldl AppE (ConE conname) (map VarE resvars))
-                      (LamE [ConP conname [] (map VarP adjvars)] $
-                         VarE 'composeL
-                           `AppE` ListE [VarE buildvar `AppE` VarE adjvar
-                                        | (buildvar, adjvar) <- zip buildvars adjvars]))
-            []
-      | (conname, fieldstrucs) <- datacons]
-    return $ CaseE outexp matches
+  ConST tyname argtys ->
+    return $ VarE $ case Map.lookup (tyname, argtys) helpernames of
+                      Just name -> name
+                      Nothing -> error $ "Helper name not defined? " ++ show (tyname, argtys)
 
 -- Set of names bound in the program at this point
 type Env = Set Name
@@ -1080,154 +1068,100 @@ checkDecsNonRecursive decs = do
     then return (Just tups)
     else return Nothing
 
-numberList :: (Int -> a -> (da, V.Vector Double -> a, Int)) -> [a] -> Int -> ([da], V.Vector Double -> [a], Int)
-numberList f l i0 =
-  let (outi, pairslist) = mapAccumL (\i x -> let (dx, f', i') = f i x in (i', (dx, f'))) i0 l
-      (dlist, funs) = unzip pairslist
-  in (dlist, \arr -> map ($ arr) funs, outi)
-
 -- input :: a
 -- nextid :: Name Int
 -- result :: (Dt[a], Vector Double -> a, Int)
-numberInput :: Quote m => Structure -> Exp -> Name -> m Exp
-numberInput (Structure monotype dtypemap) input nextid = do
+interleave :: Quote m => Structure -> Exp -> Name -> m Exp
+interleave (Structure monotype dtypemap) input nextid = do
   let dtypes = Map.keys dtypemap
   helpernames <- Map.fromAscList <$>
-                   sequence [((n, ts),) <$> newName (genDataNameTag n ts)
+                   sequence [((n, ts),) <$> newName (genDataNameTag "inter" n ts)
                             | (n, ts) <- dtypes]
-  helperfuns <- sequence [numberDataType helpernames constrs
+  helperfuns <- sequence [(helpernames Map.! (n, ts),) <$> interleaveData helpernames constrs
                          | ((n, ts), constrs) <- Map.assocs dtypemap]
-  _
+  mainfun <- interleaveType helpernames monotype
+  return $ LetE [ValD (VarP name) (NormalB fun) []
+                | (name, fun) <- helperfuns] $
+             mainfun `AppE` input `AppE` VarE nextid
 
 -- Given constructors of type T, returns expression of type
--- 'T -> Int -> (Dt[T], Vector Double -> T, Int)'
-numberDataType :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
-numberDataType helpernames constrs = do
+-- 'T -> Int -> (Dt[T], Vector Double -> T, Int)'. The Map contains for each
+-- (type name T', type arguments As') combination that occurs (transitively) in
+-- T, the name of a function with type
+-- 'T' As' -> Int -> (Dt[T' As'], Vector Double -> T' As', Int)'.
+interleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
+interleaveData helpernames constrs = do
   inputvar <- newName "input"
   idvar0 <- newName "i0"
-  allinpvars <- zipWithM (\_ i -> newName ("inp" ++ show i)) constrs [1::Int ..]
-  allpostvars <- zipWithM (\_ i -> newName ("inp'" ++ show i)) constrs [1::Int ..]
-  allrebuildvars <- zipWithM (\_ i -> newName ("reb" ++ show i)) constrs [1::Int ..]
-  allidvars <- zipWithM (\_ i -> newName ("i" ++ show i)) constrs [1::Int ..]
-
+  let maxn = maximum (map (length . snd) constrs)
+  allinpvars     <- mapM (\i -> newName ("inp"  ++ show i)) [1..maxn]
+  allpostvars    <- mapM (\i -> newName ("inp'" ++ show i)) [1..maxn]
+  allrebuildvars <- mapM (\i -> newName ("reb"  ++ show i)) [1..maxn]
+  allidvars      <- mapM (\i -> newName ("i"    ++ show i)) [1..maxn]
   -- These have the inpvars and idvar0 in scope.
   bodies <- sequence
     [do let inpvars = take (length fieldtys) allinpvars
             postvars = take (length fieldtys) allpostvars
             rebuildvars = take (length fieldtys) allrebuildvars
             idvars = take (length fieldtys) allidvars
-        let outidvar = case idvars of [] -> idvar0 ; _ -> last idvars
-        exps <- zipWithM3 (numberType helpernames) fieldtys (map VarE inpvars) (idvar0 : idvars)
+        let finalidvar = case idvars of [] -> idvar0 ; _ -> last idvars
+        -- interleaveType helpernames (MonoType T) :: Exp (T -> Int -> (Dt[T], Vector Double -> T, Int))
+        exps <- mapM (interleaveType helpernames) fieldtys
         arrname <- newName "arr"
-        return (LetE [ValD (TupP [VarP postvar, VarP rebuildvar, VarP idvar]) (NormalB expr) []
-                     | (postvar, rebuildvar, idvar, expr) <- zip4 postvars rebuildvars idvars exps]
-                     (triple (foldl AppE (ConE conname) (map VarE postvars))
-                             (LamE [VarP arrname] $
-                                foldl AppE (ConE conname)
-                                      [VarE f `AppE` VarE arrname | f <- rebuildvars])
-                             (VarE outidvar)))
+        return $ LetE [ValD (TupP [VarP postvar, VarP rebuildvar, VarP outidvar])
+                            (NormalB (expr `AppE` VarE inpvar `AppE` VarE inidvar))
+                            []
+                      | (inpvar, postvar, rebuildvar, inidvar, outidvar, expr)
+                           <- zip6 inpvars postvars rebuildvars (idvar0 : idvars) idvars exps] $
+                   triple (foldl AppE (ConE conname) (map VarE postvars))
+                          (LamE [if null rebuildvars then WildP else VarP arrname] $
+                             foldl AppE (ConE conname)
+                                   [VarE f `AppE` VarE arrname | f <- rebuildvars])
+                          (VarE finalidvar)
     | (conname, fieldtys) <- constrs]
 
   return $ LamE [VarP inputvar, VarP idvar0] $ CaseE (VarE inputvar)
-    [Match (ConP conname [] (map VarP (take (length fieldtys) inpvars)))
+    [Match (ConP conname [] (map VarP inpvars))
            (NormalB body)
            []
     | ((conname, fieldtys), body) <- zip constrs bodies
     , let inpvars = take (length fieldtys) allinpvars]
 
--- input :: a
--- nextid :: Name Int
--- result :: (Dt[a], Vector Double -> a, Int)
-numberInput' :: Quote m => Structure -> Exp -> Name -> m Exp
-numberInput' topstruc input nextid = case topstruc of
-  SDiscrete -> do
-    var <- newName "inpx"
-    return $ LetE [ValD (VarP var) (NormalB input) []] $
-               triple (VarE var) (LamE [WildP] (VarE var)) (VarE nextid)
+-- Given a type T, returns expression of type
+-- 'T -> Int -> (Dt[T], Vector Double -> T, Int)'. The Map contains for each
+-- (type name T', type arguments As') combination that occurs in the type, the
+-- name of a function with type
+-- 'T' As' -> Int -> (Dt[T' As'], Vector Double -> T' As', Int)'.
+interleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
+interleaveType helpernames = \case
+  DiscreteST -> do
+    inpxvar <- newName "inpx"
+    ivar <- newName "i"
+    return $ LamE [VarP inpxvar, VarP ivar] $
+      triple (VarE inpxvar) (LamE [WildP] (VarE inpxvar)) (VarE ivar)
 
-  SScalar -> do
-    var <- newName "arr"
-    return $
-      triple (pair input
-                   (pair (VarE nextid)
+  ScalarST -> do
+    inpxvar <- newName "inpx"
+    ivar <- newName "i"
+    arrvar <- newName "arr"
+    return $ LamE [VarP inpxvar, VarP ivar] $
+      triple (pair (VarE inpxvar)
+                   (pair (VarE ivar)
                          (ConE 'Contrib `AppE` ListE [])))
-             (LamE [VarP var] (InfixE (Just (VarE var)) (VarE '(V.!)) (Just (VarE nextid))))
-             (AppE (VarE 'succ) (VarE nextid))
+             (LamE [VarP arrvar] (InfixE (Just (VarE arrvar)) (VarE '(V.!)) (Just (VarE ivar))))
+             (InfixE (Just (VarE ivar)) (VarE '(+)) (Just (LitE (IntegerL 1))))
 
-  STuple strucs -> do
-    names <- mapM (const (newName "inp")) strucs
-    postnames <- mapM (const (newName "inp'")) strucs
-    rebuildnames <- mapM (const (newName "reb")) strucs
-    idnames <- zipWithM (\_ i -> newName ("i" ++ show i)) strucs [1::Int ..]
-    let outid = case idnames of [] -> nextid ; _ -> last idnames
-    exps <- zipWithM3 numberInput' strucs (map VarE names) (nextid : idnames)
-    arrname <- newName "arr"
-    return (LetE (ValD (TupP (map VarP names)) (NormalB input) []
-                 : [ValD (TupP [VarP postname, VarP rebuildname, VarP idname]) (NormalB expr) []
-                   | (postname, rebuildname, idname, expr) <- zip4 postnames rebuildnames idnames exps])
-                 (triple (TupE (map (Just . VarE) postnames))
-                         (LamE [VarP arrname] $
-                            TupE (map (\f -> Just (VarE f `AppE` VarE arrname)) rebuildnames))
-                         (VarE outid)))
-
-  SList eltstruc -> do
-    idxarg <- newName "i"
-    eltarg <- newName "x"
-    body <- numberInput' eltstruc (VarE eltarg) idxarg
-    return $ foldl AppE (VarE 'numberList)
-      [LamE [VarP idxarg, VarP eltarg] body
-      ,input
-      ,VarE nextid]
-
-  SNewtype conname struc -> do
-    input' <- unNewtype conname input  -- strip off the newtype wrapper first
-    expr <- numberInput' struc input' nextid
-    dxvar <- newName "dx"
-    fvar <- newName "f"
-    i'var <- newName "i'"
-    return $ CaseE expr
-      [Match (TupP [VarP dxvar, VarP fvar, VarP i'var])
-             (NormalB (TupE [Just (ConE conname `AppE` VarE dxvar)
-                            ,Just (InfixE (Just (ConE conname)) (VarE '(.)) (Just (VarE fvar)))
-                            ,Just (VarE i'var)]))
-             []]
-
-  SData datacons -> do
-    let maxlen = maximum [length fieldstrucs | (_, fieldstrucs) <- datacons]
-    allinnames  <- mapM (\i -> newName ("x"  ++ show i)) [1 .. maxlen]
-    alloutnames <- mapM (\i -> newName ("x'" ++ show i)) [1 .. maxlen]
-    allfnames   <- mapM (\i -> newName ("f"  ++ show i)) [1 .. maxlen]
-    allidnames  <- mapM (\i -> newName ("i"  ++ show i)) [1 .. maxlen]
-    arrname <- newName "arr"
-    matches <- sequence
-      [do let innames  = take (length fieldstrucs) allinnames
-              outnames = take (length fieldstrucs) alloutnames
-              fnames   = take (length fieldstrucs) allfnames
-              idnames  = take (length fieldstrucs) allidnames
-              outid = case fieldstrucs of [] -> nextid ; _ -> last idnames
-          exprs <- zipWithM3 numberInput' fieldstrucs (map VarE innames) (nextid : idnames)
-          return $ Match (ConP conname [] (map VarP innames))
-                         (NormalB
-                            (LetE [ValD (TupP [VarP outname, VarP fname, VarP outidname])
-                                        (NormalB expr)
-                                        []
-                                  | (outname, fname, outidname, expr)
-                                      <- zip4 outnames fnames idnames exprs] $
-                               triple (foldl AppE (ConE conname) (map VarE outnames))
-                                      (LamE [VarP arrname] $
-                                         foldl AppE (ConE conname)
-                                           (map (\f -> VarE f `AppE` VarE arrname) fnames))
-                                      (VarE outid)))
-                         []
-      | (conname, fieldstrucs) <- datacons]
-    return $ CaseE input matches
+  ConST tyname argtys ->
+    return $ VarE $ case Map.lookup (tyname, argtys) helpernames of
+                      Just name -> name
+                      Nothing -> error $ "Helper name not defined? " ++ show (tyname, argtys)
 
 -- | Not necessarily unique.
-genDataNameTag :: Name -> [MonoType] -> String
-genDataNameTag tyname argtys = goN tyname ++ concatMap (('_':) . goT) argtys
+genDataNameTag :: String -> Name -> [MonoType] -> String
+genDataNameTag prefix tyname argtys = prefix ++ goN tyname ++ concatMap (('_':) . goT) argtys
   where
     goN :: Name -> String
-    goN n = filter isAlphaNum (show n)
+    goN n = case filter isAlphaNum (show n) of [] -> "xx" ; s -> s
 
     goT :: MonoType -> String
     goT DiscreteST = "i"
@@ -1314,3 +1248,6 @@ zipWithM3 f a b c = traverse (\(x,y,z) -> f x y z) (zip3 a b c)
 tvbName :: TyVarBndr () -> Name
 tvbName (PlainTV n _) = n
 tvbName (KindedTV n _ _) = n
+
+mapUnionsWithKey :: (Foldable f, Ord k) => (k -> a -> a -> a) -> f (Map k a) -> Map k a
+mapUnionsWithKey f = foldr (Map.unionWithKey f) mempty
