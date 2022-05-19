@@ -447,7 +447,7 @@ ddr :: Env -> Name -> Exp -> Q Exp
 ddr env idName = \case
   VarE name
     | name `Set.member` env -> return (pair (VarE name) (VarE idName))
-    | name == 'fromIntegral -> return (VarE 'fromIntegralOp)
+    | name == 'fromIntegral -> return (pair (VarE 'fromIntegralOp) (VarE idName))
     | name == 'negate -> do
         xname <- newName "x"
         iname <- newName "i"
