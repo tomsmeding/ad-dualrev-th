@@ -1,5 +1,4 @@
 -- TODO:
--- - Put numeric literals in the type classes for numeric operator overloading
 -- - Polymorphically recursive data types
 
 {-# LANGUAGE ConstraintKinds #-}
@@ -448,20 +447,7 @@ ddr :: Env -> Name -> Exp -> Q Exp
 ddr env idName = \case
   VarE name
     | name `Set.member` env -> return (pair (VarE name) (VarE idName))
-    | name == 'fromIntegral -> do  -- TODO: this assumes this produces a Double...
-        xname <- newName "x"
-        iname <- newName "i"
-        -- We add a type signature on the Double in the tuple not because this
-        -- is super necessary, but to hopefully make the error message a bit
-        -- better if we mis-guessed the result type of fromIntegral.
-        return (pair (LamE [VarP xname, VarP iname] $
-                        pair (pair (SigE (VarE 'fromIntegral `AppE` VarE xname)
-                                         (ConT ''Double))
-                                   (pair (VarE iname) (AppE (ConE 'Contrib) (ListE []))))
-                             (InfixE (Just (VarE iname))
-                                     (VarE '(+))
-                                     (Just (LitE (IntegerL 1)))))
-                     (VarE idName))
+    | name == 'fromIntegral -> return (VarE 'fromIntegralOp)
     | name == 'negate -> do
         xname <- newName "x"
         iname <- newName "i"
@@ -767,6 +753,11 @@ class NumOperation a where
     :: DualNum a -> DualNum a  -- arguments
     -> (a -> a -> Bool)        -- primal
     -> Bool                    -- output
+  fromIntegralOp
+    :: Integral b
+    => b                       -- argument
+    -> Int                     -- nextid
+    -> (DualNum a, Int)        -- output and nextid
 
 instance NumOperation Double where
   type DualNum Double = (Double, (Int, Contrib))
@@ -779,12 +770,14 @@ instance NumOperation Double where
   applyUnaryOp (x, (xi, xcb)) primal grad nextid =
     ((primal x, (nextid, Contrib [(xi, xcb, grad x)])), nextid + 1)
   applyCmpOp (x, _) (y, _) f = f x y
+  fromIntegralOp x nextid = ((fromIntegral x, (nextid, Contrib [])), nextid + 1)
 
 instance NumOperation Int where
   type DualNum Int = Int
   applyBinaryOp x y primal _ nextid = (primal x y, nextid)
   applyUnaryOp x primal _ nextid = (primal x, nextid)
   applyCmpOp x y f = f x y
+  fromIntegralOp x nextid = (fromIntegral x, nextid)
 
 desugarDec :: (Quote m, MonadFail m) => Dec -> m Dec
 desugarDec = \case
