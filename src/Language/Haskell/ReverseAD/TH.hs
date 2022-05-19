@@ -1,5 +1,4 @@
 -- TODO:
--- - Recursive data types
 -- - Put numeric literals in the type classes for numeric operator overloading
 -- - Polymorphically recursive data types
 
@@ -27,17 +26,9 @@ module Language.Haskell.ReverseAD.TH (
   Structure,
   structureFromTypeable,
   structureFromType,
-  -- * Misc
-  -- SimpleType(..),
-  -- MonoType(..),
-  -- Structure'(..),
-  -- deriveStructureGroup,
-  -- summariseType,
-  -- toMonoType,
 ) where
 
 import Control.Applicative (asum)
-import Control.Monad.State.Strict
 import qualified Data.Array.Mutable.Linear as A
 import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
@@ -124,19 +115,6 @@ addContrib i cb adj arr =
   A.get i arr PL.& \(Ur (_, acc), arr1) ->
     A.set i (cb, acc + adj) arr1
 
-
-data Structure' tag
-  = SDiscrete
-  | SScalar  -- Double
-  | STuple [Structure' tag]
-  | SList (Structure' tag)
-  | -- | Instantiation of a newtype, with type arguments inlined.
-    SNewtype Name -- ^ data constructor name
-             (Structure' tag)
-  | -- | Instantiation of a data type, with type arguments inlined.
-    SData [(Name, [Structure' tag])]
-  | STag !tag
-  deriving (Show, Eq, Lift)
 
 -- | The structure of a type, as used by the AD transformation. Use
 -- 'structureFromTypeable' or 'structureFromType' to construct a 'Structure'.
@@ -299,198 +277,6 @@ exploreRecursiveType tau = do
                     sty
   dtypes <- exploreType mempty mempty mty
   return (mty, dtypes)
-
--- | This does not yet check that scalars do not appear in data types!
---
--- The state maps a type name to all the various instantiations under which it
--- occurs in the type we are analysing. For each instantiation, the 'Map'
--- contains the list of type arguments its type variables are instantiated to,
--- as well as the structure that was computed for this intantiation of that
--- data type.
---
--- The return structure tag is either a tag from the environment map, or an
--- instantiation of a data type (indicated using its type name and its type
--- arguments). If a tag is a data type instantiation, it refers to one of the
--- structures from the state 'Map'.
--- deriveStructureGroup
---   :: (Eq tag, Show tag)
---   => Map Name [MonoType]  -- ^ Instantiations of /data types/ in the current stack
---                           --     (for polymorphic recursion detection)
---   -> MonoType  -- ^ Type to inspect
---   -> Q (Structure' (Either (Name, [MonoType]) tag)
---        ,Map Name (Map [MonoType] (Structure' (Either (Name, [MonoType]) tag))))
--- deriveStructureGroup stack = \case
---   ConMT n []
---     | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
---                ,''Word, ''Word8, ''Word16, ''Word32, ''Word64
---                ,''Char]
---     -> return (SDiscrete, mempty)
---     | n == ''Double -> return (SScalar, mempty)
---     | n == ''Float -> fail "Only Double is an active type for now (Float isn't)"
-
---   ConMT tyname argtys
---     | Just prevargtys <- Map.lookup tyname stack ->
---         if argtys == prevargtys
---           then -- Recursion detected!
---                -- This reference comes from the stack, and we made sure to put the type
---                -- instantiation in Map at the place where we put the instantiation in
---                -- the Map. Hence the 'mempty' is okay here.
---                return (STag (Left (tyname, argtys)), mempty)
---           else fail $ "Polymorphic recursion (data type that contains itself \
---                       \with different type argument instantiations) is not \
---                       \supported in reverse AD.\n\
---                       \Type constructor: " ++ show tyname ++ "\n\
---                       \Previously seen: " ++ intercalate " " (map show prevargtys) ++ "\n\
---                       \Current:         " ++ intercalate " " (map show argtys)
-
---     | otherwise -> do
---         -- -- Compute the structures for the argument types; we do not yet grow
---         -- -- the stack, as these are not data type fields.
---         -- (argstrucs, argsmaps) <- unzip <$> mapM (deriveStructureGroup stack) argtys
---         -- argsmap <- mergeTypeMaps argsmaps
-
---         let -- Given
---             -- - structures of the type arguments
---             -- - type variables of the data type declaration
---             -- - the constructor
---             -- analyse the constructor and return (constructor name, [field structures])
---             analyseConstructor tyvars constr = do
---               -- Get constructor name and field types
---               (conname, fieldtys) <- case constr of
---                 NormalC conname fieldtys -> return (conname, map (\(  _,ty) -> ty) fieldtys)
---                 RecC    conname fieldtys -> return (conname, map (\(_,_,ty) -> ty) fieldtys)
---                 InfixC (_, ty1) conname (_, ty2) -> return (conname, [ty1, ty2])
---                 _ -> fail $ "Unsupported constructor format on data: " ++ show constr
---               fieldtys' <- mapM summariseType fieldtys
---               fieldtys'' <- mapM (stReplaceVarsF
---                                     (\n -> case lookup n (zip tyvars argtys) of
---                                              Just mt -> return mt
---                                              Nothing -> fail $ "Type variable out of scope: " ++ show n))
---                                  fieldtys'
---               let stack' = Map.insert tyname argtys stack
---               (fieldstrucs, fieldmaps) <-
---                 unzip <$> mapM (deriveStructureGroup stack') fieldtys''
---               fieldmap <- mergeTypeMaps fieldmaps
---               return ((conname, fieldstrucs), fieldmap)
-
---         -- Get information about the data type
---         typedecl <- reify tyname >>= \case
---           TyConI decl -> return decl
---           info -> fail $ "Name " ++ show tyname ++ " is not a lifted type name: " ++ show info
---         case typedecl of
---           NewtypeD [] _ tyvars _ constr  _
---             | length tyvars == length argtys -> do
---                 (resstruc, resmaps) <-
---                   unzip <$> mapM (analyseConstructor (map tvbName tyvars)) [constr]
---                 resmap <- mergeTypeMaps resmaps
---                 let resmap' = Map.singleton tyname (Map.singleton argtys (SData resstruc)) <> resmap
---                 return (SData resstruc, resmap')
---             | otherwise -> fail $ "Type not fully applied: " ++ show tyname
---           DataD    [] _ tyvars _ constrs _
---             | length tyvars == length argtys -> do
---                 (resstruc, resmaps) <-
---                   unzip <$> mapM (analyseConstructor (map tvbName tyvars)) constrs
---                 resmap <- mergeTypeMaps resmaps
---                 let resmap' = Map.singleton tyname (Map.singleton argtys (SData resstruc)) <> resmap
---                 return (SData resstruc, resmap')
---             | otherwise -> fail $ "Type not fully applied: " ++ show tyname
---           TySynD _ tyvars rhs -> do
---             srhs <- summariseType rhs
---             mrhs <- stReplaceVarsF (\n -> case lookup n (zip (map tvbName tyvars) argtys) of
---                                             Just mt -> return mt
---                                             Nothing -> fail $ "Type variable out of scope: " ++ show n)
---                                    srhs
---             deriveStructureGroup stack mrhs
---           _ -> fail $ "Type not supported: " ++ show tyname ++ " (not simple newtype or data)"
---   where
---     mergeTypeMaps :: (Eq a, Ord k1, Ord k2, Show k1, Show k2, Show a, MonadFail m)
---                   => [Map k1 (Map k2 a)] -> m (Map k1 (Map k2 a))
---     mergeTypeMaps maps =
---       let f n as s1 s2
---             | s1 == s2 = pure s1
---             | otherwise = fail $ "Type " ++ show n ++ " applied to " ++ show as ++ " \
---                                  \yielded two different structures:\n\
---                                  \- " ++ show s1 ++ "\n\
---                                  \- " ++ show s2
---       in foldM (mapUnionWithKeyF (mapUnionWithKeyF . f)) mempty maps
-
-deriveStructure :: Map Name (Structure' tag) -> Type -> Q (Structure' tag)
-deriveStructure = \env -> go env True
-  where
-    go :: Map Name (Structure' tag) -> Bool -> Type -> Q (Structure' tag)
-    go env scalarsAllowed = \case
-      AppT (ConT listty) eltty | listty == ''[] ->
-        SList <$> go env scalarsAllowed eltty
-      t@AppT{} -> do
-        let (headty, argtys) = collectApps t
-        argstrucs <- mapM (go env scalarsAllowed) argtys
-        goApplied env scalarsAllowed headty argstrucs
-      SigT t _ -> go env scalarsAllowed t
-      ConT n
-        | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
-                   ,''Word, ''Word8, ''Word16, ''Word32, ''Word64]
-        -> return SDiscrete
-        | n == ''Double
-        -> if scalarsAllowed
-             then return SScalar
-             else fail "No literal Double scalars allowed in data type used in reverse AD; replace them with a type parameter."
-        | n == ''Float
-        -> fail "Only Double is an active type for now (Float isn't)"
-        | otherwise
-        -> goApplied env scalarsAllowed (ConT n) []
-      ParensT t -> go env scalarsAllowed t
-      TupleT 0 -> return (STuple [])
-      -- ForallT _ [] t -> go env scalarsAllowed t
-      VarT name ->
-        case Map.lookup name env of
-          Just struc -> return struc
-          Nothing -> fail $ "Type variable out of scope: " ++ show name
-      -- t@(ForallT _ (_:_) _) -> fail $ "Contexts in foralls not supported in type: " ++ replace '\n' ' ' (pprint t)
-      t -> fail $ "Unsupported type in data type: " ++ pprint t
-
-    goApplied :: Map Name (Structure' tag) -> Bool -> Type -> [Structure' tag] -> Q (Structure' tag)
-    goApplied env scalarsAllowed headty argstrucs = case headty of
-      TupleT n
-        | length argstrucs == n
-        -> return (STuple argstrucs)
-
-      ListT
-        | [struc] <- argstrucs
-        -> return (SList struc)
-
-      ConT tyname -> do
-        typedecl <- reify tyname >>= \case
-          TyConI decl -> return decl
-          info -> fail $ "Name " ++ show tyname ++ " is not a type name: " ++ show info
-        case typedecl of
-          NewtypeD [] _ (map tvbName -> tyvars) _ constr _ -> do
-            when (length tyvars /= length argstrucs) $
-              fail $ "Type not fully applied: " ++ show headty
-            let env' = Map.fromList (zip tyvars argstrucs) <> env
-            case constr of
-              NormalC conname [(_, fieldty)] -> SNewtype conname <$> go env' scalarsAllowed fieldty
-              RecC conname [(_, _, fieldty)] -> SNewtype conname <$> go env' scalarsAllowed fieldty
-              _ -> fail $ "Unsupported constructor format on newtype: " ++ show constr
-          DataD [] _ (map tvbName -> tyvars) _ constrs [] -> do
-            when (length tyvars /= length argstrucs) $
-              fail $ "Type not fully applied: " ++ show headty
-            let env' = Map.fromList (zip tyvars argstrucs) <> env
-                goConstr = \case
-                  NormalC conname (map (\(  _,ty) -> ty) -> fieldtys) ->
-                    (conname,) <$> mapM (go env' False) fieldtys
-                  RecC    conname (map (\(_,_,ty) -> ty) -> fieldtys) ->
-                    (conname,) <$> mapM (go env' False) fieldtys
-                  constr -> fail $ "Unsupported constructor format on data: " ++ show constr
-            SData <$> mapM goConstr constrs
-          _ -> fail $ "Type not supported: " ++ show tyname
-
-      _ -> fail $ "Type unsupported in data in reverse AD: " ++ show headty
-
-    collectApps = second reverse . collectAppsRev
-    collectAppsRev :: Type -> (Type, [Type])
-    collectAppsRev (AppT t1 t2) = second (t2 :) (collectAppsRev t1)
-    collectAppsRev (ParensT t) = collectAppsRev t
-    collectAppsRev t = (t, [])
 
 
 -- | Use as follows:
@@ -689,11 +475,13 @@ ddr env idName = \case
     | name == 'sqrt -> do
         xname <- newName "x"
         iname <- newName "i"
+        let bin a op b = InfixE (Just a) (VarE op) (Just b)
+            lit = LitE . IntegerL
         let function = LamE [VarP xname, VarP iname] $
               foldl AppE (VarE 'applyUnaryOp)
                 [VarE xname
                 ,VarE 'sqrt
-                ,LamE [VarP xname] (InfixE (Just (LitE (IntegerL 1))) (VarE '(/)) (Just (InfixE (Just (LitE (IntegerL 2))) (VarE '(*)) (Just (AppE (VarE 'sqrt) (VarE xname))))))
+                ,LamE [VarP xname] (bin (lit 1) '(/) (bin (lit 2) '(*) (AppE (VarE 'sqrt) (VarE xname))))
                 ,VarE iname]
         return (pair function (VarE idName))
     | name == '($) -> do
@@ -706,10 +494,8 @@ ddr env idName = \case
     | name `elem` ['[]] -> return (pair (ConE name) (VarE idName))
     | otherwise -> do
         fieldtys <- checkDatacon name
-        -- let todo = "TODO: kleisli-transform every arrow in the type of the data constructor into the id generation monad"
         conexpr <- liftKleisliN (length fieldtys) (ConE name)
         return (pair conexpr (VarE idName))
-        -- fail $ "Data constructor not supported in reverseAD: " ++ show name
 
   LitE lit -> case lit of
     RationalL _ -> return (pair (pair (LitE lit)
@@ -927,9 +713,11 @@ checkDatacon name = do
                           tyargs of
               Just vars -> return vars
               Nothing -> fail "Normal constructor has GADT properties?"
-  let appliedType = foldl AppT (ConT tycon) (map VarT tyvars)
-  -- The fact that 'deriveStructure' returns successfully implies that the type is fine
-  _ <- deriveStructure (Map.fromList (zip tyvars (repeat (STag ())))) appliedType
+  -- Check that we can successfully derive the structure of the type applied to
+  -- all-() type arguments. This _should_ be equivalent to a more general
+  -- analysis that considers the type variables actual abstract entities.
+  let appliedType = foldl AppT (ConT tycon) (map (\_ -> ConT ''()) tyvars)
+  _ <- exploreRecursiveType appliedType
   return fieldtys
 
 -- | Given the type of a data constructor, return:
