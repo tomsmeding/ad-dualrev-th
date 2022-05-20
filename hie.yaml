@@ -1,25 +1,7 @@
-# cradle:
-#   multi:
-#     - path: "src/"
-#       config:
-#         cradle:
-#           cabal:
-#             component: "lib:dualrev"
-#     - path: "test/"
-#       config:
-#         cradle:
-#           cabal:
-#             component: "test:test"
-#     - path: "bench/"
-#       config:
-#         cradle:
-#           cabal:
-#             component: "bench:bench"
-
 cradle:
   cabal:
     - path: "./src"
-      component: "lib:dualrev"
+      component: "lib:ad-dualrev-th"
     - path: "./test"
       component: "test:test"
     - path: "./bench"
