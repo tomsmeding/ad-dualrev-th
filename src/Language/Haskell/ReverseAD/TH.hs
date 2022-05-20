@@ -102,6 +102,11 @@ import Language.Haskell.ReverseAD.TH.Orphans ()
 --       ,(in, Contrib [(di1, cb1, dop_1 x1..xn), ..., (din, cbn, dop_n x1..xn)]))
 --      ,in + 1)
 
+
+-- ----------------------------------------------------------------------
+-- The State type
+-- ----------------------------------------------------------------------
+
 type BuildState = Array (Contrib, Double)
 newtype Contrib = Contrib [(Int, Contrib, Double)]
 
@@ -126,6 +131,10 @@ addContrib i cb adj arr =
   A.get i arr PL.& \(Ur (_, acc), arr1) ->
     A.set i (cb, acc + adj) arr1
 
+
+-- ------------------------------------------------------------
+-- Structure descriptions of types
+-- ------------------------------------------------------------
 
 -- | The structure of a type, as used by the AD transformation. Use
 -- 'structureFromTypeable' or 'structureFromType' to construct a 'Structure'.
@@ -290,6 +299,10 @@ exploreRecursiveType tau = do
   return (mty, dtypes)
 
 
+-- ----------------------------------------------------------------------
+-- Top-level interface to reverse AD
+-- ----------------------------------------------------------------------
+
 -- | Use as follows:
 --
 -- > > :t $$(reverseAD @_ @Double [|| \(x, y) -> x * y ||])
@@ -366,88 +379,10 @@ transform inpStruc outStruc (LamE (pat : pats) body) =
 transform _ _ expr =
   fail $ "Top-level expression in reverseAD must be lambda, but is: " ++ show expr
 
--- outexp :: Dt[T]                            -- interleaved program output
--- result :: (T                               -- primal result
---           ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
-deinterleave :: Quote m => Structure -> Exp -> m Exp
-deinterleave (Structure monotype dtypemap) outexp = do
-  let dtypes = Map.keys dtypemap
-  helpernames <- Map.fromAscList <$>
-                   sequence [((n, ts),) <$> newName (genDataNameTag "deinter" n ts)
-                            | (n, ts) <- dtypes]
-  helperfuns <- sequence [(helpernames Map.! (n, ts),) <$> deinterleaveData helpernames constrs
-                         | ((n, ts), constrs) <- Map.assocs dtypemap]
-  mainfun <- deinterleaveType helpernames monotype
-  return $ LetE [ValD (VarP name) (NormalB fun) []
-                | (name, fun) <- helperfuns] $
-             mainfun `AppE` outexp
 
--- Dt[T]                                 -- interleaved program output
---   -> (T                               -- primal result
---      ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
--- The Map contains for each (type name T', type arguments As') combination
--- that occurs (transitively) in T, the name of a function with type
--- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -o BuildState)'.
-deinterleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
-deinterleaveData helpernames constrs = do
-  dualvar <- newName "out"
-  let maxn = maximum (map (length . snd) constrs)
-  alldvars <- mapM (\i -> newName ("d" ++ show i)) [1..maxn]
-  allpvars <- mapM (\i -> newName ("p" ++ show i)) [1..maxn]
-  allfvars <- mapM (\i -> newName ("f" ++ show i)) [1..maxn]
-  allavars <- mapM (\i -> newName ("a" ++ show i)) [1..maxn]
-
-  let composeLfuns [] = VarE 'PL.id
-      composeLfuns l = foldr1 (\a b -> InfixE (Just a) (VarE '(PL..)) (Just b)) l
-
-  bodies <- sequence
-    [do let dvars = take (length fieldtys) alldvars
-            pvars = take (length fieldtys) allpvars
-            fvars = take (length fieldtys) allfvars
-            avars = take (length fieldtys) allavars
-        exps <- mapM (deinterleaveType helpernames) fieldtys
-        return $ LetE [ValD (TupP [VarP pvar, VarP fvar]) (NormalB (expr `AppE` VarE dvar)) []
-                      | (dvar, pvar, fvar, expr) <- zip4 dvars pvars fvars exps] $
-                   pair (foldl AppE (ConE conname) (map VarE pvars))
-                        -- irrefutable (partial) pattern: that's what you get with sum types in
-                        -- a non-dependent context.
-                        (LamE [ConP conname [] (map VarP avars)] $
-                           SigE (composeLfuns [VarE fvar `AppE` VarE avar
-                                              | (fvar, avar) <- zip fvars avars])
-                                (MulArrowT `AppT` ConT 'One `AppT` ConT ''BuildState `AppT` ConT ''BuildState))
-    | (conname, fieldtys) <- constrs]
-
-  return $ LamE [VarP dualvar] $ CaseE (VarE dualvar)
-    [Match (ConP conname [] (map VarP dvars))
-           (NormalB body)
-           []
-    | ((conname, fieldtys), body) <- zip constrs bodies
-    , let dvars = take (length fieldtys) alldvars]
-
--- Dt[T]                                 -- interleaved program output
---   -> (T                               -- primal result
---      ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
--- The Map contains for each (type name T', type arguments As') combination
--- that occurs (transitively) in T, the name of a function with type
--- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -o BuildState)'.
-deinterleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
-deinterleaveType helpernames = \case
-  DiscreteST -> do
-    dname <- newName "d"
-    return $ LamE [VarP dname] $ pair (VarE dname) (LamE [WildP] (VarE 'PL.id))
-
-  ScalarST -> do
-    primalname <- newName "prim"
-    idname <- newName "id"
-    cbname <- newName "cb"
-    return $ LamE [TupP [VarP primalname, TupP [VarP idname, VarP cbname]]] $
-      pair (VarE primalname)
-           (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
-
-  ConST tyname argtys ->
-    return $ VarE $ case Map.lookup (tyname, argtys) helpernames of
-                      Just name -> name
-                      Nothing -> error $ "Helper name not defined? " ++ show (tyname, argtys)
+-- ----------------------------------------------------------------------
+-- The compositional code transformation
+-- ----------------------------------------------------------------------
 
 -- Set of names bound in the program at this point
 type Env = Set Name
@@ -644,12 +579,6 @@ ddr env idName = \case
   e@GetFieldE{} -> notSupported "Records" (Just (show e))
   e@ProjectionE{} -> notSupported "Records" (Just (show e))
 
-pair :: Exp -> Exp -> Exp
-pair e1 e2 = TupE [Just e1, Just e2]
-
-triple :: Exp -> Exp -> Exp -> Exp
-triple e1 e2 e3 = TupE [Just e1, Just e2, Just e3]
-
 -- | Given list of expressions and the input ID, returns a let-wrapper that
 -- defines a variable for each item in the list (differentiated), the names of
 -- those variables, and the output ID name (in scope in the let-wrapper).
@@ -699,167 +628,10 @@ ddrPat = \case
   p@SigP{} -> notSupported "Type signatures in patterns, because then I need to rewrite types and I'm lazy" (Just (show p))
   p@ViewP{} -> notSupported "View patterns" (Just (show p))
 
--- | Returns the types of the fields of the data constructor if valid
-checkDatacon :: Name -> Q [Type]
-checkDatacon name = do
-  conty <- reifyType name
-  (tycon, tyargs, fieldtys) <- case fromDataconType conty of
-    Just ty -> return ty
-    Nothing -> fail $ "Could not deduce root type from type of data constructor " ++ pprint name
-  tyvars <- case traverse (\case VarT n -> Just n
-                                 _ -> Nothing)
-                          tyargs of
-              Just vars -> return vars
-              Nothing -> fail "Normal constructor has GADT properties?"
-  -- Check that we can successfully derive the structure of the type applied to
-  -- all-() type arguments. This _should_ be equivalent to a more general
-  -- analysis that considers the type variables actual abstract entities.
-  let appliedType = foldl AppT (ConT tycon) (map (\_ -> ConT ''()) tyvars)
-  _ <- exploreRecursiveType appliedType
-  return fieldtys
 
--- | Given the type of a data constructor, return:
--- - the name of the type it is a constructor of;
--- - the instantiations of the type parameters of that type in the types of the constructor's fields;
--- - the types of the fields of the constructor
-fromDataconType :: Type -> Maybe (Name, [Type], [Type])
-fromDataconType (ForallT _ _ t) = fromDataconType t
-fromDataconType (ArrowT `AppT` ty `AppT` t) =
-  (\(n, typarams, tys) -> (n, typarams, ty : tys)) <$> fromDataconType t
-fromDataconType (MulArrowT `AppT` PromotedT multi `AppT` ty `AppT` t)
-  | multi == 'One = (\(n, typarams, tys) -> (n, typarams, ty : tys)) <$> fromDataconType t
-  | otherwise = Nothing
-fromDataconType t = (\(n, typarams) -> (n, typarams, [])) <$> extractTypeCon t
-
-extractTypeCon :: Type -> Maybe (Name, [Type])
-extractTypeCon (AppT t arg) = second (++ [arg]) <$> extractTypeCon t
-extractTypeCon (ConT n) = Just (n, [])
-extractTypeCon _ = Nothing
-
--- | Given an expression `e`, wraps it in `n` kleisli-lifted lambdas like
---
--- > \x1 i1 -> (\x2 i2 -> (... \xn in -> (e x1 ... xn, in), i2), i1)
-liftKleisliN :: Int -> Exp -> Q Exp
-liftKleisliN 0 e = return e
-liftKleisliN n e = do
-  name <- newName "x"
-  e' <- liftKleisliN (n - 1) (AppE e (VarE name))
-  iname <- newName "i"
-  return (LamE [VarP name, VarP iname] $ pair e' (VarE iname))
-
-class NumOperation a where
-  type DualNum a = r | r -> a
-  applyBinaryOp
-    :: DualNum a -> DualNum a  -- arguments
-    -> (a -> a -> a)           -- primal
-    -> (a -> a -> (a, a))      -- gradient given inputs (assuming adjoint 1)
-    -> Int                     -- nextid
-    -> (DualNum a, Int)        -- output and nextid
-  applyUnaryOp
-    :: DualNum a               -- argument
-    -> (a -> a)                -- primal
-    -> (a -> a)                -- derivative given input (assuming adjoint 1)
-    -> Int                     -- nextid
-    -> (DualNum a, Int)        -- output and nextid
-  applyCmpOp
-    :: DualNum a -> DualNum a  -- arguments
-    -> (a -> a -> Bool)        -- primal
-    -> Bool                    -- output
-  fromIntegralOp
-    :: Integral b
-    => b                       -- argument
-    -> Int                     -- nextid
-    -> (DualNum a, Int)        -- output and nextid
-
-instance NumOperation Double where
-  type DualNum Double = (Double, (Int, Contrib))
-  applyBinaryOp (x, (xi, xcb)) (y, (yi, ycb)) primal grad nextid =
-    let (dx, dy) = grad x y
-    in ((primal x y
-        ,(nextid
-         ,Contrib [(xi, xcb, dx), (yi, ycb, dy)]))
-       ,nextid + 1)
-  applyUnaryOp (x, (xi, xcb)) primal grad nextid =
-    ((primal x, (nextid, Contrib [(xi, xcb, grad x)])), nextid + 1)
-  applyCmpOp (x, _) (y, _) f = f x y
-  fromIntegralOp x nextid = ((fromIntegral x, (nextid, Contrib [])), nextid + 1)
-
-instance NumOperation Int where
-  type DualNum Int = Int
-  applyBinaryOp x y primal _ nextid = (primal x y, nextid)
-  applyUnaryOp x primal _ nextid = (primal x, nextid)
-  applyCmpOp x y f = f x y
-  fromIntegralOp x nextid = (fromIntegral x, nextid)
-
-desugarDec :: (Quote m, MonadFail m) => Dec -> m Dec
-desugarDec = \case
-  dec@(ValD (VarP _) (NormalB _) []) -> return $ dec
-
-  FunD _ [] -> fail "Function declaration with empty list of clauses?"
-
-  FunD name clauses@(_:_)
-    | not (allEqual [length pats | Clause pats _ _ <- clauses])
-    -> fail "Clauses of a function declaration do not all have the same number of arguments"
-    | length [() | Clause _ _ [] <- clauses] /= length clauses
-    -> fail $ "Where blocks not supported in declaration of " ++ show name
-    | length [() | Clause _ (NormalB _) _ <- clauses] /= length clauses
-    -> fail $ "Guards not supported in declaration of " ++ show name
-    | otherwise
-    -> do
-      let nargs = head [length pats | Clause pats _ _ <- clauses]
-      argnames <- mapM (\i -> newName ("arg" ++ show i)) [1..nargs]
-      let body = LamE (map VarP argnames) $
-                   CaseE (TupE (map (Just . VarE) argnames))
-                     [Match (TupP ps) (NormalB rhs) []
-                     | Clause ps ~(NormalB rhs) ~[] <- clauses]
-      return $ ValD (VarP name) (NormalB body) []
-
-  dec -> fail $ "Only simple let bindings supported in reverseAD: " ++ show dec
-  where
-    allEqual :: Eq a => [a] -> Bool
-    allEqual [] = True
-    allEqual (x:xs) = all (== x) xs
-
--- | Differentiate a declaration, given a variable containing the next ID to
--- generate. Modifies the declaration to bind the next ID to a new name, which
--- is returned.
-transDec :: Env -> Dec -> Name -> Q (Dec, Name)
-transDec env dec idName = case dec of
-  ValD (VarP name) (NormalB body) [] -> do
-    idName1 <- newName "i"
-    body' <- ddr env idName body
-    return (ValD (TupP [VarP name, VarP idName1]) (NormalB body') [], idName1)
-
-  _ -> fail $ "How did this declaration get through desugaring? " ++ show dec
-
--- | `sequence 'transDec'`
-transDecs :: Env -> [Dec] -> Name -> Q ([Dec], Name)
-transDecs _ [] n = return ([], n)
-transDecs env (d : ds) n = do
-  (d', n') <- transDec env d n
-  (ds', n'') <- transDecs env ds n'
-  return (d' : ds', n'')
-
--- | If these declarations occur in a let block, check that all dependencies go
--- backwards, i.e. it would be valid to replace the let block with a chain of
--- single-dec lets. If non-recursive, returns, for each variable defined: the
--- name, the free variables of its right-hand side, and its right-hand side.
-checkDecsNonRecursive :: MonadFail m => [Dec] -> m (Maybe [(Name, Set Name, Exp)])
-checkDecsNonRecursive decs = do
-  let processDec :: MonadFail m => Dec -> m (Name, Set Name, Exp)
-      processDec = \case
-        ValD (VarP name) (NormalB e) [] -> (name,,e) <$> freeVars e
-        dec -> fail $ "Unsupported declaration in let: " ++ show dec
-  tups <- mapM processDec decs
-  -- TODO: mild quadratic behaviour with this notElem
-  let nonRecursive :: [Name] -> Set Name -> Bool
-      nonRecursive boundAfterThis frees = all (\name -> name `notElem` boundAfterThis) (toList frees)
-  if all (\((_, frees, rhs), boundAfterThis) ->
-            case rhs of LamE (_:_) _ -> True
-                        _ -> nonRecursive boundAfterThis frees)
-         (zip tups (tail (tails (map fst3 tups))))
-    then return (Just tups)
-    else return Nothing
+-- ----------------------------------------------------------------------
+-- The wrapper: interleave and deinterleave
+-- ----------------------------------------------------------------------
 
 -- input :: a
 -- nextid :: Name Int
@@ -949,6 +721,89 @@ interleaveType helpernames = \case
                       Just name -> name
                       Nothing -> error $ "Helper name not defined? " ++ show (tyname, argtys)
 
+-- outexp :: Dt[T]                            -- interleaved program output
+-- result :: (T                               -- primal result
+--           ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+deinterleave :: Quote m => Structure -> Exp -> m Exp
+deinterleave (Structure monotype dtypemap) outexp = do
+  let dtypes = Map.keys dtypemap
+  helpernames <- Map.fromAscList <$>
+                   sequence [((n, ts),) <$> newName (genDataNameTag "deinter" n ts)
+                            | (n, ts) <- dtypes]
+  helperfuns <- sequence [(helpernames Map.! (n, ts),) <$> deinterleaveData helpernames constrs
+                         | ((n, ts), constrs) <- Map.assocs dtypemap]
+  mainfun <- deinterleaveType helpernames monotype
+  return $ LetE [ValD (VarP name) (NormalB fun) []
+                | (name, fun) <- helperfuns] $
+             mainfun `AppE` outexp
+
+-- Dt[T]                                 -- interleaved program output
+--   -> (T                               -- primal result
+--      ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+-- The Map contains for each (type name T', type arguments As') combination
+-- that occurs (transitively) in T, the name of a function with type
+-- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -o BuildState)'.
+deinterleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
+deinterleaveData helpernames constrs = do
+  dualvar <- newName "out"
+  let maxn = maximum (map (length . snd) constrs)
+  alldvars <- mapM (\i -> newName ("d" ++ show i)) [1..maxn]
+  allpvars <- mapM (\i -> newName ("p" ++ show i)) [1..maxn]
+  allfvars <- mapM (\i -> newName ("f" ++ show i)) [1..maxn]
+  allavars <- mapM (\i -> newName ("a" ++ show i)) [1..maxn]
+
+  let composeLfuns [] = VarE 'PL.id
+      composeLfuns l = foldr1 (\a b -> InfixE (Just a) (VarE '(PL..)) (Just b)) l
+
+  bodies <- sequence
+    [do let dvars = take (length fieldtys) alldvars
+            pvars = take (length fieldtys) allpvars
+            fvars = take (length fieldtys) allfvars
+            avars = take (length fieldtys) allavars
+        exps <- mapM (deinterleaveType helpernames) fieldtys
+        return $ LetE [ValD (TupP [VarP pvar, VarP fvar]) (NormalB (expr `AppE` VarE dvar)) []
+                      | (dvar, pvar, fvar, expr) <- zip4 dvars pvars fvars exps] $
+                   pair (foldl AppE (ConE conname) (map VarE pvars))
+                        -- irrefutable (partial) pattern: that's what you get with sum types in
+                        -- a non-dependent context.
+                        (LamE [ConP conname [] (map VarP avars)] $
+                           SigE (composeLfuns [VarE fvar `AppE` VarE avar
+                                              | (fvar, avar) <- zip fvars avars])
+                                (MulArrowT `AppT` ConT 'One `AppT` ConT ''BuildState `AppT` ConT ''BuildState))
+    | (conname, fieldtys) <- constrs]
+
+  return $ LamE [VarP dualvar] $ CaseE (VarE dualvar)
+    [Match (ConP conname [] (map VarP dvars))
+           (NormalB body)
+           []
+    | ((conname, fieldtys), body) <- zip constrs bodies
+    , let dvars = take (length fieldtys) alldvars]
+
+-- Dt[T]                                 -- interleaved program output
+--   -> (T                               -- primal result
+--      ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+-- The Map contains for each (type name T', type arguments As') combination
+-- that occurs (transitively) in T, the name of a function with type
+-- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -o BuildState)'.
+deinterleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
+deinterleaveType helpernames = \case
+  DiscreteST -> do
+    dname <- newName "d"
+    return $ LamE [VarP dname] $ pair (VarE dname) (LamE [WildP] (VarE 'PL.id))
+
+  ScalarST -> do
+    primalname <- newName "prim"
+    idname <- newName "id"
+    cbname <- newName "cb"
+    return $ LamE [TupP [VarP primalname, TupP [VarP idname, VarP cbname]]] $
+      pair (VarE primalname)
+           (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
+
+  ConST tyname argtys ->
+    return $ VarE $ case Map.lookup (tyname, argtys) helpernames of
+                      Just name -> name
+                      Nothing -> error $ "Helper name not defined? " ++ show (tyname, argtys)
+
 -- | Not necessarily unique.
 genDataNameTag :: String -> Name -> [MonoType] -> String
 genDataNameTag prefix tyname argtys = prefix ++ goN tyname ++ concatMap (('_':) . goT) argtys
@@ -961,8 +816,182 @@ genDataNameTag prefix tyname argtys = prefix ++ goN tyname ++ concatMap (('_':) 
     goT ScalarST = "s"
     goT (ConST n ts) = goN n ++ concatMap goT ts
 
-fst3 :: (a, b, c) -> a
-fst3 (a, _, _) = a
+
+-- ----------------------------------------------------------------------
+-- Polymorphic numeric operations
+-- ----------------------------------------------------------------------
+--
+-- This is to get around the limitation of TH that we do not know the inferred
+-- types of subexpressions in the AD transformation. Hence, for polymorphic
+-- primitive operations, we defer the choice of implementation to the Haskell
+-- typechecker using a type class.
+
+class NumOperation a where
+  type DualNum a = r | r -> a
+  applyBinaryOp
+    :: DualNum a -> DualNum a  -- arguments
+    -> (a -> a -> a)           -- primal
+    -> (a -> a -> (a, a))      -- gradient given inputs (assuming adjoint 1)
+    -> Int                     -- nextid
+    -> (DualNum a, Int)        -- output and nextid
+  applyUnaryOp
+    :: DualNum a               -- argument
+    -> (a -> a)                -- primal
+    -> (a -> a)                -- derivative given input (assuming adjoint 1)
+    -> Int                     -- nextid
+    -> (DualNum a, Int)        -- output and nextid
+  applyCmpOp
+    :: DualNum a -> DualNum a  -- arguments
+    -> (a -> a -> Bool)        -- primal
+    -> Bool                    -- output
+  fromIntegralOp
+    :: Integral b
+    => b                       -- argument
+    -> Int                     -- nextid
+    -> (DualNum a, Int)        -- output and nextid
+
+instance NumOperation Double where
+  type DualNum Double = (Double, (Int, Contrib))
+  applyBinaryOp (x, (xi, xcb)) (y, (yi, ycb)) primal grad nextid =
+    let (dx, dy) = grad x y
+    in ((primal x y
+        ,(nextid
+         ,Contrib [(xi, xcb, dx), (yi, ycb, dy)]))
+       ,nextid + 1)
+  applyUnaryOp (x, (xi, xcb)) primal grad nextid =
+    ((primal x, (nextid, Contrib [(xi, xcb, grad x)])), nextid + 1)
+  applyCmpOp (x, _) (y, _) f = f x y
+  fromIntegralOp x nextid = ((fromIntegral x, (nextid, Contrib [])), nextid + 1)
+
+instance NumOperation Int where
+  type DualNum Int = Int
+  applyBinaryOp x y primal _ nextid = (primal x y, nextid)
+  applyUnaryOp x primal _ nextid = (primal x, nextid)
+  applyCmpOp x y f = f x y
+  fromIntegralOp x nextid = (fromIntegral x, nextid)
+
+
+-- ----------------------------------------------------------------------
+-- Further utility functions
+-- ----------------------------------------------------------------------
+
+-- | Returns the types of the fields of the data constructor if valid
+checkDatacon :: Name -> Q [Type]
+checkDatacon name = do
+  conty <- reifyType name
+  (tycon, tyargs, fieldtys) <- case fromDataconType conty of
+    Just ty -> return ty
+    Nothing -> fail $ "Could not deduce root type from type of data constructor " ++ pprint name
+  tyvars <- case traverse (\case VarT n -> Just n
+                                 _ -> Nothing)
+                          tyargs of
+              Just vars -> return vars
+              Nothing -> fail "Normal constructor has GADT properties?"
+  -- Check that we can successfully derive the structure of the type applied to
+  -- all-() type arguments. This _should_ be equivalent to a more general
+  -- analysis that considers the type variables actual abstract entities.
+  let appliedType = foldl AppT (ConT tycon) (map (\_ -> ConT ''()) tyvars)
+  _ <- exploreRecursiveType appliedType
+  return fieldtys
+
+-- | Given the type of a data constructor, return:
+-- - the name of the type it is a constructor of;
+-- - the instantiations of the type parameters of that type in the types of the constructor's fields;
+-- - the types of the fields of the constructor
+fromDataconType :: Type -> Maybe (Name, [Type], [Type])
+fromDataconType (ForallT _ _ t) = fromDataconType t
+fromDataconType (ArrowT `AppT` ty `AppT` t) =
+  (\(n, typarams, tys) -> (n, typarams, ty : tys)) <$> fromDataconType t
+fromDataconType (MulArrowT `AppT` PromotedT multi `AppT` ty `AppT` t)
+  | multi == 'One = (\(n, typarams, tys) -> (n, typarams, ty : tys)) <$> fromDataconType t
+  | otherwise = Nothing
+fromDataconType t = (\(n, typarams) -> (n, typarams, [])) <$> extractTypeCon t
+
+extractTypeCon :: Type -> Maybe (Name, [Type])
+extractTypeCon (AppT t arg) = second (++ [arg]) <$> extractTypeCon t
+extractTypeCon (ConT n) = Just (n, [])
+extractTypeCon _ = Nothing
+
+-- | Given an expression `e`, wraps it in `n` kleisli-lifted lambdas like
+--
+-- > \x1 i1 -> (\x2 i2 -> (... \xn in -> (e x1 ... xn, in), i2), i1)
+liftKleisliN :: Int -> Exp -> Q Exp
+liftKleisliN 0 e = return e
+liftKleisliN n e = do
+  name <- newName "x"
+  e' <- liftKleisliN (n - 1) (AppE e (VarE name))
+  iname <- newName "i"
+  return (LamE [VarP name, VarP iname] $ pair e' (VarE iname))
+
+desugarDec :: (Quote m, MonadFail m) => Dec -> m Dec
+desugarDec = \case
+  dec@(ValD (VarP _) (NormalB _) []) -> return $ dec
+
+  FunD _ [] -> fail "Function declaration with empty list of clauses?"
+
+  FunD name clauses@(_:_)
+    | not (allEqual [length pats | Clause pats _ _ <- clauses])
+    -> fail "Clauses of a function declaration do not all have the same number of arguments"
+    | length [() | Clause _ _ [] <- clauses] /= length clauses
+    -> fail $ "Where blocks not supported in declaration of " ++ show name
+    | length [() | Clause _ (NormalB _) _ <- clauses] /= length clauses
+    -> fail $ "Guards not supported in declaration of " ++ show name
+    | otherwise
+    -> do
+      let nargs = head [length pats | Clause pats _ _ <- clauses]
+      argnames <- mapM (\i -> newName ("arg" ++ show i)) [1..nargs]
+      let body = LamE (map VarP argnames) $
+                   CaseE (TupE (map (Just . VarE) argnames))
+                     [Match (TupP ps) (NormalB rhs) []
+                     | Clause ps ~(NormalB rhs) ~[] <- clauses]
+      return $ ValD (VarP name) (NormalB body) []
+
+  dec -> fail $ "Only simple let bindings supported in reverseAD: " ++ show dec
+  where
+    allEqual :: Eq a => [a] -> Bool
+    allEqual [] = True
+    allEqual (x:xs) = all (== x) xs
+
+-- | Differentiate a declaration, given a variable containing the next ID to
+-- generate. Modifies the declaration to bind the next ID to a new name, which
+-- is returned.
+transDec :: Env -> Dec -> Name -> Q (Dec, Name)
+transDec env dec idName = case dec of
+  ValD (VarP name) (NormalB body) [] -> do
+    idName1 <- newName "i"
+    body' <- ddr env idName body
+    return (ValD (TupP [VarP name, VarP idName1]) (NormalB body') [], idName1)
+
+  _ -> fail $ "How did this declaration get through desugaring? " ++ show dec
+
+-- | `sequence 'transDec'`
+transDecs :: Env -> [Dec] -> Name -> Q ([Dec], Name)
+transDecs _ [] n = return ([], n)
+transDecs env (d : ds) n = do
+  (d', n') <- transDec env d n
+  (ds', n'') <- transDecs env ds n'
+  return (d' : ds', n'')
+
+-- | If these declarations occur in a let block, check that all dependencies go
+-- backwards, i.e. it would be valid to replace the let block with a chain of
+-- single-dec lets. If non-recursive, returns, for each variable defined: the
+-- name, the free variables of its right-hand side, and its right-hand side.
+checkDecsNonRecursive :: MonadFail m => [Dec] -> m (Maybe [(Name, Set Name, Exp)])
+checkDecsNonRecursive decs = do
+  let processDec :: MonadFail m => Dec -> m (Name, Set Name, Exp)
+      processDec = \case
+        ValD (VarP name) (NormalB e) [] -> (name,,e) <$> freeVars e
+        dec -> fail $ "Unsupported declaration in let: " ++ show dec
+  tups <- mapM processDec decs
+  -- TODO: mild quadratic behaviour with this notElem
+  let nonRecursive :: [Name] -> Set Name -> Bool
+      nonRecursive boundAfterThis frees = all (\name -> name `notElem` boundAfterThis) (toList frees)
+  if all (\((_, frees, rhs), boundAfterThis) ->
+            case rhs of LamE (_:_) _ -> True
+                        _ -> nonRecursive boundAfterThis frees)
+         (zip tups (tail (tails (map fst3 tups))))
+    then return (Just tups)
+    else return Nothing
 
 freeVars :: MonadFail m => Exp -> m (Set Name)
 freeVars = \case
@@ -1032,6 +1061,12 @@ boundVars = \case
 combine :: (Monad m, Monoid a) => [m a] -> m a
 combine = fmap mconcat . sequence
 
+pair :: Exp -> Exp -> Exp
+pair e1 e2 = TupE [Just e1, Just e2]
+
+triple :: Exp -> Exp -> Exp -> Exp
+triple e1 e2 e3 = TupE [Just e1, Just e2, Just e3]
+
 notSupported :: MonadFail m => String -> Maybe String -> m a
 notSupported descr mthing = fail $ descr ++ " not supported in reverseAD" ++ maybe "" (": " ++) mthing
 
@@ -1044,3 +1079,6 @@ tvbName (KindedTV n _ _) = n
 
 mapUnionsWithKey :: (Foldable f, Ord k) => (k -> a -> a -> a) -> f (Map k a) -> Map k a
 mapUnionsWithKey f = foldr (Map.unionWithKey f) mempty
+
+fst3 :: (a, b, c) -> a
+fst3 (a, _, _) = a
