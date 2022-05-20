@@ -64,7 +64,7 @@ test-suite test
   ghc-options: -Wall -O2 -threaded -rtsopts
   build-depends:
       base >=4.7 && <4.17
-    , dualrev
+    , ad-dualrev-th
     , test-framework
     , clock
     , containers
@@ -82,7 +82,7 @@ benchmark bench
   ghc-options: -Wall -O2 -threaded -rtsopts
   build-depends:
       base >=4.7 && <4.17
-    , dualrev
+    , ad-dualrev-th
     , test-framework
     , ad ^>= 4.5
     , criterion
