@@ -56,12 +56,14 @@ import Prelude.Linear (Ur(..))
 import Language.Haskell.ReverseAD.TH.Orphans ()
 
 
+-- === The program transformation ===
+--
 -- Dt[Double] = (Double, (Int, Contrib))
 -- Dt[()] = ()
 -- Dt[(a, b)] = (Dt[a], Dt[b])
 -- Dt[a -> b] = a -> Int -> (Dt[b], Int)
 -- Dt[Int] = Int
--- Dt[Newtype a] = Newtype (Dt[a])
+-- Dt[T a b c] = T Dt[a] Dt[b] Dt[c]      -- data types, generalises (,)
 --
 -- Dt[eps] = eps
 -- Dt[Γ, x : a] = Dt[Γ], x : Dt[a]
@@ -75,6 +77,16 @@ import Language.Haskell.ReverseAD.TH.Orphans ()
 -- D[i, (s, t)] = let (x, i1) = D[i, s]
 --                    (y, i2) = D[i1, t]
 --                in ((x, y), i2)
+-- D[i, C x y z] = let (x', i1) = D[i, x]
+--                     (y', i2) = D[i1, y]
+--                     (z', i3) = D[i2, z]
+--                 in (C x' y' z', i3)
+-- D[i, case s of C1 x1 x2 -> t1 ; ... ; Cn x1 x2 -> tn] =
+--        let (x, i1) = D[i, s]
+--        in case x of
+--          C1 x1 x2 -> D[i1, t1]
+--          ...
+--          Cn x1 x2 -> D[i1, tn]
 -- D[i, s t] = let (f, i1) = D[i, s]
 --                 (a, i2) = D[i1, t]
 --             in f a i2
