@@ -10,7 +10,7 @@ these code transformations look and what the reasoning behind them is, we refer
 to [\[1\]][1].
 
 
-[1]: TODO
+[1]: https://arxiv.org/pdf/2205.11368.pdf
 [2]: https://arxiv.org/pdf/1909.13768.pdf
 [3]: https://arxiv.org/pdf/2001.02209.pdf
 [docrender]: https://tomsmeding.com/f/ad-dualrev-th-docs/Language-Haskell-ReverseAD-TH.html

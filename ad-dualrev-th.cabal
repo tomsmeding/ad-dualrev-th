@@ -3,8 +3,9 @@ name:          ad-dualrev-th
 version:       0.1.0.0
 synopsis:      Implementation of dual-numbers reverse AD for Haskell
 description:
-  An implementation of the algorithm described in [TODO] using Template Haskell
-  to differentiate a subset of Haskell98 code.
+  An implementation of the algorithm described in
+  <https://arxiv.org/pdf/2205.11368.pdf> using Template Haskell to
+  differentiate a subset of Haskell98 code.
 homepage:      https://github.com/tomsmeding/ad-dualrev-th
 author:        Tom Smeding
 maintainer:    Tom Smeding <tom@tomsmeding.com>
