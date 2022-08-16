@@ -17,6 +17,12 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS -Wno-incomplete-uni-patterns #-}
+
+-- This warning is over-eager in TH quotes when the variables that the pattern
+-- binds are spliced instead of mentioned directly. See
+-- https://gitlab.haskell.org/ghc/ghc/-/issues/22057 .
+{-# OPTIONS -Wno-unused-pattern-binds #-}
+
 module Language.Haskell.ReverseAD.TH (
   -- * Reverse AD
   reverseAD,
@@ -336,42 +342,31 @@ reverseAD' inpStruc outStruc (unTypeCode -> inputCode) =
 
 transform :: Structure -> Structure -> Exp -> Q Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
+  patbound <- boundVars pat
   argvar <- newName "arg"
   onevar <- newName "one"
-  inp <- interleave inpStruc (VarE argvar) onevar
   rebuildvar <- newName "rebuild"
   idvar <- newName "i0"
-  patbound <- boundVars pat
-  ddrexpr <- ddr patbound idvar expr
   outname <- newName "out"
   idvar' <- newName "i'"
-  deinterexpr <- deinterleave outStruc (VarE outname)
   primalname <- newName "primal"
   dualname <- newName "dual"
   adjname <- newName "adjoint"
   stagedvecname <- newName "stagedvec"
-  let composeLinearFuns :: [Exp] -> Exp
-      composeLinearFuns [] = VarE 'PL.id
-      composeLinearFuns l = foldl1 (\a b -> InfixE (Just a) (VarE '(PL..)) (Just b)) l
-  return (LamE [VarP argvar] $
-            LetE [ValD (VarP onevar) (NormalB (SigE (LitE (IntegerL 1)) (ConT ''Int))) []
-                 ,ValD (TupP [pat, VarP rebuildvar, VarP idvar]) (NormalB inp) []
-                 ,ValD (TupP [VarP outname, VarP idvar']) (NormalB ddrexpr) []
-                 ,ValD (TupP [VarP primalname, VarP dualname]) (NormalB deinterexpr) []] $
-              pair (VarE primalname)
-                   (LamE [VarP adjname] $
-                      LetE [ValD (ConP 'Ur [] [VarP stagedvecname])
-                                 (NormalB
-                                    (VarE 'A.alloc
-                                       `AppE` VarE idvar'
-                                       `AppE` pair (AppE (ConE 'Contrib) (ListE []))
-                                                   (LitE (RationalL 0.0))
-                                       `AppE` composeLinearFuns
-                                                [VarE 'A.freeze
-                                                ,AppE (VarE 'resolve) (VarE idvar')
-                                                ,AppE (VarE dualname) (VarE adjname)]))
-                                 []] $
-                        VarE rebuildvar `AppE` (VarE 'V.map `AppE` VarE 'snd `AppE` VarE stagedvecname)))
+  [| \ $(varP argvar) ->
+        let $(varP onevar) = 1 :: Int
+            ($(pure pat), $(varP rebuildvar), $(varP idvar)) = $(interleave inpStruc (VarE argvar) onevar)
+            ($(varP outname), $(varP idvar')) = $(ddr patbound idvar expr)
+            ($(varP primalname), $(varP dualname)) = $(deinterleave outStruc (VarE outname))
+        in ($(varE primalname)
+           ,\ $(varP adjname) ->
+                let Ur $(varP stagedvecname) =
+                      A.alloc $(varE idvar')
+                              (Contrib [], 0.0)
+                              (A.freeze
+                               PL.. resolve $(varE idvar')
+                               PL.. $(varE dualname) $(varE adjname))
+                in $(varE rebuildvar) (V.map snd $(varE stagedvecname))) |]
 transform inpStruc outStruc (LamE [] body) =
   transform inpStruc outStruc body
 transform inpStruc outStruc (LamE (pat : pats) body) =
@@ -424,7 +419,6 @@ ddr env idName = \case
     | otherwise -> fail $ "Free variables not supported in reverseAD: " ++ show name ++ " (env = " ++ show env ++ ")"
 
   ConE name
-    | name `elem` ['[]] -> return (pair (ConE name) (VarE idName))
     | otherwise -> do
         fieldtys <- checkDatacon name
         conexpr <- liftKleisliN (length fieldtys) (ConE name)
@@ -481,20 +475,15 @@ ddr env idName = \case
                      (VarE outid)
             else Nothing
 
-        handleOther =
-          Just $ ddr env idName (AppE (AppE (VarE opname) e1) e2)
+        handleOther =  -- TODO: can we just put an infix operator in a VarE?
+          Just $ ddr env idName (VarE opname `AppE` e1 `AppE` e2)
 
     case asum [handleNum, handleOrd, handleOther] of
       Nothing -> fail ("Unsupported infix operator " ++ show opname)
       Just act -> act
 
-  InfixE (Just e1) (ConE constr) (Just e2)
-    | constr == '(:) -> do
-        (letwrap, [xname, xsname], outid) <- ddrList env [e1, e2] idName
-        return $ letwrap $
-          pair (InfixE (Just (VarE xname)) (ConE '(:)) (Just (VarE xsname)))
-               (VarE outid)
-    | otherwise -> fail $ "Unsupported infix operator: " ++ show constr
+  InfixE (Just e1) (ConE constr) (Just e2) ->
+    ddr env idName (ConE constr `AppE` e1 `AppE` e2)
 
   e@InfixE{} -> fail $ "Unsupported operator section: " ++ show e
 
@@ -587,7 +576,7 @@ ddrList :: Env -> [Exp] -> Name -> Q (Exp -> Exp, [Name], Name)
 ddrList env es idName = do
   -- output varnames of the expressions
   names <- mapM (\idx -> (,) <$> newName ("x" ++ show idx) <*> newName ("i" ++ show idx))
-                (take (length es) [1::Int ..])
+                [1 .. length es]
   -- the let-binding pairs
   binds <- zipWithM3 (\ni_in (nx, ni_out) e -> do e' <- ddr env ni_in e
                                                   return ((nx, ni_out), e'))
@@ -910,6 +899,7 @@ fromDataconType t = (\(n, typarams) -> (n, typarams, [])) <$> extractTypeCon t
 extractTypeCon :: Type -> Maybe (Name, [Type])
 extractTypeCon (AppT t arg) = second (++ [arg]) <$> extractTypeCon t
 extractTypeCon (ConT n) = Just (n, [])
+extractTypeCon ListT = Just (''[], [])
 extractTypeCon _ = Nothing
 
 -- | Given an expression `e`, wraps it in `n` kleisli-lifted lambdas like
@@ -923,6 +913,13 @@ liftKleisliN n e = do
   iname <- newName "i"
   return (LamE [VarP name, VarP iname] $ pair e' (VarE iname))
 
+-- Convert function declarations to simple variable declarations:
+--   f a b c = E
+--   f d e f = F
+-- becomes
+--   f = \arg1 arg2 arg3 -> case (arg1, arg2, arg3) of
+--                            (a, b, c) -> E
+--                            (d, e, f) -> F
 desugarDec :: (Quote m, MonadFail m) => Dec -> m Dec
 desugarDec = \case
   dec@(ValD (VarP _) (NormalB _) []) -> return $ dec
@@ -987,7 +984,7 @@ checkDecsNonRecursive decs = do
   let nonRecursive :: [Name] -> Set Name -> Bool
       nonRecursive boundAfterThis frees = all (\name -> name `notElem` boundAfterThis) (toList frees)
   if all (\((_, frees, rhs), boundAfterThis) ->
-            case rhs of LamE (_:_) _ -> True
+            case rhs of LamE (_:_) _ -> True  -- mutually recursive _functions_ are fine
                         _ -> nonRecursive boundAfterThis frees)
          (zip tups (tail (tails (map fst3 tups))))
     then return (Just tups)
