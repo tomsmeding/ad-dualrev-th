@@ -175,7 +175,7 @@ main =
                            g = \x -> if x < 1.0 then x else f (x - 1.0) + 2.0
                        in f x0 ||])
        Nothing
-       YesFD
+       NoFD
     ,checkFDcontrol "list constr"
        $$(reverseADandControl @Double @[Double]
             [|| \x -> 2.0 * x : 3.0 * x : [x, x + 1.0] ||])
