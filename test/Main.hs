@@ -44,7 +44,6 @@ checkFDcontrol :: forall a b.
                -> DoCheckFinDiff
                -> Tree
 checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
-  | Nothing <- mcontrolgrad, NoFD <- dofindiff = error "checkFDcontrol: should check against _something_"
   | Refl <- replaceElementsId @a
   , Refl <- replaceElementsId @b
   = property name $ \x ->
@@ -62,26 +61,25 @@ checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
                                         (rebuildAs (Proxy @a) (Proxy @Double) input inelts)))
                                 (zip (elements @a input) (elements @a tangent)))
                           x
-          (refJacName, refJac) = case controlJac of
-                                   Nothing -> ("forwardJac", forwardJac)
-                                   Just jac -> ("controlJac", jac)
-      in conjoin $
-         (case controlJac of
-            Nothing -> []
-            Just jac ->
-              [counterexample ("controlJac /= forwardJac\n" ++
-                                 show jac ++ " /= " ++ show forwardJac)
-                              (jac ~= forwardJac)])
-         ++
-         (case dofindiff of
-            YesFD -> [counterexample (refJacName ++ " /= findiffJac\n" ++
-                                        show refJac ++ " /= " ++ show findiffJac)
-                                     (refJac ~= findiffJac)]
-            NoFD -> [])
-         ++
-         [counterexample (refJacName ++ " /= programJac\n" ++
-                            show refJac ++ " /= " ++ show programJac)
-                         (refJac ~= programJac)]
+          compareJacs name1 jac1 name2 jac2 =
+            counterexample (name1 ++ "/= " ++ name2 ++ "\n" ++
+                              show jac1 ++ " /= " ++ show jac2)
+                           (jac1 ~= jac2)
+      in case (controlJac, dofindiff) of
+           (Just jac, _) ->
+             conjoin $
+               (case dofindiff of
+                  YesFD -> [compareJacs "controlJac" jac "findiffJac" findiffJac]
+                  NoFD -> [])
+               ++
+               [compareJacs "controlJac" jac "forwardJac" forwardJac
+               ,compareJacs "controlJac" jac "programJac" programJac]
+           (Nothing, YesFD) ->
+             conjoin $
+               [compareJacs "findiffJac" findiffJac "forwardJac" forwardJac
+               ,compareJacs "findiffJac" findiffJac "programJac" programJac]
+           (Nothing, NoFD) ->
+             compareJacs "forwardJac" forwardJac "programJac" programJac
 
 main :: IO ()
 main =
