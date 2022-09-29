@@ -17,6 +17,7 @@ module FinDiff (
   finiteDifference,
   FinDiff(..),
   dataFinDiff,
+  dataFinDiffs,
 ) where
 
 import Control.Monad (when, forM)
@@ -167,6 +168,9 @@ instance FinDiff a => FinDiff [a] where
   zero p refl = map (zero p) refl
   replaceElements _ f l = map (replaceElements (Proxy @a) f) l
   replaceElementsId | Refl <- replaceElementsId @a = Refl
+
+dataFinDiffs :: [Name] -> Q [Dec]
+dataFinDiffs = fmap concat . traverse dataFinDiff
 
 dataFinDiff :: Name -> Q [Dec]
 dataFinDiff tyname = do

@@ -270,4 +270,23 @@ main =
        (Just (\_ d -> case d of WSOne _ _ _ -> 0.0
                                 WSTwo (d', _) -> 3.0 * d'))
        YesFD
+    ,checkFDcontrol "AltLists1"
+       $$(reverseADandControl @(AltList1 Double) @Double
+            [|| \l -> let sum1 (AltCons1 x l') = x + sum2 l'
+                          sum1 AltNil1 = 0.0
+                          sum2 (AltCons2 x l') = x + sum1 l'
+                          sum2 AltNil2 = 0.0
+                      in sum1 l ||])
+       (Just (\l d -> d <$ l))
+       YesFD
+    ,checkFDcontrol "AltLists2"
+       $$(reverseADandControl @(Int, Double) @(AltList1 Double)
+            [|| \(n, value) ->
+                  let unf1 i = if i == 0 then AltNil1 else AltCons1 value (unf2 (i-1))
+                      unf2 i = if i == 0 then AltNil2 else AltCons2 value (unf1 (i-1))
+                      min' x y = if x < y then x else y
+                      max' x y = if x > y then x else y
+                  in unf1 (max' 0 (min' 10 n)) ||])
+       (Just (\(_, _) d -> (0, sum d)))
+       YesFD
     ]
