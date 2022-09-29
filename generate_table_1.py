@@ -2,6 +2,7 @@
 from collections import namedtuple
 import tempfile
 import subprocess
+import sys
 
 def uniq(it):
     seen = set()
@@ -14,6 +15,7 @@ def uniq(it):
 
 def run_benchmarks():
     with tempfile.TemporaryDirectory() as workdir:
+        print("Running benchmarks; this will take a while, even after the \"tests\" output stops. Get a coffee. :)", file=sys.stderr)
         subprocess.check_output(["cabal", "run", "bench", "--", "--csv", workdir + "/out.csv"])
         with open(workdir + "/out.csv") as f:
             return f.read()
