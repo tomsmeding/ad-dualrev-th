@@ -67,7 +67,7 @@ import Language.Haskell.ReverseAD.TH.Orphans ()
 -- Dt[Double] = (Double, (Int, Contrib))
 -- Dt[()] = ()
 -- Dt[(a, b)] = (Dt[a], Dt[b])
--- Dt[a -> b] = a -> Int -> (Dt[b], Int)
+-- Dt[a -> b] = Dt[a] -> Int -> (Dt[b], Int)
 -- Dt[Int] = Int
 -- Dt[T a b c] = T Dt[a] Dt[b] Dt[c]      -- data types, generalises (,)
 --
