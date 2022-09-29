@@ -86,7 +86,8 @@ benchmark bench
     , ad-dualrev-th
     , test-framework
     , ad ^>= 4.5
-    , criterion
+    -- criterion lower bound: to support ghc 9.2.4
+    , criterion ^>= 1.6
     , deepseq
     , QuickCheck
     , template-haskell
