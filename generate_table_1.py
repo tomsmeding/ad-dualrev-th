@@ -15,7 +15,7 @@ def uniq(it):
 
 def run_benchmarks():
     with tempfile.TemporaryDirectory() as workdir:
-        print("Running benchmarks; this will take a while, even after the \"tests\" output stops. Get a coffee. :)", file=sys.stderr)
+        print("Running benchmarks; this will take about a minute, depending on machine speed and load.", file=sys.stderr)
         subprocess.check_output(["cabal", "run", "bench", "--", "--csv", workdir + "/out.csv"])
         with open(workdir + "/out.csv") as f:
             return f.read()
