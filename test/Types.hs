@@ -75,7 +75,7 @@ instance Approx a => Approx (AltList2 a) where
 
 instance Foldable AltList1 where
   foldMap f (AltCons1 x l) = f x <> foldMap f l
-  foldMap f AltNil1 = mempty
+  foldMap _ AltNil1 = mempty
 instance Foldable AltList2 where
   foldMap f (AltCons2 x l) = f x <> foldMap f l
-  foldMap f AltNil2 = mempty
+  foldMap _ AltNil2 = mempty
