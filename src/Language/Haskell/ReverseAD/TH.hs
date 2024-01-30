@@ -495,12 +495,10 @@ ddr env idName = \case
     e' <- ddr (env <> patbound) idName1 e
     return (pair (LamE [pat, VarP idName1] e') (VarE idName))
 
-  TupE mes
-    | Just es <- sequence mes -> do
-        (letwrap, vars, outid) <- ddrList env es idName
-        return (letwrap (pair (TupE (map (Just . VarE) vars))
-                              (VarE outid)))
-    | otherwise -> notSupported "Tuple sections" (Just (show (TupE mes)))
+  TupE mes | Just es <- sequence mes -> do
+    (letwrap, vars, outid) <- ddrList env es idName
+    return (letwrap (pair (TupE (map (Just . VarE) vars))
+                          (VarE outid)))
 
   CondE e1 e2 e3 -> do
     e1' <- ddr env idName e1
@@ -548,6 +546,17 @@ ddr env idName = \case
   LamCaseE mats -> do
     name <- newName "lcarg"
     ddr env idName (LamE [VarP name] (CaseE (VarE name) mats))
+
+  TupE mes -> do
+    let trav _ [] argsf esf = return (argsf [], esf [])
+        trav i (Nothing : mes') argsf esf = do
+          name <- newName ("x" ++ show (i :: Int))
+          trav (i+1) mes' (argsf . (name :)) (esf . (VarE name :))
+        trav i (Just e : mes') argsf esf =
+          trav i mes' argsf (esf . (e :))
+
+    (args, es) <- trav 1 mes id id
+    ddr env idName (LamE (map VarP args) (TupE (map Just es)))
 
   -- Unsupported constructs
   e@AppTypeE{} -> notSupported "Type applications" (Just (show e))
@@ -879,15 +888,15 @@ checkDatacon name = do
   -- Check that we can successfully derive the structure of the type applied to
   -- all-() type arguments. This _should_ be equivalent to a more general
   -- analysis that considers the type variables actual abstract entities.
-  let appliedType = foldl AppT (ConT tycon) (map (\_ -> ConT ''()) tyvars)
+  let appliedType = foldl AppT tycon (map (\_ -> ConT ''()) tyvars)
   _ <- exploreRecursiveType appliedType
   return fieldtys
 
 -- | Given the type of a data constructor, return:
--- - the name of the type it is a constructor of;
+-- - the name of the type it is a constructor of (usually 'ConT name', but also 'TupleT n');
 -- - the instantiations of the type parameters of that type in the types of the constructor's fields;
 -- - the types of the fields of the constructor
-fromDataconType :: Type -> Maybe (Name, [Type], [Type])
+fromDataconType :: Type -> Maybe (Type, [Type], [Type])
 fromDataconType (ForallT _ _ t) = fromDataconType t
 fromDataconType (ArrowT `AppT` ty `AppT` t) =
   (\(n, typarams, tys) -> (n, typarams, ty : tys)) <$> fromDataconType t
@@ -896,10 +905,11 @@ fromDataconType (MulArrowT `AppT` PromotedT multi `AppT` ty `AppT` t)
   | otherwise = Nothing
 fromDataconType t = (\(n, typarams) -> (n, typarams, [])) <$> extractTypeCon t
 
-extractTypeCon :: Type -> Maybe (Name, [Type])
+extractTypeCon :: Type -> Maybe (Type, [Type])
 extractTypeCon (AppT t arg) = second (++ [arg]) <$> extractTypeCon t
-extractTypeCon (ConT n) = Just (n, [])
-extractTypeCon ListT = Just (''[], [])
+extractTypeCon (ConT n) = Just (ConT n, [])
+extractTypeCon ListT = Just (ConT ''[], [])
+extractTypeCon (TupleT n) = Just (TupleT n, [])
 extractTypeCon _ = Nothing
 
 -- | Given an expression `e`, wraps it in `n` kleisli-lifted lambdas like

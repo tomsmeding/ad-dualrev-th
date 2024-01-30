@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -288,5 +289,18 @@ main =
                       max' x y = if x > y then x else y
                   in unf1 (max' 0 (min' 10 n)) ||])
        (Just (\(_, _) d -> (0, sum d)))
+       YesFD
+    ,checkFDcontrol "tuple sections"
+       $$(reverseADandControl @(Double, Double, Double) @Double
+            [|| \(x, y, z) ->
+                  let (a,b,c) +. (d,e,f) = (a+d, b+e, c+f)
+                      f1 = (y,z,)
+                      f2 = (x,,y)
+                      f3 = (,x,z)
+                      f4 = (,z,)
+                      f5 = (,,)
+                      reduce (a,b,c) = a + b + c
+                  in reduce $ f1 x +. f2 z +. f3 y +. f4 x y +. f5 y z x ||])
+       (Just (\_ d -> (5*d, 5*d, 5*d)))
        YesFD
     ]

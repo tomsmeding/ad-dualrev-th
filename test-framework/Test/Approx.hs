@@ -21,6 +21,12 @@ instance (Approx a, Approx b) => Approx (a, b) where
     approx absdelta reldelta a x &&
       approx absdelta reldelta b y
 
+instance (Approx a, Approx b, Approx c) => Approx (a, b, c) where
+  approx absdelta reldelta (a, b, c) (x, y, z) =
+    approx absdelta reldelta a x &&
+    approx absdelta reldelta b y &&
+    approx absdelta reldelta c z
+
 instance Approx a => Approx [a] where
   approx absdelta reldelta l1 l2 =
     foldr (&&) True (zipWith (approx absdelta reldelta) l1 l2)
