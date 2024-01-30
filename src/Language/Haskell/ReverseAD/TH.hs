@@ -440,6 +440,10 @@ ddr env idName = \case
     (letwrap, [funname, argname], outid) <- ddrList env [e1, e2] idName
     return (letwrap (VarE funname `AppE` VarE argname `AppE` VarE outid))
 
+  -- Handle ($) specially in case the program needs the special type inference (let's hope it does not)
+  InfixE (Just e1) (VarE opname) (Just e2) | opname == '($) ->
+    ddr env idName (AppE e1 e2)
+
   InfixE (Just e1) (VarE opname) (Just e2) -> do
     let handleNum =
           let num = LitE . IntegerL in
