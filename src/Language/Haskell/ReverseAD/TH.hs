@@ -34,6 +34,7 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Applicative (asum)
+import Control.Monad (zipWithM)
 import qualified Data.Array.Mutable.Linear as A
 import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
@@ -586,10 +587,10 @@ ddrList env es idName = do
   -- output varnames of the expressions
   names <- mapM (\idx -> (,) <$> newName ("x" ++ show idx) <*> newName ("i" ++ show idx))
                 [1 .. length es]
+  -- the right-hand sides
+  rhss <- zipWithM (ddr env) (idName : map snd names) es
   -- the let-binding pairs
-  binds <- zipWithM3 (\ni_in (nx, ni_out) e -> do e' <- ddr env ni_in e
-                                                  return ((nx, ni_out), e'))
-                     (idName : map snd names) names es
+  let binds = zip names rhss
   let out_index = case names of
                     [] -> idName
                     l -> snd (last l)
@@ -1076,9 +1077,6 @@ triple e1 e2 e3 = TupE [Just e1, Just e2, Just e3]
 
 notSupported :: MonadFail m => String -> Maybe String -> m a
 notSupported descr mthing = fail $ descr ++ " not supported in reverseAD" ++ maybe "" (": " ++) mthing
-
-zipWithM3 :: Applicative m => (a -> b -> c -> m d) -> [a] -> [b] -> [c] -> m [d]
-zipWithM3 f a b c = traverse (\(x,y,z) -> f x y z) (zip3 a b c)
 
 tvbName :: TyVarBndr () -> Name
 tvbName (PlainTV n _) = n
