@@ -10,7 +10,8 @@
 {-# LANGUAGE RankNTypes #-}
 module Main where
 
-import Control.DeepSeq (deepseq)
+import Control.DeepSeq (force)
+import Control.Exception (evaluate)
 import Control.Monad (when)
 import Criterion
 import Criterion.Types (Config(..))
@@ -116,7 +117,7 @@ main = do
       let run f n =
             let l1 = take (fromIntegral n) [1..]
                 l2 = take (fromIntegral n) [3,5..]
-            in f fdotprod (FDotProd (l1, l2)) `deepseq` return ()
+            in evaluate (force (f fdotprod (FDotProd (l1, l2)))) >> return ()
       in [bench "TH" (toBenchmarkable (run radWithTH))
          ,bench "ad" (toBenchmarkable (run radWithAD))]
     ,bgroup "fsummatvec" $
@@ -124,7 +125,7 @@ main = do
             let n = round (sqrt (fromIntegral n2 :: Double))
                 l1 = take n (blockN n [1..])
                 l2 = take n [3,5..]
-            in f fsummatvec (FSumMatVec (l1, l2)) `deepseq` return ()
+            in evaluate (force (f fsummatvec (FSumMatVec (l1, l2)))) >> return ()
       in [bench "TH" (toBenchmarkable (run radWithTH))
          ,bench "ad" (toBenchmarkable (run radWithAD))]
     ,bgroup "frotvecquat" $
