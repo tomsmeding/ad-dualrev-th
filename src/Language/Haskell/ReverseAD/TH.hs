@@ -3,6 +3,7 @@
 
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveLift #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
@@ -34,18 +35,21 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Applicative (asum)
-import Control.Monad (zipWithM)
+import Control.Monad.Trans.Maybe
+import Control.Monad.Trans.Class (lift)
 import qualified Data.Array.Mutable.Linear as A
 import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
 import Data.Char (isAlphaNum)
 import Data.Foldable (toList)
 import Data.Function ((&))
-import Data.List (tails, zip6, zip4)
+import Data.Graph (stronglyConnComp, SCC(..))
+import Data.List (zip4)
 import Data.Int
 import Data.Proxy
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Typeable
@@ -137,6 +141,28 @@ addContrib :: Int -> Contrib -> Double -> BuildState %1-> BuildState
 addContrib i cb adj arr =
   A.get i arr PL.& \(Ur (_, acc), arr1) ->
     A.set i (cb, acc + adj) arr1
+
+
+-- ------------------------------------------------------------
+-- The monad for the target program
+-- ------------------------------------------------------------
+
+newtype FwdM a = FwdM (Int -> (Int, a))
+  deriving (Functor)
+
+instance Applicative FwdM where
+  pure x = FwdM (\i -> (i, x))
+  FwdM f <*> FwdM g = FwdM $ \i -> let (j, h) = f i in second h (g j)
+
+instance Monad FwdM where
+  FwdM f >>= g = FwdM $ \i -> let (j, x) = f i ; FwdM h = g x in h j
+
+-- Returns highest Id generated plus 1
+runFwdM :: FwdM a -> (Int, a)
+runFwdM (FwdM f) = f 0
+
+fwdmGenId :: FwdM Int
+fwdmGenId = FwdM (\i -> (i + 1, i))
 
 
 -- ------------------------------------------------------------
@@ -345,29 +371,30 @@ transform :: Structure -> Structure -> Exp -> Q Exp
 transform inpStruc outStruc (LamE [pat] expr) = do
   patbound <- boundVars pat
   argvar <- newName "arg"
-  onevar <- newName "one"
   rebuildvar <- newName "rebuild"
-  idvar <- newName "i0"
-  outname <- newName "out"
-  idvar' <- newName "i'"
-  primalname <- newName "primal"
-  dualname <- newName "dual"
-  adjname <- newName "adjoint"
-  stagedvecname <- newName "stagedvec"
+  rebuild'var <- newName "rebuild'"
+  outvar <- newName "out"
+  out'var <- newName "out'"
+  ioutvar <- newName "iout"
+  primalvar <- newName "primal"
+  dualvar <- newName "dual"
+  adjvar <- newName "adjoint"
+  stagedvecvar <- newName "stagedvec"
   [| \ $(varP argvar) ->
-        let $(varP onevar) = 1 :: Int
-            ($(pure pat), $(varP rebuildvar), $(varP idvar)) = $(interleave inpStruc (VarE argvar) onevar)
-            ($(varP outname), $(varP idvar')) = $(ddr patbound idvar expr)
-            ($(varP primalname), $(varP dualname)) = $(deinterleave outStruc (VarE outname))
-        in ($(varE primalname)
-           ,\ $(varP adjname) ->
-                let Ur $(varP stagedvecname) =
-                      A.alloc $(varE idvar')
+        let ($(varP ioutvar), ($(varP outvar), $(varP rebuildvar))) = runFwdM $ do
+              ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
+              $(varP out'var) <- $(ddr patbound expr)
+              pure ($(varE out'var), $(varE rebuild'var))
+            ($(varP primalvar), $(varP dualvar)) = $(deinterleave outStruc (VarE outvar))
+        in ($(varE primalvar)
+           ,\ $(varP adjvar) ->
+                let Ur $(varP stagedvecvar) =
+                      A.alloc $(varE ioutvar)
                               (Contrib [], 0.0)
                               (A.freeze
-                               PL.. resolve $(varE idvar')
-                               PL.. $(varE dualname) $(varE adjname))
-                in $(varE rebuildvar) (V.map snd $(varE stagedvecname))) |]
+                               PL.. resolve $(varE ioutvar)
+                               PL.. $(varE dualvar) $(varE adjvar))
+                in $(varE rebuildvar) (V.map snd $(varE stagedvecvar))) |]
 transform inpStruc outStruc (LamE [] body) =
   transform inpStruc outStruc body
 transform inpStruc outStruc (LamE (pat : pats) body) =
@@ -383,66 +410,49 @@ transform _ _ expr =
 -- Set of names bound in the program at this point
 type Env = Set Name
 
--- Γ |- i : Int                        -- idName
--- Γ |- t : a                          -- expression
--- ~> Dt[Γ] |- D[i, t] : (Dt[a], Int)  -- result
-ddr :: Env -> Name -> Exp -> Q Exp
-ddr env idName = \case
+-- Γ |- t : a                        -- expression
+-- ~> Dt[Γ] |- D[i, t] : FwdM Dt[a]  -- result
+ddr :: Env -> Exp -> Q Exp
+ddr env = \case
   VarE name
-    | name `Set.member` env -> return (pair (VarE name) (VarE idName))
-    | name == 'fromIntegral -> return (pair (VarE 'fromIntegralOp) (VarE idName))
+    | name `Set.member` env -> [| pure $(varE name) |]
+    | name == 'fromIntegral -> [| pure fromIntegralOp |]
     | name == 'negate -> do
         xname <- newName "x"
-        iname <- newName "i"
-        let function = LamE [VarP xname, VarP iname] $
-              foldl AppE (VarE 'applyUnaryOp)
-                [VarE xname
-                ,VarE 'negate
-                ,LamE [WildP] (LitE (IntegerL (-1)))
-                ,VarE iname]
-        return (pair function (VarE idName))
+        [| pure (\ $(varP xname) -> applyUnaryOp $(varE xname) negate (\_ -> (-1))) |]
     | name == 'sqrt -> do
         xname <- newName "x"
-        iname <- newName "i"
-        let bin a op b = InfixE (Just a) (VarE op) (Just b)
-            lit = LitE . IntegerL
-        let function = LamE [VarP xname, VarP iname] $
-              foldl AppE (VarE 'applyUnaryOp)
-                [VarE xname
-                ,VarE 'sqrt
-                ,LamE [VarP xname] (bin (lit 1) '(/) (bin (lit 2) '(*) (AppE (VarE 'sqrt) (VarE xname))))
-                ,VarE iname]
-        return (pair function (VarE idName))
+        pname <- newName "p"
+        [| \ $(varP xname) ->
+              applyUnaryOp $(varE xname) sqrt (\ $(varP pname) -> 1 / (2 * sqrt $(varE pname))) |]
     | name == '($) -> do
         fname <- newName "f"
         xname <- newName "x"
-        ddr env idName (LamE [VarP fname, VarP xname] (AppE (VarE fname) (VarE xname)))
+        ddr env (LamE [VarP fname, VarP xname] (AppE (VarE fname) (VarE xname)))
     | otherwise -> fail $ "Free variables not supported in reverseAD: " ++ show name ++ " (env = " ++ show env ++ ")"
 
   ConE name
     | otherwise -> do
         fieldtys <- checkDatacon name
-        conexpr <- liftKleisliN (length fieldtys) (ConE name)
-        return (pair conexpr (VarE idName))
+        (VarE 'pure `AppE`) <$> liftKleisliN (length fieldtys) (ConE name)
 
   LitE lit -> case lit of
-    RationalL _ -> return (pair (pair (LitE lit)
-                                      (pair (VarE idName) (AppE (ConE 'Contrib) (ListE []))))
-                                (InfixE (Just (VarE idName))
-                                        (VarE '(+))
-                                        (Just (LitE (IntegerL 1)))))
+    RationalL _ -> do
+      iname <- newName "i"
+      [| do $(varP iname) <- fwdmGenId
+            pure ($(litE lit), ($(varE iname), Contrib [])) |]
     FloatPrimL _ -> fail "float prim?"
     DoublePrimL _ -> fail "double prim?"
-    IntegerL _ -> return (pair (LitE lit) (VarE idName))
+    IntegerL _ -> return (VarE 'pure `AppE` LitE lit)
     _ -> fail $ "literal? " ++ show lit
 
   AppE e1 e2 -> do
-    (letwrap, [funname, argname], outid) <- ddrList env [e1, e2] idName
-    return (letwrap (VarE funname `AppE` VarE argname `AppE` VarE outid))
+    (wrap, [funname, argname]) <- ddrList env [e1, e2]
+    return (wrap (VarE funname `AppE` VarE argname))
 
   -- Handle ($) specially in case the program needs the special type inference (let's hope it does not)
   InfixE (Just e1) (VarE opname) (Just e2) | opname == '($) ->
-    ddr env idName (AppE e1 e2)
+    ddr env (AppE e1 e2)
 
   InfixE (Just e1) (VarE opname) (Just e2) -> do
     let handleNum =
@@ -454,104 +464,98 @@ ddr env idName = \case
             & \case
               Nothing -> Nothing
               Just ((gxused, gyused), gradientfun) -> Just $ do
-                (letwrap, [x1name, x2name], outid) <- ddrList env [e1, e2] idName
+                (wrap, [x1name, x2name]) <- ddrList env [e1, e2]
                 t1name <- newName "arg1"
                 t2name <- newName "arg2"
-                return $ letwrap $
+                return $ wrap $
                   foldl AppE (VarE 'applyBinaryOp)
                     [VarE x1name, VarE x2name
                     ,VarE opname
                     ,LamE [if gxused then VarP t1name else WildP
                           ,if gyused then VarP t2name else WildP] $
-                       gradientfun (VarE t1name) (VarE t2name)
-                    ,VarE outid]
+                       gradientfun (VarE t1name) (VarE t2name)]
 
         handleOrd =
           if opname `elem` ['(==), '(/=), '(<), '(>), '(<=), '(>=)]
             then Just $ do
-              (letwrap, [x1name, x2name], outid) <- ddrList env [e1, e2] idName
+              (wrap, [x1name, x2name]) <- ddrList env [e1, e2]
               t1name <- newName "arg1"
               t2name <- newName "arg2"
-              return $ letwrap $
-                pair (foldl AppE (VarE 'applyCmpOp)
-                        [VarE x1name, VarE x2name
-                        ,LamE [VarP t1name, VarP t2name] $
-                           InfixE (Just (VarE t1name)) (VarE opname) (Just (VarE t2name))])
-                     (VarE outid)
+              return $ wrap $ VarE 'pure `AppE`
+                foldl AppE (VarE 'applyCmpOp)
+                  [VarE x1name, VarE x2name
+                  ,LamE [VarP t1name, VarP t2name] $
+                     InfixE (Just (VarE t1name)) (VarE opname) (Just (VarE t2name))]
             else Nothing
 
         handleOther =  -- TODO: can we just put an infix operator in a VarE?
-          Just $ ddr env idName (VarE opname `AppE` e1 `AppE` e2)
+          ddr env (VarE opname `AppE` e1 `AppE` e2)
 
-    case asum [handleNum, handleOrd, handleOther] of
-      Nothing -> fail ("Unsupported infix operator " ++ show opname)
-      Just act -> act
+    fromMaybe handleOther (asum [handleNum, handleOrd])
 
   InfixE (Just e1) (ConE constr) (Just e2) ->
-    ddr env idName (ConE constr `AppE` e1 `AppE` e2)
+    ddr env (ConE constr `AppE` e1 `AppE` e2)
 
   e@InfixE{} -> fail $ "Unsupported operator section: " ++ show e
 
-  ParensE e -> ParensE <$> ddr env idName e
+  ParensE e -> ParensE <$> ddr env e
 
   LamE [pat] e -> do
-    idName1 <- newName "i"
     patbound <- boundVars pat
-    e' <- ddr (env <> patbound) idName1 e
-    return (pair (LamE [pat, VarP idName1] e') (VarE idName))
+    e' <- ddr (env <> patbound) e
+    [| pure (\ $(pure pat) -> $(pure e')) |]
 
   TupE mes | Just es <- sequence mes -> do
-    (letwrap, vars, outid) <- ddrList env es idName
-    return (letwrap (pair (TupE (map (Just . VarE) vars))
-                          (VarE outid)))
+    (wrap, vars) <- ddrList env es
+    return (wrap $ VarE 'pure `AppE` TupE (map (Just . VarE) vars))
 
   CondE e1 e2 e3 -> do
-    e1' <- ddr env idName e1
+    e1' <- ddr env e1
     boolName <- newName "bool"
-    idName1 <- newName "i1"
-    e2' <- ddr env idName1 e2
-    e3' <- ddr env idName1 e3
-    return (LetE [ValD (TupP [VarP boolName, VarP idName1]) (NormalB e1') []]
-              (CondE (VarE boolName) e2' e3'))
+    e2' <- ddr env e2
+    e3' <- ddr env e3
+    return (DoE Nothing
+              [BindS (VarP boolName) e1'
+              ,NoBindS (CondE (VarE boolName) e2' e3')])
 
   LetE decs body -> do
     decs' <- mapM desugarDec decs
-    checkDecsNonRecursive decs' >>= \case
-      Just (map fst3 -> declared) -> do
-        (decs'', idName') <- transDecs (env <> Set.fromList declared) decs' idName
-        body' <- ddr (env <> Set.fromList declared) idName' body
-        return (LetE decs'' body')
-      Nothing -> notSupported "Recursive or non-variable let-bindings" (Just (show (LetE decs' body)))
+    ddrDecs env decs' >>= \case
+      Just (wrap, vars, _) -> do
+        body' <- ddr (env <> Set.fromList vars) body
+        return $ wrap body'
+      Nothing ->
+        notSupported "Recursive non-function declarations in let" (Just (show (LetE decs body)))
 
   CaseE expr matches -> do
-    (letwrap, [evar], outid) <- ddrList env [expr] idName
+    (wrap, [evar]) <- ddrList env [expr]
     matches' <- sequence
       [case mat of
          Match pat (NormalB rhs) [] -> do
            patbound <- boundVars pat
            pat' <- ddrPat pat
-           rhs' <- ddr (env <> patbound) outid rhs
+           rhs' <- ddr (env <> patbound) rhs
            return (pat', rhs')
          _ -> fail "Where blocks or guards not supported in case expressions"
       | mat <- matches]
-    return $ letwrap $
+    return $ wrap $
       CaseE (VarE evar)
         [Match pat (NormalB rhs) [] | (pat, rhs) <- matches']
 
   ListE es -> do
-    (letwrap, vars, outid) <- ddrList env es idName
-    return (letwrap (pair (ListE (map VarE vars))
-                          (VarE outid)))
+    (wrap, vars) <- ddrList env es
+    return (wrap (VarE 'pure `AppE` ListE (map VarE vars)))
 
   UnboundVarE n -> fail $ "Free variable in reverseAD: " ++ show n
 
   -- Constructs that we can express in terms of other, simpler constructs handled above
-  LamE [] e -> ddr env idName e  -- is this even a valid AST?
-  LamE (pat : pats@(_:_)) e -> ddr env idName (LamE [pat] (LamE pats e))
+  LamE [] e -> ddr env e  -- is this even a valid AST?
+  LamE (pat : pats@(_:_)) e -> ddr env (LamE [pat] (LamE pats e))
   LamCaseE mats -> do
     name <- newName "lcarg"
-    ddr env idName (LamE [VarP name] (CaseE (VarE name) mats))
+    ddr env (LamE [VarP name] (CaseE (VarE name) mats))
 
+  -- tuple sections (these were excluded by the TupE case above)
   TupE mes -> do
     let trav _ [] argsf esf = return (argsf [], esf [])
         trav i (Nothing : mes') argsf esf = do
@@ -561,7 +565,7 @@ ddr env idName = \case
           trav i mes' argsf (esf . (e :))
 
     (args, es) <- trav 1 mes id id
-    ddr env idName (LamE (map VarP args) (TupE (map Just es)))
+    ddr env (LamE (map VarP args) (TupE (map Just es)))
 
   -- Unsupported constructs
   e@AppTypeE{} -> notSupported "Type applications" (Just (show e))
@@ -581,27 +585,77 @@ ddr env idName = \case
   e@ImplicitParamVarE{} -> notSupported "Implicit parameters" (Just (show e))
   e@GetFieldE{} -> notSupported "Records" (Just (show e))
   e@ProjectionE{} -> notSupported "Records" (Just (show e))
+  e@LamCasesE{} -> notSupported "\\cases" (Just (show e))
 
--- | Given list of expressions and the input ID, returns a let-wrapper that
--- defines a variable for each item in the list (differentiated), the names of
--- those variables, and the output ID name (in scope in the let-wrapper).
+-- | Given list of expressions, returns a wrapper that defines a variable for
+-- each item in the list (differentiated), together with a list of the names of
+-- those variables.
 -- The expressions must all have the same, given, environment.
-ddrList :: Env -> [Exp] -> Name -> Q (Exp -> Exp, [Name], Name)
-ddrList env es idName = do
-  -- output varnames of the expressions
-  names <- mapM (\idx -> (,) <$> newName ("x" ++ show idx) <*> newName ("i" ++ show idx))
-                [1 .. length es]
-  -- the right-hand sides
-  rhss <- zipWithM (ddr env) (idName : map snd names) es
-  -- the let-binding pairs
-  let binds = zip names rhss
-  let out_index = case names of
-                    [] -> idName
-                    l -> snd (last l)
-  return (LetE [ValD (TupP [VarP nx, VarP ni]) (NormalB e) []
-               | ((nx, ni), e) <- binds]
-         ,map fst names
-         ,out_index)
+ddrList :: Env -> [Exp] -> Q (Exp -> Exp, [Name])
+ddrList env es = do
+  names <- mapM (\idx -> newName ("x" ++ show idx)) [1 .. length es]
+  rhss <- mapM (ddr env) es
+  return (\rest ->
+            DoE Nothing $ [BindS (VarP nx) e | (nx, e) <- zip names rhss] ++ [NoBindS rest]
+         ,names)
+
+-- | Assumes the declarations occur in a let block. If non-recursive (apart
+-- from function bindings), returns a wrapper that defines all of the names,
+-- the list of defined names, and the set of all free variables of the
+-- collective let-block.
+ddrDecs :: Env -> [Dec] -> Q (Maybe (Exp -> Exp, [Name], Set Name))
+ddrDecs env decs = do
+  bindings <- flip traverse decs $ \case
+    ValD (VarP name) (NormalB e) [] -> return (name, e)
+    dec -> notSupported "Declaration in let" (Just (show dec))
+
+  let extendedEnv = env <> Set.fromList (map fst bindings)
+
+  let processDec :: Dec -> Q (Name, Set Name, Exp)
+      processDec = \case
+        ValD (VarP name) (NormalB e) [] -> (name,,e) <$> freeVars extendedEnv e
+        dec -> fail $ "Unsupported declaration in let: " ++ show dec
+
+      fromLam :: Exp -> Maybe (Pat, Exp)
+      fromLam (LamE (p : vs) e) = Just (p, LamE vs e)
+      fromLam (LamE [] e) = fromLam e
+      fromLam (ParensE e) = fromLam e
+      fromLam _ = Nothing
+
+      handleComp :: Env -> SCC (Name, Exp) -> MaybeT Q Stmt
+      handleComp env' (AcyclicSCC (name, e)) = BindS (VarP name) <$> lift (ddr env' e)
+      handleComp env' (CyclicSCC (unzip -> (names, es)))
+        | Just (unzip -> (pats, bodies)) <- traverse fromLam es = lift $ do
+            bounds <- traverse boundVars pats
+            bodies' <- traverse
+                         (\(bound, body) -> ddr (env' <> Set.fromList names <> bound) body)
+                         (zip bounds bodies)
+            pure $ LetS [ValD (VarP name) (NormalB (LamE [pat] body)) []
+                        | (name, pat, body) <- zip3 names pats bodies']
+        | otherwise =
+            MaybeT (return Nothing)
+
+      handleComps :: Env -> [SCC (Name, Exp)] -> MaybeT Q [Stmt]
+      handleComps _ [] = return []
+      handleComps env' (comp : comps) = do
+        let bound = case comp of
+                      AcyclicSCC (name, _) -> [name]
+                      CyclicSCC ps -> map fst ps
+        stmt <- handleComp env' comp
+        stmts <- handleComps (env' <> Set.fromList bound) comps
+        return (stmt : stmts)
+
+  tups <- mapM processDec decs
+  let sccs = stronglyConnComp (map (\(name, frees, e) -> ((name, e), name, toList frees)) tups)
+  mstmts <- runMaybeT $ handleComps env sccs
+  let declared = map fst3 tups
+
+  case mstmts of
+    Nothing -> return Nothing
+    Just stmts -> return $ Just
+                    (\rest -> DoE Nothing $ stmts ++ [NoBindS rest]
+                    ,declared
+                    ,Set.unions [frees | (_, frees, _) <- tups] Set.\\ Set.fromList declared)
 
 ddrPat :: Pat -> Q Pat
 ddrPat = \case
@@ -637,58 +691,64 @@ ddrPat = \case
 -- ----------------------------------------------------------------------
 
 -- input :: a
--- nextid :: Name Int
--- result :: (Dt[a], Vector Double -> a, Int)
-interleave :: Quote m => Structure -> Exp -> Name -> m Exp
-interleave (Structure monotype dtypemap) input nextid = do
-  let dtypes = Map.keys dtypemap
+-- result :: FwdM (Dt[a], Vector Double -> a)
+interleave :: Quote m => Structure -> Exp -> m Exp
+interleave (Structure monotype dtypemap) input = do
   helpernames <- Map.fromAscList <$>
                    sequence [((n, ts),) <$> newName (genDataNameTag "inter" n ts)
-                            | (n, ts) <- dtypes]
+                            | (n, ts) <- Map.keys dtypemap]
   helperfuns <- sequence [(helpernames Map.! (n, ts),) <$> interleaveData helpernames constrs
                          | ((n, ts), constrs) <- Map.assocs dtypemap]
   mainfun <- interleaveType helpernames monotype
   return $ LetE [ValD (VarP name) (NormalB fun) []
                 | (name, fun) <- helperfuns] $
-             mainfun `AppE` input `AppE` VarE nextid
+             mainfun `AppE` input
 
 -- Given constructors of type T, returns expression of type
--- 'T -> Int -> (Dt[T], Vector Double -> T, Int)'. The Map contains for each
+-- 'T -> (Dt[T], Vector Double -> T)'. The Map contains for each
 -- (type name T', type arguments As') combination that occurs (transitively) in
 -- T, the name of a function with type
--- 'T' As' -> Int -> (Dt[T' As'], Vector Double -> T' As', Int)'.
+-- 'T' As' -> (Dt[T' As'], Vector Double -> T' As')'.
 interleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
 interleaveData helpernames constrs = do
   inputvar <- newName "input"
-  idvar0 <- newName "i0"
   let maxn = maximum (map (length . snd) constrs)
   allinpvars     <- mapM (\i -> newName ("inp"  ++ show i)) [1..maxn]
   allpostvars    <- mapM (\i -> newName ("inp'" ++ show i)) [1..maxn]
   allrebuildvars <- mapM (\i -> newName ("reb"  ++ show i)) [1..maxn]
-  allidvars      <- mapM (\i -> newName ("i"    ++ show i)) [1..maxn]
-  -- These have the inpvars and idvar0 in scope.
+  -- These have the inpvars in scope.
   bodies <- sequence
-    [do let inpvars = take (length fieldtys) allinpvars
+    [do -- For constructor C f₁…f₃:
+        --   do (post₁, rebuild₁) <- $(interleaveType helpernames f₁) inp₁
+        --      (post₂, rebuild₂) <- $(interleaveType helpernames f₂) inp₂
+        --      (post₃, rebuild₃) <- $(interleaveType helpernames f₃) inp₃
+        --      pure (C post₁ post₂ post₃
+        --           ,\arr -> C (rebuild₁ arr) (rebuild₂ arr) (rebuild₃ arr))
+        --
+        -- interleaveType helpernames (Monotype for T) :: Exp (T -> FwdM (Dt[T], Vector Double -> T))
+        let inpvars = take (length fieldtys) allinpvars
             postvars = take (length fieldtys) allpostvars
             rebuildvars = take (length fieldtys) allrebuildvars
-            idvars = take (length fieldtys) allidvars
-        let finalidvar = case idvars of [] -> idvar0 ; _ -> last idvars
-        -- interleaveType helpernames (MonoType T) :: Exp (T -> Int -> (Dt[T], Vector Double -> T, Int))
         exps <- mapM (interleaveType helpernames) fieldtys
         arrname <- newName "arr"
-        return $ LetE [ValD (TupP [VarP postvar, VarP rebuildvar, VarP outidvar])
-                            (NormalB (expr `AppE` VarE inpvar `AppE` VarE inidvar))
-                            []
-                      | (inpvar, postvar, rebuildvar, inidvar, outidvar, expr)
-                           <- zip6 inpvars postvars rebuildvars (idvar0 : idvars) idvars exps] $
-                   triple (foldl AppE (ConE conname) (map VarE postvars))
-                          (LamE [if null rebuildvars then WildP else VarP arrname] $
-                             foldl AppE (ConE conname)
-                                   [VarE f `AppE` VarE arrname | f <- rebuildvars])
-                          (VarE finalidvar)
+        return $ DoE Nothing $
+          [BindS (TupP [VarP postvar, VarP rebuildvar])
+                 (expr `AppE` VarE inpvar)
+          | (inpvar, postvar, rebuildvar, expr)
+               <- zip4 inpvars postvars rebuildvars exps]
+          ++
+          [NoBindS $ VarE 'pure `AppE`
+              pair (foldl AppE (ConE conname) (map VarE postvars))
+                   (LamE [if null rebuildvars then WildP else VarP arrname] $
+                      foldl AppE (ConE conname)
+                            [VarE f `AppE` VarE arrname | f <- rebuildvars])]
     | (conname, fieldtys) <- constrs]
 
-  return $ LamE [VarP inputvar, VarP idvar0] $ CaseE (VarE inputvar)
+  -- \input -> case input of
+  --   C₁ inp₁ inp₂ inp₃ -> $(bodies !! 0)
+  --   C₂ inp₁ inp₂      -> $(bodies !! 1)
+  --   C₃ inp₁ inp₂ inp₃ -> $(bodies !! 2)
+  return $ LamE [VarP inputvar] $ CaseE (VarE inputvar)
     [Match (ConP conname [] (map VarP inpvars))
            (NormalB body)
            []
@@ -696,28 +756,24 @@ interleaveData helpernames constrs = do
     , let inpvars = take (length fieldtys) allinpvars]
 
 -- Given a type T, returns expression of type
--- 'T -> Int -> (Dt[T], Vector Double -> T, Int)'. The Map contains for each
+-- 'T -> FwdM (Dt[T], Vector Double -> T)'. The Map contains for each
 -- (type name T', type arguments As') combination that occurs in the type, the
 -- name of a function with type
--- 'T' As' -> Int -> (Dt[T' As'], Vector Double -> T' As', Int)'.
+-- 'T' As' -> FwdM (Dt[T' As'], Vector Double -> T' As')'.
 interleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
 interleaveType helpernames = \case
   DiscreteST -> do
     inpxvar <- newName "inpx"
-    ivar <- newName "i"
-    return $ LamE [VarP inpxvar, VarP ivar] $
-      triple (VarE inpxvar) (LamE [WildP] (VarE inpxvar)) (VarE ivar)
+    [| \ $(varP inpxvar) -> pure ($(varE inpxvar), \_ -> $(varE inpxvar)) |]
 
   ScalarST -> do
     inpxvar <- newName "inpx"
     ivar <- newName "i"
     arrvar <- newName "arr"
-    return $ LamE [VarP inpxvar, VarP ivar] $
-      triple (pair (VarE inpxvar)
-                   (pair (VarE ivar)
-                         (ConE 'Contrib `AppE` ListE [])))
-             (LamE [VarP arrvar] (InfixE (Just (VarE arrvar)) (VarE '(V.!)) (Just (VarE ivar))))
-             (InfixE (Just (VarE ivar)) (VarE '(+)) (Just (LitE (IntegerL 1))))
+    [| \ $(varP inpxvar) -> do
+           $(varP ivar) <- fwdmGenId
+           pure (($(varE inpxvar), ($(varE ivar), Contrib []))
+                ,\ $(varP arrvar) -> $(varE arrvar) V.! $(varE ivar)) |]
 
   ConST tyname argtys ->
     return $ VarE $ case Map.lookup (tyname, argtys) helpernames of
@@ -835,14 +891,12 @@ class NumOperation a where
     :: DualNum a -> DualNum a  -- arguments
     -> (a -> a -> a)           -- primal
     -> (a -> a -> (a, a))      -- gradient given inputs (assuming adjoint 1)
-    -> Int                     -- nextid
-    -> (DualNum a, Int)        -- output and nextid
+    -> FwdM (DualNum a)        -- output
   applyUnaryOp
     :: DualNum a               -- argument
     -> (a -> a)                -- primal
     -> (a -> a)                -- derivative given input (assuming adjoint 1)
-    -> Int                     -- nextid
-    -> (DualNum a, Int)        -- output and nextid
+    -> FwdM (DualNum a)        -- output
   applyCmpOp
     :: DualNum a -> DualNum a  -- arguments
     -> (a -> a -> Bool)        -- primal
@@ -850,28 +904,28 @@ class NumOperation a where
   fromIntegralOp
     :: Integral b
     => b                       -- argument
-    -> Int                     -- nextid
-    -> (DualNum a, Int)        -- output and nextid
+    -> FwdM (DualNum a)        -- output
 
 instance NumOperation Double where
   type DualNum Double = (Double, (Int, Contrib))
-  applyBinaryOp (x, (xi, xcb)) (y, (yi, ycb)) primal grad nextid =
+  applyBinaryOp (x, (xi, xcb)) (y, (yi, ycb)) primal grad = do
     let (dx, dy) = grad x y
-    in ((primal x y
-        ,(nextid
-         ,Contrib [(xi, xcb, dx), (yi, ycb, dy)]))
-       ,nextid + 1)
-  applyUnaryOp (x, (xi, xcb)) primal grad nextid =
-    ((primal x, (nextid, Contrib [(xi, xcb, grad x)])), nextid + 1)
+    i <- fwdmGenId
+    pure (primal x y, (i, Contrib [(xi, xcb, dx), (yi, ycb, dy)]))
+  applyUnaryOp (x, (xi, xcb)) primal grad = do
+    i <- fwdmGenId
+    pure (primal x, (i, Contrib [(xi, xcb, grad x)]))
   applyCmpOp (x, _) (y, _) f = f x y
-  fromIntegralOp x nextid = ((fromIntegral x, (nextid, Contrib [])), nextid + 1)
+  fromIntegralOp x = do
+    i <- fwdmGenId
+    pure (fromIntegral x, (i, Contrib []))
 
 instance NumOperation Int where
   type DualNum Int = Int
-  applyBinaryOp x y primal _ nextid = (primal x y, nextid)
-  applyUnaryOp x primal _ nextid = (primal x, nextid)
+  applyBinaryOp x y primal _ = pure (primal x y)
+  applyUnaryOp x primal _ = pure (primal x)
   applyCmpOp x y f = f x y
-  fromIntegralOp x nextid = (fromIntegral x, nextid)
+  fromIntegralOp x = pure (fromIntegral x)
 
 
 -- ----------------------------------------------------------------------
@@ -919,14 +973,12 @@ extractTypeCon _ = Nothing
 
 -- | Given an expression `e`, wraps it in `n` kleisli-lifted lambdas like
 --
--- > \x1 i1 -> (\x2 i2 -> (... \xn in -> (e x1 ... xn, in), i2), i1)
+-- > \x1 -> pure (\x2 -> pure (... \xn -> pure (e x1 ... xn)))
 liftKleisliN :: Int -> Exp -> Q Exp
 liftKleisliN 0 e = return e
 liftKleisliN n e = do
   name <- newName "x"
-  e' <- liftKleisliN (n - 1) (AppE e (VarE name))
-  iname <- newName "i"
-  return (LamE [VarP name, VarP iname] $ pair e' (VarE iname))
+  [| \ $(varP name) -> pure $(liftKleisliN (n - 1) (e `AppE` VarE name)) |]
 
 -- Convert function declarations to simple variable declarations:
 --   f a b c = E
@@ -964,83 +1016,52 @@ desugarDec = \case
     allEqual [] = True
     allEqual (x:xs) = all (== x) xs
 
--- | Differentiate a declaration, given a variable containing the next ID to
--- generate. Modifies the declaration to bind the next ID to a new name, which
--- is returned.
-transDec :: Env -> Dec -> Name -> Q (Dec, Name)
-transDec env dec idName = case dec of
-  ValD (VarP name) (NormalB body) [] -> do
-    idName1 <- newName "i"
-    body' <- ddr env idName body
-    return (ValD (TupP [VarP name, VarP idName1]) (NormalB body') [], idName1)
-
-  _ -> fail $ "How did this declaration get through desugaring? " ++ show dec
-
--- | `sequence 'transDec'`
-transDecs :: Env -> [Dec] -> Name -> Q ([Dec], Name)
-transDecs _ [] n = return ([], n)
-transDecs env (d : ds) n = do
-  (d', n') <- transDec env d n
-  (ds', n'') <- transDecs env ds n'
-  return (d' : ds', n'')
-
--- | If these declarations occur in a let block, check that all dependencies go
--- backwards, i.e. it would be valid to replace the let block with a chain of
--- single-dec lets. If non-recursive, returns, for each variable defined: the
--- name, the free variables of its right-hand side, and its right-hand side.
-checkDecsNonRecursive :: MonadFail m => [Dec] -> m (Maybe [(Name, Set Name, Exp)])
-checkDecsNonRecursive decs = do
-  let processDec :: MonadFail m => Dec -> m (Name, Set Name, Exp)
-      processDec = \case
-        ValD (VarP name) (NormalB e) [] -> (name,,e) <$> freeVars e
-        dec -> fail $ "Unsupported declaration in let: " ++ show dec
-  tups <- mapM processDec decs
-  -- TODO: mild quadratic behaviour with this notElem
-  let nonRecursive :: [Name] -> Set Name -> Bool
-      nonRecursive boundAfterThis frees = all (\name -> name `notElem` boundAfterThis) (toList frees)
-  if all (\((_, frees, rhs), boundAfterThis) ->
-            case rhs of LamE (_:_) _ -> True  -- mutually recursive _functions_ are fine
-                        _ -> nonRecursive boundAfterThis frees)
-         (zip tups (tail (tails (map fst3 tups))))
-    then return (Just tups)
-    else return Nothing
-
-freeVars :: MonadFail m => Exp -> m (Set Name)
-freeVars = \case
+freeVars :: Env -> Exp -> Q (Set Name)
+freeVars env = \case
   VarE n -> return (Set.singleton n)
   ConE{} -> return mempty
   LitE{} -> return mempty
-  AppE e1 e2 -> (<>) <$> freeVars e1 <*> freeVars e2
-  AppTypeE e1 _ -> freeVars e1
-  InfixE me1 e2 me3 -> combine [maybe (return mempty) freeVars me1
-                               ,freeVars e2
-                               ,maybe (return mempty) freeVars me3]
+  AppE e1 e2 -> (<>) <$> freeVars env e1 <*> freeVars env e2
+  AppTypeE e1 _ -> freeVars env e1
+  InfixE me1 e2 me3 -> combine [maybe (return mempty) (freeVars env) me1
+                               ,freeVars env e2
+                               ,maybe (return mempty) (freeVars env) me3]
   e@UInfixE{} -> notSupported "UInfixE" (Just (show e))
-  ParensE e -> freeVars e
-  LamE pats e -> (Set.\\) <$> freeVars e <*> combine (map boundVars pats)
-  LamCaseE mats -> combine [case mat of
-                              Match pat (NormalB e) [] -> (Set.\\) <$> freeVars e <*> boundVars pat
-                              _ -> fail $ "Unsupported pattern in LambdaCase (neither guards nor where-blocks supported): " ++ show mat
-                           | mat <- mats]
-  TupE es -> combine (map (maybe (return mempty) freeVars) es)
-  UnboxedTupE es -> combine (map (maybe (return mempty) freeVars) es)
+  ParensE e -> freeVars env e
+  LamE pats e -> do
+    bound <- combine (map boundVars pats)
+    frees <- freeVars (env <> bound) e
+    return (frees Set.\\ bound)
+  LamCaseE mats ->
+    combine [case mat of
+               Match pat (NormalB e) [] -> do
+                 bound <- boundVars pat
+                 frees <- freeVars (env <> bound) e
+                 return (frees Set.\\ bound)
+               _ -> notSupported "Pattern in LambdaCase (neither guards nor where-blocks supported)" (Just (show mat))
+            | mat <- mats]
+  TupE es -> combine (map (maybe (return mempty) (freeVars env)) es)
+  UnboxedTupE es -> combine (map (maybe (return mempty) (freeVars env)) es)
   e@UnboxedSumE{} -> notSupported "Unboxed sums" (Just (show e))
-  CondE e1 e2 e3 -> combine (map freeVars [e1, e2, e3])
+  CondE e1 e2 e3 -> combine (map (freeVars env) [e1, e2, e3])
   e@MultiIfE{} -> notSupported "Multi-way ifs" (Just (show e))
   LetE decs body -> do
-    checkDecsNonRecursive decs >>= \case
-        Just tups -> (Set.\\) <$> freeVars body <*> pure (Set.fromList (map fst3 tups))
-        Nothing -> fail $ "Recursive declarations in let unsupported: " ++ show (LetE decs body)
-  CaseE e ms -> (<>) <$> freeVars e <*> combine (map go ms)
-    where go :: MonadFail m => Match -> m (Set Name)
-          go (Match pat (NormalB rhs) []) = (Set.\\) <$> freeVars rhs <*> boundVars pat
+    ddrDecs env decs >>= \case
+      Just (_, _, frees) -> return frees
+      Nothing -> notSupported "Recursive declarations in let" (Just (show (LetE decs body)))
+  CaseE e ms -> (<>) <$> freeVars env e <*> combine (map go ms)
+    where go :: Match -> Q (Set Name)
+          go (Match pat (NormalB rhs) []) = do
+            bound <- boundVars pat
+            frees <- freeVars (env <> bound) rhs
+            return (frees Set.\\ bound)
           go mat = fail $ "Unsupported match in case: " ++ show mat
   e@DoE{} -> notSupported "Do blocks" (Just (show e))
   e@MDoE{} -> notSupported "MDo blocks" (Just (show e))
   e@CompE{} -> notSupported "List comprehensions" (Just (show e))
   e@ArithSeqE{} -> notSupported "Arithmetic sequences" (Just (show e))
-  ListE es -> combine (map freeVars es)
-  SigE e _ -> freeVars e
+  ListE es -> combine (map (freeVars env) es)
+  SigE e _ -> freeVars env e
   e@RecConE{} -> notSupported "Records" (Just (show e))
   e@RecUpdE{} -> notSupported "Records" (Just (show e))
   e@StaticE{} -> notSupported "Cloud Haskell" (Just (show e))
@@ -1049,6 +1070,7 @@ freeVars = \case
   e@ImplicitParamVarE{} -> notSupported "Implicit parameters" (Just (show e))
   e@GetFieldE{} -> notSupported "Records" (Just (show e))
   e@ProjectionE{} -> notSupported "Records" (Just (show e))
+  e@LamCasesE{} -> notSupported "\\cases" (Just (show e))
 
 boundVars :: MonadFail m => Pat -> m (Set Name)
 boundVars = \case
@@ -1075,9 +1097,6 @@ combine = fmap mconcat . sequence
 
 pair :: Exp -> Exp -> Exp
 pair e1 e2 = TupE [Just e1, Just e2]
-
-triple :: Exp -> Exp -> Exp -> Exp
-triple e1 e2 e3 = TupE [Just e1, Just e2, Just e3]
 
 notSupported :: MonadFail m => String -> Maybe String -> m a
 notSupported descr mthing = fail $ descr ++ " not supported in reverseAD" ++ maybe "" (": " ++) mthing

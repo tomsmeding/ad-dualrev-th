@@ -4,6 +4,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 module Main where
 
@@ -22,6 +23,7 @@ import Test.Framework hiding (elements, scale)
 import Types
 
 
+-- redefine this with a restricted type
 (^) :: Num a => a -> Int -> a
 (^) = (Prelude.^)
 
@@ -172,6 +174,13 @@ main =
        $$(reverseADandControl @Double @Double
             [|| \x0 -> let f = \x -> if x < 10.0 then g (x * 0.6) + 1.0 else g (x * 0.1) + 2.0
                            g = \x -> if x < 1.0 then x else f (x - 1.0) + 2.0
+                       in f x0 ||])
+       Nothing
+       NoFD
+    ,checkFDcontrol "recursive2"
+       $$(reverseADandControl @Double @Double
+            [|| \x0 -> let f x = if x < 10.0 then g (x * 0.6) + 1.0 else g (x * 0.1) + 2.0
+                           g x = if x < 1.0 then x else f (x - 1.0) + 2.0
                        in f x0 ||])
        Nothing
        NoFD

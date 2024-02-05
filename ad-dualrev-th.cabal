@@ -24,6 +24,7 @@ source-repository head
 library
   exposed-modules:
     Language.Haskell.ReverseAD.TH
+    Language.Haskell.ReverseAD.TH.Compat
     Language.Haskell.ReverseAD.TH.Orphans
   hs-source-dirs:
     src
@@ -36,6 +37,7 @@ library
     , mtl
     , some
     , template-haskell
+    , transformers
     , vector
   default-language: Haskell2010
 
@@ -62,7 +64,7 @@ test-suite test
     FinDiff
     ForwardAD
     Types
-  ghc-options: -Wall -O2 -threaded -rtsopts
+  ghc-options: -Wall -O2 -threaded -rtsopts -ddump-splices
   build-depends:
       base
     , ad-dualrev-th
