@@ -71,12 +71,14 @@ frotvecquat = $$(makeFunction
 data Options = Options
   { argsPatternsRev :: [String]
   , argsOutput :: Maybe FilePath
-  , argsHelp :: Bool }
+  , argsHelp :: Bool
+  , argsNoTest :: Bool }
   deriving (Show)
 
 parseArgs :: [String] -> Options -> Either String Options
 parseArgs [] a = return a
 parseArgs ("-o" : path : ss) a = parseArgs ss (a { argsOutput = Just path })
+parseArgs ("--notest" : ss) a = parseArgs ss (a { argsNoTest = True })
 parseArgs ("-h" : _) a = return $ a { argsHelp = True }
 parseArgs ("--help" : _) a = return $ a { argsHelp = True }
 parseArgs ("" : _) _ = Left "Unexpected empty argument"
@@ -86,26 +88,27 @@ parseArgs (s : _) _ = Left ("Unrecognised argument '" ++ s ++ "'")
 
 main :: IO ()
 main = do
-  options <- getArgs >>= \args -> case parseArgs args (Options [] Nothing False) of
+  options <- getArgs >>= \args -> case parseArgs args (Options [] Nothing False False) of
                Left err -> die err
                Right opts -> return opts
 
   when (argsHelp options) $ do
-    putStrLn "Usage: bench [-o <criterion-output.html>] [test patterns...]"
+    putStrLn "Usage: bench [-o <criterion-output.html>] [--notest] [test patterns...]"
     exitSuccess
 
-  checksOK <- runTestsPatterns (reverse (argsPatternsRev options)) $
-    tree "correctness"
-      [changeArgs (\args -> args { maxSuccess = 50000 }) $
-       tree "fast"
-         [property "fmult" (\x -> radWithTH fmult x ~= radWithAD fmult x)
-         ,property "fdotprod" (\x -> radWithTH fdotprod x ~= radWithAD fdotprod x)
-         ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)]
-      ,changeArgs (\args -> args { maxSuccess = 5000 }) $
-       tree "slow"
-         [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)]]
+  when (not (argsNoTest options)) $ do
+    checksOK <- runTestsPatterns (reverse (argsPatternsRev options)) $
+      tree "correctness"
+        [changeArgs (\args -> args { maxSuccess = 50000 }) $
+         tree "fast"
+           [property "fmult" (\x -> radWithTH fmult x ~= radWithAD fmult x)
+           ,property "fdotprod" (\x -> radWithTH fdotprod x ~= radWithAD fdotprod x)
+           ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)]
+        ,changeArgs (\args -> args { maxSuccess = 5000 }) $
+         tree "slow"
+           [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)]]
 
-  when (not checksOK) exitFailure
+    when (not checksOK) exitFailure
 
   let crconfig = Criterion.defaultConfig { reportFile = argsOutput options }
   Criterion.runMode
