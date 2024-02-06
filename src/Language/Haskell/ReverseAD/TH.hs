@@ -437,6 +437,16 @@ ddr env = \case
         pname <- newName "p"
         [| pure (\ $(varP xname) ->
               applyUnaryOp $(varE xname) log (\ $(varP pname) -> 1 / $(varE pname))) |]
+    | name == 'sin -> do
+        xname <- newName "x"
+        pname <- newName "p"
+        [| pure (\ $(varP xname) ->
+              applyUnaryOp $(varE xname) sin (\ $(varP pname) -> cos $(varE pname))) |]
+    | name == 'cos -> do
+        xname <- newName "x"
+        pname <- newName "p"
+        [| pure (\ $(varP xname) ->
+              applyUnaryOp $(varE xname) cos (\ $(varP pname) -> - sin $(varE pname))) |]
     | name == '($) -> do
         fname <- newName "f"
         xname <- newName "x"
@@ -446,11 +456,13 @@ ddr env = \case
         gname <- newName "g"
         xname <- newName "x"
         ddr env (LamE [VarP fname, VarP gname, VarP xname] (AppE (VarE fname) (AppE (VarE gname) (VarE xname))))
-    | name `elem` ['(+), '(-), '(*)] -> do
+    | name `elem` ['(+), '(-), '(*), '(/)] -> do
         xname <- newName "x"
         yname <- newName "y"
         ddr env (LamE [VarP xname, VarP yname] (InfixE (Just (VarE xname)) (VarE name) (Just (VarE yname))))
     | name == 'error -> [| pure error |]
+    | name == 'fst -> [| pure (pure . fst) |]
+    | name == 'snd -> [| pure (pure . snd) |]
     | otherwise -> fail $ "Free variables not supported in reverseAD: " ++ show name ++ " (env = " ++ show env ++ ")"
 
   ConE name
@@ -479,10 +491,10 @@ ddr env = \case
 
   InfixE (Just e1) (VarE opname) (Just e2) -> do
     let handleNum =
-          let num = LitE . IntegerL in
-          if | opname == '(+) -> Just ((False, False), \_ _ -> pair (num 1) (num 1))
-             | opname == '(-) -> Just ((False, False), \_ _ -> pair (num 1) (num (-1)))
-             | opname == '(*) -> Just ((True, True), \x y -> pair y x)
+          if | opname == '(+) -> Just ((False, False), \_ _ -> [| (1, 1) |])
+             | opname == '(-) -> Just ((False, False), \_ _ -> [| (1, (-1)) |])
+             | opname == '(*) -> Just ((True, True), \x y -> [| ($y, $x) |])
+             | opname == '(/) -> Just ((True, True), \x y -> [| (recip $y, (- $x) / ($y * $y)) |])
              | otherwise -> Nothing
             & \case
               Nothing -> Nothing
@@ -490,13 +502,12 @@ ddr env = \case
                 (wrap, [x1name, x2name]) <- ddrList env [e1, e2]
                 t1name <- newName "arg1"
                 t2name <- newName "arg2"
-                return $ wrap $
-                  foldl AppE (VarE 'applyBinaryOp)
-                    [VarE x1name, VarE x2name
-                    ,VarE opname
-                    ,LamE [if gxused then VarP t1name else WildP
-                          ,if gyused then VarP t2name else WildP] $
-                       gradientfun (VarE t1name) (VarE t2name)]
+                wrap <$>
+                  [| applyBinaryOp
+                       $(varE x1name) $(varE x2name) $(varE opname)
+                       (\ $(if gxused then varP t1name else wildP)
+                          $(if gyused then varP t2name else wildP) ->
+                            $(gradientfun (varE t1name) (varE t2name))) |]
 
         handleOrd =
           if opname `elem` ['(==), '(/=), '(<), '(>), '(<=), '(>=)]
