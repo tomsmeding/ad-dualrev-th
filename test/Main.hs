@@ -15,6 +15,8 @@ import Data.Monoid (Sum(..))
 import Data.Proxy
 import Data.Type.Equality
 
+import Language.Haskell.ReverseAD.TH ((|*|))
+
 import ControlFun
 import FinDiff
 import ForwardAD
@@ -432,6 +434,26 @@ main =
                       reduce (a,b,c) = a + b + c
                   in reduce $ f1 x +. f2 z +. f3 y +. f4 x y +. f5 y z x ||])
        (Just (\_ d -> (5*d, 5*d, 5*d)))
+       YesFD] ++
+
+    [changeArgs (\a -> a { maxSuccess = 1000 }) $
+     checkFDcontrol "parallel"
+       $$(reverseADandControl @(Double, Double) @Double
+            [|| \(x, y) ->
+                  let rotate (a, b) i =
+                        if i <= 0
+                          then (a, b)
+                          else let ang = 0.1 + 0.05 * sin (fromIntegral i)
+                               in rotate (a * cos ang - b * sin ang
+                                         ,a * sin ang + b * cos ang)
+                                         (i - 1)
+                      n = 300 :: Int
+                      out = rotate (x, y) n |*| rotate (y, x) n
+                  in case out of
+                       ((a1, b1), (a2, b2)) -> a1 + b1 + a2 + b2 ||])
+       (Just (\_ d ->
+                let ang = 300 * 0.1 + 0.05 * sum [sin (fromIntegral i) | i <- [1::Int .. 300]]
+                in (d * 2 * cos ang, d * 2 * cos ang)))
        YesFD] ++
 
     []

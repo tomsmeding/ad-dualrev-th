@@ -34,6 +34,7 @@ library
     , linear-base
     , ghc-prim
     , mtl
+    , parallel
     , some
     , template-haskell
     , transformers

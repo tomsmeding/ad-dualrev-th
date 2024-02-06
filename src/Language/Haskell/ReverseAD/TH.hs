@@ -32,11 +32,14 @@ module Language.Haskell.ReverseAD.TH (
   Structure,
   structureFromTypeable,
   structureFromType,
+  -- * Special methods
+  (|*|),
 ) where
 
 import Control.Applicative (asum)
 import Control.Monad.Trans.Maybe
 import Control.Monad.Trans.Class (lift)
+import Control.Parallel (par)
 import qualified Data.Array.Mutable.Linear as A
 import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
@@ -114,6 +117,24 @@ import Language.Haskell.ReverseAD.TH.Orphans ()
 --      i <- gen
 --      pure (op x1..xn
 --           ,(i, Contrib [(i1, cb1, dop_1 x1..xn), ..., (in, cbn, dop_n x1..xn)]))
+
+
+-- ----------------------------------------------------------------------
+-- Additional API
+-- ----------------------------------------------------------------------
+
+-- | Parallel (strict) pair construction.
+--
+-- The definition of @x |*| y@ is @x \`'par'\` y \`'par'\` (x, y)@: @x@ and @y@
+-- are evaluated in parallel. This also means that this pair constructor is
+-- strict, in a sense.
+--
+-- In differentiation using 'reverseAD', this function is specially interpreted
+-- so that not only the forward pass, but also the reverse gradient pass runs
+-- in parallel. This takes some additional administration, so benchmark whether
+-- your parallel work is expensive enough to warrant using this combinator.
+(|*|) :: a -> b -> (a, b)
+x |*| y = x `par` y `par` (x, y)
 
 
 -- ----------------------------------------------------------------------
@@ -488,6 +509,9 @@ ddr env = \case
   -- Handle ($) specially in case the program needs the special type inference (let's hope it does not)
   InfixE (Just e1) (VarE opname) (Just e2) | opname == '($) ->
     ddr env (AppE e1 e2)
+
+  InfixE (Just e1) (VarE opname) (Just e2) | opname == '(|*|) ->
+    ddr env (TupE [Just e1, Just e2])
 
   InfixE (Just e1) (VarE opname) (Just e2) -> do
     let handleNum =
