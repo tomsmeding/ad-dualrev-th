@@ -463,7 +463,7 @@ ddr env = \case
             pure ($(litE lit), ($(varE iname), Contrib [])) |]
     FloatPrimL _ -> fail "float prim?"
     DoublePrimL _ -> fail "double prim?"
-    IntegerL _ -> return (VarE 'pure `AppE` LitE lit)
+    IntegerL _ -> [| pure $(litE lit) |]
     StringL _ -> [| pure $(litE lit) |]
     _ -> fail $ "literal? " ++ show lit
 
