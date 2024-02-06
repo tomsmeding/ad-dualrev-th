@@ -46,10 +46,21 @@ checkFDcontrol :: forall a b.
                -> Maybe (a -> b -> a)
                -> DoCheckFinDiff
                -> Tree
-checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
+checkFDcontrol name = checkFDcontrol' name (\_ -> True)
+
+checkFDcontrol' :: forall a b.
+                   (Arbitrary a, Arbitrary b, Approx a, Approx b, Show a, Show b
+                   ,FinDiff a, FinDiff b, Element a ~ Double, Element b ~ Double)
+                => String
+                -> (a -> Bool)
+                -> (a -> (b, b -> a), ControlFun a b)
+                -> Maybe (a -> b -> a)
+                -> DoCheckFinDiff
+                -> Tree
+checkFDcontrol' name precondition (program, ControlFun controlfun) mcontrolgrad dofindiff
   | Refl <- replaceElementsId @a
   , Refl <- replaceElementsId @b
-  = property name $ \x ->
+  = property name $ \x -> precondition x ==>
       let refout = controlfun @Double x
           controlJac = (\df -> jacobianByRows refout df x) <$> mcontrolgrad
           programJac = jacobianByRows refout (snd . program) x
@@ -113,6 +124,26 @@ main =
             [|| \(x, y) -> x * y ||])
        (Just (\(x,y) d -> (y*d,x*d)))
        YesFD] ++
+
+    [checkFDcontrol "sqrt"
+       $$(reverseADandControl @Double @Double
+            [|| \x -> sqrt (x * x + 1.0) ||])
+       (Just (\x d -> let r = x*x + 1 in d * x / sqrt r))
+       YesFD] ++
+
+    [checkFDcontrol' "log"
+       (\x -> x > 0.1)
+       $$(reverseADandControl @Double @Double
+            [|| \x -> log x ||])
+       (Just (\x d -> d/x))
+       YesFD] ++
+
+    [checkFDcontrol' "more math"
+       (\(x, y) -> x > 0 && y > 0)
+       $$(reverseADandControl @(Double, Double) @Double
+            [|| \(x, y) -> log x + exp y + exp (log (x * y)) ||])
+       (Just (\(x, y) d -> (d*(1/x + y), d*(exp y + x))))
+       NoFD] ++
 
     [checkFDcontrol "let"
        $$(reverseADandControl @Double @Double
@@ -188,6 +219,15 @@ main =
                               h = g f
                           in h y ||])
        (Just (\(x,y) d -> (d * (3*x^2*y + 2*x*y + y^2), d * (x^3 + x^2 + 2*x*y + 2*y))))
+       YesFD] ++
+
+    [checkFDcontrol "composition"
+       $$(reverseADandControl @(Double, Double) @Double
+            [|| \(x,y) -> let f z = z * z
+                              g z = 2.0 * (x - z) + y
+                              h = g . f
+                          in h y + (f . g) x ||])
+       (Just (\(_,y) d -> (d * 2, d * (-2*y + 1))))
        YesFD] ++
 
     [checkFDcontrol "complexity"

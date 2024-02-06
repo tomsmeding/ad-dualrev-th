@@ -423,18 +423,18 @@ ddr env = \case
     | name == 'sqrt -> do
         xname <- newName "x"
         pname <- newName "p"
-        [| \ $(varP xname) ->
-              applyUnaryOp $(varE xname) sqrt (\ $(varP pname) -> 1 / (2 * sqrt $(varE pname))) |]
+        [| pure (\ $(varP xname) ->
+              applyUnaryOp $(varE xname) sqrt (\ $(varP pname) -> 1 / (2 * sqrt $(varE pname)))) |]
     | name == 'exp -> do
         xname <- newName "x"
         primalname <- newName "p"
-        [| \ $(varP xname) ->
-              applyUnaryOp2 $(varE xname) exp (\_ $(varP primalname) -> $(varE primalname)) |]
+        [| pure (\ $(varP xname) ->
+              applyUnaryOp2 $(varE xname) exp (\_ $(varP primalname) -> $(varE primalname))) |]
     | name == 'log -> do
         xname <- newName "x"
         pname <- newName "p"
-        [| \ $(varP xname) ->
-              applyUnaryOp $(varE xname) log (\ $(varP pname) -> 1 / $(varE pname)) |]
+        [| pure (\ $(varP xname) ->
+              applyUnaryOp $(varE xname) log (\ $(varP pname) -> 1 / $(varE pname))) |]
     | name == '($) -> do
         fname <- newName "f"
         xname <- newName "x"
@@ -443,7 +443,7 @@ ddr env = \case
         fname <- newName "f"
         gname <- newName "g"
         xname <- newName "x"
-        ddr env (LamE [VarP fname, VarP gname, VarP xname] (AppE (VarE fname) (AppE (VarE gname) ( VarE xname))))
+        ddr env (LamE [VarP fname, VarP gname, VarP xname] (AppE (VarE fname) (AppE (VarE gname) (VarE xname))))
     | name `elem` ['(+), '(-), '(*)] -> do
         xname <- newName "x"
         yname <- newName "y"

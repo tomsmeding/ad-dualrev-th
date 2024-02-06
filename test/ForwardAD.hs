@@ -38,7 +38,7 @@ instance (Ord a, Floating a) => Floating (Fwd a) where
   pi = Fwd (pi, 0)
   exp = unary exp exp
   log = unary log recip
-  sqrt = unary sqrt (\x -> recip (-2 * sqrt x))
+  sqrt = unary sqrt (\x -> recip (2 * sqrt x))
   -- a(x) ^ b(x) = e ^ (b(x) * log(a(x)))
   -- ~>
   -- e ^ (b(x) * log(a(x))) * (b'(x) * log(a(x)) + b(x) * a'(x)/a(x))
