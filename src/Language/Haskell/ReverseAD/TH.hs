@@ -606,7 +606,7 @@ ddr env = \case
   e@ImplicitParamVarE{} -> notSupported "Implicit parameters" (Just (show e))
   e@GetFieldE{} -> notSupported "Records" (Just (show e))
   e@ProjectionE{} -> notSupported "Records" (Just (show e))
-  e@LamCasesE{} -> notSupported "\\cases" (Just (show e))
+  e -> notSupported (takeWhile (/= ' ') (show e)) (Just (show e))
 
 -- | Given list of expressions, returns a wrapper that defines a variable for
 -- each item in the list (differentiated), together with a list of the names of
@@ -1103,7 +1103,7 @@ freeVars env = \case
   e@ImplicitParamVarE{} -> notSupported "Implicit parameters" (Just (show e))
   e@GetFieldE{} -> notSupported "Records" (Just (show e))
   e@ProjectionE{} -> notSupported "Records" (Just (show e))
-  e@LamCasesE{} -> notSupported "\\cases" (Just (show e))
+  e -> notSupported (takeWhile (/= ' ') (show e)) (Just (show e))
 
 boundVars :: MonadFail m => Pat -> m (Set Name)
 boundVars = \case

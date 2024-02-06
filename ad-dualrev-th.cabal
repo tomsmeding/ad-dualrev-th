@@ -24,7 +24,6 @@ source-repository head
 library
   exposed-modules:
     Language.Haskell.ReverseAD.TH
-    Language.Haskell.ReverseAD.TH.Compat
     Language.Haskell.ReverseAD.TH.Orphans
   hs-source-dirs:
     src
