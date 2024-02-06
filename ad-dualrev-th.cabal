@@ -64,7 +64,7 @@ test-suite test
     FinDiff
     ForwardAD
     Types
-  ghc-options: -Wall -O2 -threaded -rtsopts -ddump-splices
+  ghc-options: -Wall -O2 -threaded -rtsopts
   build-depends:
       base
     , ad-dualrev-th
