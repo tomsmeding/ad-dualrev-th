@@ -72,46 +72,48 @@ import Language.Haskell.ReverseAD.TH.Orphans ()
 -- Dt[Double] = (Double, (Int, Contrib))
 -- Dt[()] = ()
 -- Dt[(a, b)] = (Dt[a], Dt[b])
--- Dt[a -> b] = Dt[a] -> Int -> (Dt[b], Int)
+-- Dt[a -> b] = Dt[a] -> FwdM Dt[b]
 -- Dt[Int] = Int
 -- Dt[T a b c] = T Dt[a] Dt[b] Dt[c]      -- data types, generalises (,)
 --
 -- Dt[eps] = eps
 -- Dt[Γ, x : a] = Dt[Γ], x : Dt[a]
 --
--- Γ |- i : Int
+-- FwdM is a monad with:
+--   gen :: FwdM Int
+--
 -- Γ |- t : a
--- ~> Dt[Γ] |- D[i, t] : (Dt[a], Int)
--- D[i, r] = ((r, (i, Contrib [])), i + 1)
--- D[i, x] = (x, i)
--- D[i, ()] = ((), i)
--- D[i, (s, t)] = let (x, i1) = D[i, s]
---                    (y, i2) = D[i1, t]
---                in ((x, y), i2)
--- D[i, C x y z] = let (x', i1) = D[i, x]
---                     (y', i2) = D[i1, y]
---                     (z', i3) = D[i2, z]
---                 in (C x' y' z', i3)
--- D[i, case s of C1 x1 x2 -> t1 ; ... ; Cn x1 x2 -> tn] =
---        let (x, i1) = D[i, s]
---        in case x of
---          C1 x1 x2 -> D[i1, t1]
+-- ~> Dt[Γ] |- D[t] : FwdM Dt[a]
+-- D[r] = do i <- gen; pure (r, (i, Contrib []))
+-- D[x] = pure x
+-- D[()] = ((), i)
+-- D[(s, t)] = do x <- D[s]
+--                y <- D[t]
+--                pure (x, y)
+-- D[C s t u] = do x <- D[s]
+--                 y <- D[t]
+--                 z <- D[u]
+--                 pure (C x y z)
+-- D[case s of C1 x1 x2 -> t1 ; ... ; Cn x1 x2 -> tn] =
+--     do x <- D[s]
+--        case x of
+--          C1 x1 x2 -> D[t1]
 --          ...
---          Cn x1 x2 -> D[i1, tn]
--- D[i, s t] = let (f, i1) = D[i, s]
---                 (a, i2) = D[i1, t]
---             in f a i2
--- D[i, \x -> t] = (\x i1 -> D[i1, t], i)
--- D[i, let x = s in t] = let (x, i1) = D[i, s]
---                        in D[i1, t]
--- D[i, op t1..tn] =
---   let ((x1, (di1, cb1)), i1) = D[i, t1]
---       ((x2, (di2, cb2)), i2) = D[i1, t1]
---       ...
---       ((xn, (din, cbn)), in) = D[i{n-1}, tn]
---   in ((op x1..xn
---       ,(in, Contrib [(di1, cb1, dop_1 x1..xn), ..., (din, cbn, dop_n x1..xn)]))
---      ,in + 1)
+--          Cn x1 x2 -> D[tn]
+-- D[s t] = do f <- D[s]
+--             a <- D[t]
+--             f a
+-- D[\x -> t] = pure (\x -> D[t])
+-- D[let x = s in t] = do x <- D[s]
+--                        D[t]
+-- D[op t1..tn] =
+--   do (x1, (i1, cb1)) = D[t1]
+--      (x2, (i2, cb2)) = D[t1]
+--      ...
+--      (xn, (in, cbn)) = D[tn]
+--      i <- gen
+--      pure (op x1..xn
+--           ,(i, Contrib [(i1, cb1, dop_1 x1..xn), ..., (in, cbn, dop_n x1..xn)]))
 
 
 -- ----------------------------------------------------------------------
