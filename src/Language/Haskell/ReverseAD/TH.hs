@@ -613,7 +613,9 @@ ddrDecs env decs = do
 
   let processDec :: Dec -> Q (Name, Set Name, Exp)
       processDec = \case
-        ValD (VarP name) (NormalB e) [] -> (name,,e) <$> freeVars extendedEnv e
+        ValD (VarP name) (NormalB e) [] -> do
+          frees <- freeVars extendedEnv e
+          return (name, frees, e)
         dec -> fail $ "Unsupported declaration in let: " ++ show dec
 
       fromLam :: Exp -> Maybe (Pat, Exp)
@@ -1047,7 +1049,7 @@ freeVars env = \case
   e@MultiIfE{} -> notSupported "Multi-way ifs" (Just (show e))
   LetE decs body -> do
     ddrDecs env decs >>= \case
-      Just (_, _, frees) -> return frees
+      Just (_, bound, frees) -> (frees <>) <$> freeVars (env <> Set.fromList bound) body
       Nothing -> notSupported "Recursive declarations in let" (Just (show (LetE decs body)))
   CaseE e ms -> (<>) <$> freeVars env e <*> combine (map go ms)
     where go :: Match -> Q (Set Name)
