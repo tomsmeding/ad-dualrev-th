@@ -65,7 +65,7 @@ checkFDcontrol name (program, ControlFun controlfun) mcontrolgrad dofindiff
                                 (zip (elements @a input) (elements @a tangent)))
                           x
           compareJacs name1 jac1 name2 jac2 =
-            counterexample (name1 ++ "/= " ++ name2 ++ "\n" ++
+            counterexample (name1 ++ " /= " ++ name2 ++ "\n" ++
                               show jac1 ++ " /= " ++ show jac2)
                            (jac1 ~= jac2)
       in case (controlJac, dofindiff) of
