@@ -55,7 +55,7 @@ import qualified Data.Set as Set
 import Data.Typeable
 import qualified Data.Vector as V
 import Data.Word
-import GHC.Types (Multiplicity(One))
+import GHC.Types (Multiplicity(..))
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax hiding (lift)
 import qualified Prelude.Linear as PL
@@ -569,6 +569,9 @@ ddr env = \case
     (wrap, vars) <- ddrList env es
     return (wrap (VarE 'pure `AppE` ListE (map VarE vars)))
 
+  SigE e ty ->
+    SigE <$> ddr env e <*> ((ConT ''FwdM `AppT`) <$> ddrType ty)
+
   UnboundVarE n -> fail $ "Free variable in reverseAD: " ++ show n
 
   -- Constructs that we can express in terms of other, simpler constructs handled above
@@ -600,7 +603,6 @@ ddr env = \case
   e@MDoE{} -> notSupported "MDo blocks" (Just (show e))
   e@CompE{} -> notSupported "List comprehensions" (Just (show e))
   e@ArithSeqE{} -> notSupported "Arithmetic sequences" (Just (show e))
-  e@SigE{} -> fail $ "Type ascriptions not supported, because I'm lazy and then I need to write code to rewrite types (" ++ show e ++ ")"
   e@RecConE{} -> notSupported "Records" (Just (show e))
   e@RecUpdE{} -> notSupported "Records" (Just (show e))
   e@StaticE{} -> notSupported "Cloud Haskell" (Just (show e))
@@ -709,6 +711,38 @@ ddrPat = \case
   ListP ps -> ListP <$> traverse ddrPat ps
   p@SigP{} -> notSupported "Type signatures in patterns, because then I need to rewrite types and I'm lazy" (Just (show p))
   p@ViewP{} -> notSupported "View patterns" (Just (show p))
+
+ddrType :: Type -> Q Type
+ddrType = \ty ->
+  case go ty of
+    Left bad -> fail $ "Don't know how to differentiate (" ++ show bad ++ "), which is a \
+                       \part of the type: " ++ show ty
+    Right res -> return res
+  where
+    go :: Type -> Either Type Type
+    go (ConT name)
+      | name == ''Double = Right (pairt (ConT ''Double) (pairt (ConT ''Int) (ConT ''Contrib)))
+      | name == ''Int = Right (ConT ''Int)
+    go (ArrowT `AppT` t1 `AppT` t) = do
+      t1' <- go t1
+      t' <- go t
+      return $ ArrowT `AppT` t1' `AppT` (ConT ''FwdM `AppT` t')
+    go (MulArrowT `AppT` PromotedT multi `AppT` t1 `AppT` t)
+      | multi == 'Many = go (ArrowT `AppT` t1 `AppT` t)
+    go ty =
+      case second ($ []) (collectApps ty) of
+        (TupleT n, args) | length args == n ->
+          foldl AppT (TupleT n) <$> traverse go args
+        (ConT name, args) ->  -- I hope this one is correct
+          foldl AppT (ConT name) <$> traverse go args
+        _ -> Left ty  -- don't know how to handle this type
+
+    collectApps :: Type -> (Type, [Type] -> [Type])
+    collectApps (t1 `AppT` t2) = second (. (t2:)) (collectApps t1)
+    collectApps t = (t, id)
+
+    pairt :: Type -> Type -> Type
+    pairt t1 t2 = TupleT 2 `AppT` t1 `AppT` t2
 
 
 -- ----------------------------------------------------------------------
@@ -925,7 +959,7 @@ class NumOperation a where
   applyUnaryOp2
     :: DualNum a               -- argument
     -> (a -> a)                -- primal
-    -> (a -> a -> a)           -- derivative given input and primal (assuming adjoint 1)
+    -> (a -> a -> a)           -- derivative given input and primal result (assuming adjoint 1)
     -> FwdM (DualNum a)        -- output
   applyCmpOp
     :: DualNum a -> DualNum a  -- arguments
