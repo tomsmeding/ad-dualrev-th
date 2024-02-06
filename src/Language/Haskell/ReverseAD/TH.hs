@@ -425,10 +425,30 @@ ddr env = \case
         pname <- newName "p"
         [| \ $(varP xname) ->
               applyUnaryOp $(varE xname) sqrt (\ $(varP pname) -> 1 / (2 * sqrt $(varE pname))) |]
+    | name == 'exp -> do
+        xname <- newName "x"
+        primalname <- newName "p"
+        [| \ $(varP xname) ->
+              applyUnaryOp2 $(varE xname) exp (\_ $(varP primalname) -> $(varE primalname)) |]
+    | name == 'log -> do
+        xname <- newName "x"
+        pname <- newName "p"
+        [| \ $(varP xname) ->
+              applyUnaryOp $(varE xname) log (\ $(varP pname) -> 1 / $(varE pname)) |]
     | name == '($) -> do
         fname <- newName "f"
         xname <- newName "x"
         ddr env (LamE [VarP fname, VarP xname] (AppE (VarE fname) (VarE xname)))
+    | name == '(.) -> do
+        fname <- newName "f"
+        gname <- newName "g"
+        xname <- newName "x"
+        ddr env (LamE [VarP fname, VarP gname, VarP xname] (AppE (VarE fname) (AppE (VarE gname) ( VarE xname))))
+    | name `elem` ['(+), '(-), '(*)] -> do
+        xname <- newName "x"
+        yname <- newName "y"
+        ddr env (LamE [VarP xname, VarP yname] (InfixE (Just (VarE xname)) (VarE name) (Just (VarE yname))))
+    | name == 'error -> [| pure error |]
     | otherwise -> fail $ "Free variables not supported in reverseAD: " ++ show name ++ " (env = " ++ show env ++ ")"
 
   ConE name
@@ -444,6 +464,7 @@ ddr env = \case
     FloatPrimL _ -> fail "float prim?"
     DoublePrimL _ -> fail "double prim?"
     IntegerL _ -> return (VarE 'pure `AppE` LitE lit)
+    StringL _ -> [| pure $(litE lit) |]
     _ -> fail $ "literal? " ++ show lit
 
   AppE e1 e2 -> do
@@ -899,6 +920,11 @@ class NumOperation a where
     -> (a -> a)                -- primal
     -> (a -> a)                -- derivative given input (assuming adjoint 1)
     -> FwdM (DualNum a)        -- output
+  applyUnaryOp2
+    :: DualNum a               -- argument
+    -> (a -> a)                -- primal
+    -> (a -> a -> a)           -- derivative given input and primal (assuming adjoint 1)
+    -> FwdM (DualNum a)        -- output
   applyCmpOp
     :: DualNum a -> DualNum a  -- arguments
     -> (a -> a -> Bool)        -- primal
@@ -917,6 +943,10 @@ instance NumOperation Double where
   applyUnaryOp (x, (xi, xcb)) primal grad = do
     i <- fwdmGenId
     pure (primal x, (i, Contrib [(xi, xcb, grad x)]))
+  applyUnaryOp2 (x, (xi, xcb)) primal grad = do
+    i <- fwdmGenId
+    let pr = primal x
+    pure (pr, (i, Contrib [(xi, xcb, grad x pr)]))
   applyCmpOp (x, _) (y, _) f = f x y
   fromIntegralOp x = do
     i <- fwdmGenId
@@ -926,6 +956,7 @@ instance NumOperation Int where
   type DualNum Int = Int
   applyBinaryOp x y primal _ = pure (primal x y)
   applyUnaryOp x primal _ = pure (primal x)
+  applyUnaryOp2 x primal _ = pure (primal x)
   applyCmpOp x y f = f x y
   fromIntegralOp x = pure (fromIntegral x)
 
