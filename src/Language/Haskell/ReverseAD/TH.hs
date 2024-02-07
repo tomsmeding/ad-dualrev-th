@@ -36,7 +36,7 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Applicative (asum)
-import Control.Monad.Trans.Maybe
+import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Trans.Class (lift)
 import Control.Parallel (par)
 import qualified Data.Array.Mutable.Linear as A
@@ -47,8 +47,7 @@ import Data.Foldable (toList)
 import Data.Function ((&))
 import Data.Graph (stronglyConnComp, SCC(..))
 import Data.List (zip4)
-import Data.Int
-import Data.Proxy
+import Data.Int (Int8, Int16, Int32, Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -56,8 +55,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Typeable
 import qualified Data.Vector as V
-import Data.Word
-import GHC.Types (Multiplicity(..))
+import Data.Word (Word8, Word16, Word32, Word64)
+import GHC.Exts (Multiplicity(..))
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax hiding (lift)
 import qualified Prelude.Linear as PL
