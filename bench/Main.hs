@@ -69,20 +69,20 @@ frotvecquat = $$(makeFunction
         in rotate_vec_by_quat topv topq ||])
 
 data Options = Options
-  { argsPatternsRev :: [String]
+  { argsHelp :: Bool
   , argsOutput :: Maybe FilePath
   , argsCsv :: Maybe FilePath
-  , argsHelp :: Bool
-  , argsNoTest :: Bool }
+  , argsNoTest :: Bool
+  , argsPatternsRev :: [String] }
   deriving (Show)
 
 parseArgs :: [String] -> Options -> Either String Options
 parseArgs [] a = return a
+parseArgs ("-h" : _) a = return $ a { argsHelp = True }
+parseArgs ("--help" : _) a = return $ a { argsHelp = True }
 parseArgs ("-o" : path : ss) a = parseArgs ss (a { argsOutput = Just path })
 parseArgs ("--notest" : ss) a = parseArgs ss (a { argsNoTest = True })
 parseArgs ("--csv" : path : ss) a = parseArgs ss (a { argsCsv = Just path })
-parseArgs ("-h" : _) a = return $ a { argsHelp = True }
-parseArgs ("--help" : _) a = return $ a { argsHelp = True }
 parseArgs ("" : _) _ = Left "Unexpected empty argument"
 parseArgs (s@(c0:_) : ss) a
   | c0 /= '-' = parseArgs ss (a { argsPatternsRev = s : argsPatternsRev a })
@@ -90,7 +90,7 @@ parseArgs (s : _) _ = Left ("Unrecognised argument '" ++ s ++ "'")
 
 main :: IO ()
 main = do
-  options <- getArgs >>= \args -> case parseArgs args (Options [] Nothing Nothing False False) of
+  options <- getArgs >>= \args -> case parseArgs args (Options False Nothing Nothing False []) of
                Left err -> die err
                Right opts -> return opts
 
