@@ -71,6 +71,7 @@ frotvecquat = $$(makeFunction
 data Options = Options
   { argsPatternsRev :: [String]
   , argsOutput :: Maybe FilePath
+  , argsCsv :: Maybe FilePath
   , argsHelp :: Bool
   , argsNoTest :: Bool }
   deriving (Show)
@@ -79,6 +80,7 @@ parseArgs :: [String] -> Options -> Either String Options
 parseArgs [] a = return a
 parseArgs ("-o" : path : ss) a = parseArgs ss (a { argsOutput = Just path })
 parseArgs ("--notest" : ss) a = parseArgs ss (a { argsNoTest = True })
+parseArgs ("--csv" : path : ss) a = parseArgs ss (a { argsCsv = Just path })
 parseArgs ("-h" : _) a = return $ a { argsHelp = True }
 parseArgs ("--help" : _) a = return $ a { argsHelp = True }
 parseArgs ("" : _) _ = Left "Unexpected empty argument"
@@ -88,12 +90,13 @@ parseArgs (s : _) _ = Left ("Unrecognised argument '" ++ s ++ "'")
 
 main :: IO ()
 main = do
-  options <- getArgs >>= \args -> case parseArgs args (Options [] Nothing False False) of
+  options <- getArgs >>= \args -> case parseArgs args (Options [] Nothing Nothing False False) of
                Left err -> die err
                Right opts -> return opts
 
   when (argsHelp options) $ do
-    putStrLn "Usage: bench [-o <criterion-output.html>] [--notest] [test patterns...]"
+    putStrLn "Usage: bench [-o <criterion-output.html>] [--notest] [--csv <results.csv>]\n\
+             \             [test patterns...]"
     exitSuccess
 
   when (not (argsNoTest options)) $ do
@@ -110,7 +113,8 @@ main = do
 
     when (not checksOK) exitFailure
 
-  let crconfig = Criterion.defaultConfig { reportFile = argsOutput options }
+  let crconfig = Criterion.defaultConfig { reportFile = argsOutput options
+                                         , csvFile = argsCsv options }
   Criterion.runMode
     (Criterion.Run crconfig Criterion.Pattern (reverse (argsPatternsRev options)))
     [bgroup "fmult"
