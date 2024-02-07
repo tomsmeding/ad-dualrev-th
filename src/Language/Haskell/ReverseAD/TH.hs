@@ -17,7 +17,6 @@
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# OPTIONS -Wno-incomplete-uni-patterns #-}
 
 -- This warning is over-eager in TH quotes when the variables that the pattern
 -- binds are spliced instead of mentioned directly. See
@@ -1097,22 +1096,27 @@ desugarDec = \case
 
   FunD _ [] -> fail "Function declaration with empty list of clauses?"
 
-  FunD name clauses@(_:_)
-    | not (allEqual [length pats | Clause pats _ _ <- clauses])
-    -> fail "Clauses of a function declaration do not all have the same number of arguments"
-    | length [() | Clause _ _ [] <- clauses] /= length clauses
-    -> fail $ "Where blocks not supported in declaration of " ++ show name
-    | length [() | Clause _ (NormalB _) _ <- clauses] /= length clauses
-    -> fail $ "Guards not supported in declaration of " ++ show name
-    | otherwise
-    -> do
-      let nargs = head [length pats | Clause pats _ _ <- clauses]
-      argnames <- mapM (\i -> newName ("arg" ++ show i)) [1..nargs]
-      let body = LamE (map VarP argnames) $
-                   CaseE (TupE (map (Just . VarE) argnames))
-                     [Match (TupP ps) (NormalB rhs) []
-                     | Clause ps ~(NormalB rhs) ~[] <- clauses]
-      return $ ValD (VarP name) (NormalB body) []
+  FunD name clauses@(_:_) ->
+    case traverse fromSimpleClause clauses of
+      Left err -> fail err
+      Right cpairs
+        | allEqual [length pats | (pats, _) <- cpairs] -> do
+            let nargs = head [length pats | Clause pats _ _ <- clauses]
+            argnames <- mapM (\i -> newName ("arg" ++ show i)) [1..nargs]
+            let body = LamE (map VarP argnames) $
+                         CaseE (TupE (map (Just . VarE) argnames))
+                           [Match (TupP ps) (NormalB rhs) []
+                           | (ps, rhs) <- cpairs]
+            return $ ValD (VarP name) (NormalB body) []
+        | otherwise ->
+            fail $ "Clauses of declaration of " ++ show name ++
+                   " do not all have the same number of arguments"
+    where
+      fromSimpleClause (Clause pats (NormalB body) []) = Right (pats, body)
+      fromSimpleClause (Clause _ _ (_:_)) =
+        Left $ "Where blocks not supported in declaration of " ++ show name
+      fromSimpleClause (Clause _ GuardedB{} _) =
+        Left $ "Guards not supported in declaration of " ++ show name
 
   dec -> fail $ "Only simple let bindings supported in reverseAD: " ++ show dec
   where
