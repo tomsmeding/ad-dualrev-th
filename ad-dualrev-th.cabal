@@ -24,6 +24,8 @@ source-repository head
 library
   exposed-modules:
     Language.Haskell.ReverseAD.TH
+  other-modules:
+    Data.Vector.Storable.Mutable.CAS
     Language.Haskell.ReverseAD.TH.Orphans
   hs-source-dirs:
     src
@@ -31,8 +33,6 @@ library
   build-depends:
       base >=4.7 && <4.19
     , containers
-    , linear-base
-    , ghc-prim
     , mtl
     , parallel
     , some

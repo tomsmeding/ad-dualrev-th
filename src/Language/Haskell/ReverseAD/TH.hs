@@ -1,13 +1,11 @@
 -- TODO:
 -- - Polymorphically recursive data types
 
-{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveLift #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE LinearTypes #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -15,12 +13,11 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
-{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
 
 -- This warning is over-eager in TH quotes when the variables that the pattern
 -- binds are spliced instead of mentioned directly. See
--- https://gitlab.haskell.org/ghc/ghc/-/issues/22057 .
+-- https://gitlab.haskell.org/ghc/ghc/-/issues/22057 . Fixed in GHC 9.6.1.
 {-# OPTIONS -Wno-unused-pattern-binds #-}
 
 module Language.Haskell.ReverseAD.TH (
@@ -36,11 +33,10 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Applicative (asum)
+import Control.Concurrent
 import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Trans.Class (lift)
 import Control.Parallel (par)
-import qualified Data.Array.Mutable.Linear as A
-import Data.Array.Mutable.Linear (Array)
 import Data.Bifunctor (second)
 import Data.Char (isAlphaNum)
 import Data.Foldable (toList)
@@ -48,23 +44,27 @@ import Data.Function ((&))
 import Data.Graph (stronglyConnComp, SCC(..))
 import Data.List (zip4)
 import Data.Int (Int8, Int16, Int32, Int64)
+import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Typeable
-import qualified Data.Vector as V
+import qualified Data.Vector.Storable as VS
+import qualified Data.Vector.Mutable as MV
+import qualified Data.Vector.Storable.Mutable as MVS
 import Data.Word (Word8, Word16, Word32, Word64)
 import GHC.Exts (Multiplicity(..))
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax hiding (lift)
-import qualified Prelude.Linear as PL
-import Prelude.Linear (Ur(..))
+import System.IO.Unsafe
 
 -- import Control.Monad.IO.Class
 -- import Debug.Trace
+-- import System.IO
 
+import Data.Vector.Storable.Mutable.CAS
 import Language.Haskell.ReverseAD.TH.Orphans ()
 
 
@@ -135,55 +135,184 @@ import Language.Haskell.ReverseAD.TH.Orphans ()
 x |*| y = x `par` y `par` (x, y)
 
 
--- ----------------------------------------------------------------------
--- The State type
--- ----------------------------------------------------------------------
-
-type BuildState = Array (Contrib, Double)
-newtype Contrib = Contrib [(Int, Contrib, Double)]
-
-resolve :: Int -> BuildState %1-> BuildState
-resolve iout = \arr -> loop (iout - 1) arr
-  where
-    loop :: Int -> BuildState %1-> BuildState
-    loop 0 arr = arr
-    loop i arr =
-      A.get i arr PL.& \(Ur (cb, adj), arr1) ->
-        loop (i - 1) (apply cb adj arr1)
-
-    apply :: Contrib -> Double -> BuildState %1-> BuildState
-    apply (Contrib []) _ arr = arr
-    apply (Contrib ((i, cb, d) : cbs)) a arr =
-      A.get i arr PL.& \(Ur (_, acc), arr1) ->  -- acc = backpropagator argument (i.e. adjoint) accumulator
-      A.set i (cb, acc + a * d) arr1 PL.& \arr2 ->
-        apply (Contrib cbs) a arr2
-
-addContrib :: Int -> Contrib -> Double -> BuildState %1-> BuildState
-addContrib i cb adj arr =
-  A.get i arr PL.& \(Ur (_, acc), arr1) ->
-    A.set i (cb, acc + adj) arr1
-
-
 -- ------------------------------------------------------------
 -- The monad for the target program
 -- ------------------------------------------------------------
 
-newtype FwdM a = FwdM (Int -> (Int, a))
-  deriving (Functor)
+-- | The ID of a parallel job, starting from 1. The implicit main job has ID 0.
+newtype JobID = JobID Int
+  deriving (Show)
+
+data JobDescr = JobDescr
+    JobID   -- ^ The ID of this job
+    Int     -- ^ Last ID + 1 generated in this thread (first was 0)
+    [Fork]  -- ^ Fork history in this thread, last fork at head
+  deriving (Show)
+
+data Fork = Fork Int  -- ^ First ID after join
+                 JobDescr  -- ^ Left job
+                 JobDescr  -- ^ Right job
+  deriving (Show)
+
+newtype FwdM a = FwdM
+    ([Fork]       -- state: history of forks on this thread; the last one is at
+                  --   the head of the list
+  -> IORef JobID  -- reader context: the next job ID to generate
+  -> JobID        -- reader context: the job ID of the current thread
+  -> Int          -- state: the next node ID to generate
+  -> IO ([Fork], Int, a))
+
+instance Functor FwdM where
+  fmap f (FwdM g) = FwdM $ \hist jr curj i -> do
+    (hist1, i1, x) <- g hist jr curj i
+    return (hist1, i1, f x)
 
 instance Applicative FwdM where
-  pure x = FwdM (\i -> (i, x))
-  FwdM f <*> FwdM g = FwdM $ \i -> let (j, h) = f i in second h (g j)
+  pure x = FwdM (\hist _ _ i -> return (hist, i, x))
+  FwdM f <*> FwdM g = FwdM $ \hist jr curj i -> do
+    (hist1, i1, fun) <- f hist jr curj i
+    (hist2, i2, x) <- g hist1 jr curj i1
+    return (hist2, i2, fun x)
 
 instance Monad FwdM where
-  FwdM f >>= g = FwdM $ \i -> let (j, x) = f i ; FwdM h = g x in h j
+  FwdM f >>= g = FwdM $ \hist jr curj i -> do
+    (hist1, i1, x) <- f hist jr curj i
+    let FwdM h = g x
+    h hist1 jr curj i1
 
--- Returns highest Id generated plus 1
-runFwdM :: FwdM a -> (Int, a)
-runFwdM (FwdM f) = f 0
+-- Returns:
+-- - fork history on the main thread
+-- - highest JobID generated plus 1
+-- - highest id generated plus 1
+runFwdM :: FwdM a -> ([Fork], JobID, Int, a)
+runFwdM (FwdM f) = unsafePerformIO $ do
+  jiref <- newIORef (JobID 1)
+  (hist, i, y) <- f mempty jiref (JobID 0) 0
+  nextji <- readIORef jiref
+  return (hist, nextji, i, y)
 
-fwdmGenId :: FwdM Int
-fwdmGenId = FwdM (\i -> (i + 1, i))
+-- The 'a' is computed in the current job; 'b' is computed in a new job, of
+-- which the ID is returned.
+fwdmPar :: FwdM a -> FwdM b -> FwdM (a, b)
+fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \hist jr _curj i -> do
+  ji1 <- atomicModifyIORef' jr (\ji@(JobID j) -> (JobID (j + 2), ji))
+  let ji2 = let JobID j = ji1 in JobID (j + 1)
+  threadResult <- newEmptyMVar
+  _ <- forkIO $ f2 [] jr ji2 0 >>= putMVar threadResult
+  (hist1, i1, x) <- f1 [] jr ji1 0
+  (hist2, i2, y) <- readMVar threadResult
+  return (Fork i (JobDescr ji1 i1 hist1) (JobDescr ji2 i2 hist2) : hist, i, (x, y))
+
+-- | The tag on a node in the Contrib graph. Consists of a job ID and the ID of
+-- the node within this thread.
+data NID = NID {-# UNPACK #-} !JobID
+               {-# UNPACK #-} !Int
+
+fwdmGenId :: FwdM NID
+fwdmGenId = FwdM (\hist _ curj i -> return (hist, i + 1, NID curj i))
+
+fwdmGenIdInterleave :: FwdM Int
+fwdmGenIdInterleave = FwdM $ \hist _ (JobID curj) i ->
+  if curj == 0
+    then return (hist, i + 1, i)
+    else error "fwdmGenIdInterleave: not on main thread"
+
+
+-- ----------------------------------------------------------------------
+-- The State type
+-- ----------------------------------------------------------------------
+
+-- | For each thread, the unzipped vector of (Contrib, adjoint) pairs. The
+-- inner "vector" is Nothing if the outputs from that thread haven't been used
+-- yet.
+type MaybeBuildState = MV.IOVector (Maybe (MV.IOVector Contrib, MVS.IOVector Double))
+type BuildState = MV.IOVector (MV.IOVector Contrib, MVS.IOVector Double)
+
+newtype Contrib = Contrib [(NID, Contrib, Double)]
+
+-- TODO: This function is sequential in the total number of jobs started in the
+-- forward pass, which is technically not good: they were started in parallel,
+-- so we are technically sequentialising a bit in the worst case here. It's not
+-- _so_ bad, though.
+allocBS :: [Fork] -> MaybeBuildState -> IO ()
+allocBS [] _ = return ()
+allocBS (Fork _ jd1 jd2 : hist) threads = do
+  allocJD jd1
+  allocJD jd2
+  allocBS hist threads
+  where
+    allocJD :: JobDescr -> IO ()
+    allocJD (JobDescr (JobID ji) n subhist) = do
+      MV.read threads ji >>= \case
+        Just _ -> return ()
+        Nothing -> do
+          cbarr <- MV.replicate n (Contrib [])
+          adjarr <- MVS.replicate n 0.0
+          MV.write threads ji (Just (cbarr, adjarr))
+      allocBS subhist threads
+
+resolve :: [Fork] -> Int -> BuildState -> IO ()
+resolve = \hist iout threads -> do
+  loopEnter (JobDescr (JobID 0) (iout - 1) hist) threads
+  where
+    loopEnter :: JobDescr -> BuildState -> IO ()
+    loopEnter (JobDescr ji i []) threads = loop 0 [] (NID ji i) threads
+    loopEnter (JobDescr ji i hist@(Fork nexti _ _ : _)) threads = loop nexti hist (NID ji i) threads
+
+    loop :: Int -> [Fork] -> NID -> BuildState -> IO ()
+    loop joini hist (NID jid@(JobID ji) i) threads
+      | i < joini = case hist of
+          [] -> return ()
+          Fork _ jd1 jd2 : hist' -> do
+            done <- newEmptyMVar
+            _ <- forkIO $ loopEnter jd2 threads >> putMVar done ()
+            loopEnter jd1 threads
+            readMVar done
+            loopEnter (JobDescr jid i hist') threads
+      | otherwise = do
+          (cbarr, adjarr) <- MV.read threads ji
+          cb <- MV.read cbarr i
+          adj <- MVS.read adjarr i
+          apply cb adj threads
+          loop joini hist (NID jid (i - 1)) threads
+
+    apply :: Contrib -> Double -> BuildState -> IO ()
+    apply (Contrib []) _ _ = return ()
+    apply (Contrib ((nid, cb, d) : cbs)) a threads = do
+      addContrib nid cb d threads
+      apply (Contrib cbs) a threads
+
+-- This is the function called from the backpropagator built by deinterleave.
+addContrib :: NID -> Contrib -> Double -> BuildState -> IO ()
+addContrib (NID (JobID ji) i) cb adj threads = do
+  (cbarr, adjarr) <- MV.read threads ji
+  MV.write cbarr i cb
+  let loop acc = do
+        (success, old) <- casIOVectorDouble adjarr i acc (acc + adj)
+        if success then return () else loop old
+  orig <- MVS.read adjarr i
+  loop orig
+  -- hPutStrLn stderr $ "aC: [" ++ show ji ++ "] " ++ show i ++ ": " ++ show orig ++ " + " ++ show adj ++ " = " ++ show (orig + adj)
+
+-- | Returns adjoints of the main (initial) thread.
+dualpass :: [Fork] -> JobID -> Int -> (d -> BuildState -> IO ()) -> d -> VS.Vector Double
+dualpass hist (JobID numJobs) iout backprop adj = unsafePerformIO $ do
+  threads' <- MV.replicate numJobs Nothing
+  cbarr0 <- MV.replicate iout (Contrib [])
+  adjarr0 <- MVS.replicate iout 0.0
+  MV.write threads' 0 (Just (cbarr0, adjarr0))
+  allocBS hist threads'
+  threads <- MV.generateM numJobs (\i ->
+                MV.read threads' i >>= \case
+                  Just p -> return p
+                  Nothing -> error $ "Thread array not initialised: " ++ show i)
+  -- hPutStrLn stderr $ "hist = " ++ show hist
+  -- hPutStrLn stderr $ "iout = " ++ show iout
+  -- hPutStrLn stderr $ "adj = " ++ show adj
+  backprop adj threads
+  -- hPutStrLn stderr $ "-- resolve --"
+  resolve hist iout threads
+  VS.freeze adjarr0
 
 
 -- ------------------------------------------------------------
@@ -396,26 +525,21 @@ transform inpStruc outStruc (LamE [pat] expr) = do
   rebuild'var <- newName "rebuild'"
   outvar <- newName "out"
   out'var <- newName "out'"
+  histvar <- newName "hist"
+  outjivar <- newName "outji"
   ioutvar <- newName "iout"
   primalvar <- newName "primal"
   dualvar <- newName "dual"
   adjvar <- newName "adjoint"
-  stagedvecvar <- newName "stagedvec"
   [| \ $(varP argvar) ->
-        let ($(varP ioutvar), ($(varP outvar), $(varP rebuildvar))) = runFwdM $ do
+        let ($(varP histvar), $(varP outjivar), $(varP ioutvar), ($(varP outvar), $(varP rebuildvar))) = runFwdM $ do
               ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
               $(varP out'var) <- $(ddr patbound expr)
               pure ($(varE out'var), $(varE rebuild'var))
             ($(varP primalvar), $(varP dualvar)) = $(deinterleave outStruc (VarE outvar))
         in ($(varE primalvar)
            ,\ $(varP adjvar) ->
-                let Ur $(varP stagedvecvar) =
-                      A.alloc $(varE ioutvar)
-                              (Contrib [], 0.0)
-                              (A.freeze
-                               PL.. resolve $(varE ioutvar)
-                               PL.. $(varE dualvar) $(varE adjvar))
-                in $(varE rebuildvar) (V.map snd $(varE stagedvecvar))) |]
+                $(varE rebuildvar) (dualpass $(varE histvar) $(varE outjivar) $(varE ioutvar) $(varE dualvar) $(varE adjvar))) |]
 transform inpStruc outStruc (LamE [] body) =
   transform inpStruc outStruc body
 transform inpStruc outStruc (LamE (pat : pats) body) =
@@ -508,8 +632,8 @@ ddr env = \case
   InfixE (Just e1) (VarE opname) (Just e2) | opname == '($) ->
     ddr env (AppE e1 e2)
 
-  InfixE (Just e1) (VarE opname) (Just e2) | opname == '(|*|) ->
-    ddr env (TupE [Just e1, Just e2])
+  InfixE (Just e1) (VarE opname) (Just e2) | opname == '(|*|) -> do
+    [| fwdmPar $(ddr env e1) $(ddr env e2) |]
 
   InfixE (Just e1) (VarE opname) (Just e2) -> do
     let handleNum =
@@ -783,7 +907,7 @@ ddrType = \ty ->
 -- ----------------------------------------------------------------------
 
 -- input :: a
--- result :: FwdM (Dt[a], Vector Double -> a)
+-- result :: FwdM (Dt[a], VS.Vector Double -> a)
 interleave :: Quote m => Structure -> Exp -> m Exp
 interleave (Structure monotype dtypemap) input = do
   helpernames <- Map.fromAscList <$>
@@ -797,10 +921,10 @@ interleave (Structure monotype dtypemap) input = do
              mainfun `AppE` input
 
 -- Given constructors of type T, returns expression of type
--- 'T -> (Dt[T], Vector Double -> T)'. The Map contains for each
+-- 'T -> (Dt[T], VS.Vector Double -> T)'. The Map contains for each
 -- (type name T', type arguments As') combination that occurs (transitively) in
 -- T, the name of a function with type
--- 'T' As' -> (Dt[T' As'], Vector Double -> T' As')'.
+-- 'T' As' -> (Dt[T' As'], VS.Vector Double -> T' As')'.
 interleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
 interleaveData helpernames constrs = do
   inputvar <- newName "input"
@@ -851,7 +975,7 @@ interleaveData helpernames constrs = do
 -- 'T -> FwdM (Dt[T], Vector Double -> T)'. The Map contains for each
 -- (type name T', type arguments As') combination that occurs in the type, the
 -- name of a function with type
--- 'T' As' -> FwdM (Dt[T' As'], Vector Double -> T' As')'.
+-- 'T' As' -> FwdM (Dt[T' As'], VS.Vector Double -> T' As')'.
 interleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
 interleaveType helpernames = \case
   DiscreteST -> do
@@ -863,18 +987,18 @@ interleaveType helpernames = \case
     ivar <- newName "i"
     arrvar <- newName "arr"
     [| \ $(varP inpxvar) -> do
-           $(varP ivar) <- fwdmGenId
-           pure (($(varE inpxvar), ($(varE ivar), Contrib []))
-                ,\ $(varP arrvar) -> $(varE arrvar) V.! $(varE ivar)) |]
+           $(varP ivar) <- fwdmGenIdInterleave
+           pure (($(varE inpxvar), (NID (JobID 0) $(varE ivar), Contrib []))
+                ,\ $(varP arrvar) -> $(varE arrvar) VS.! $(varE ivar)) |]
 
   ConST tyname argtys ->
     return $ VarE $ case Map.lookup (tyname, argtys) helpernames of
                       Just name -> name
                       Nothing -> error $ "Helper name not defined? " ++ show (tyname, argtys)
 
--- outexp :: Dt[T]                            -- interleaved program output
--- result :: (T                               -- primal result
---           ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+-- outexp :: Dt[T]                       -- interleaved program output
+-- result :: (T                          -- primal result
+--           ,T -> BuildState -> IO ())  -- given adjoint, add initial contributions
 deinterleave :: Quote m => Structure -> Exp -> m Exp
 deinterleave (Structure monotype dtypemap) outexp = do
   let dtypes = Map.keys dtypemap
@@ -888,12 +1012,12 @@ deinterleave (Structure monotype dtypemap) outexp = do
                 | (name, fun) <- helperfuns] $
              mainfun `AppE` outexp
 
--- Dt[T]                                 -- interleaved program output
---   -> (T                               -- primal result
---      ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+-- Dt[T]                            -- interleaved program output
+--   -> (T                          -- primal result
+--      ,T -> BuildState -> IO ())  -- given adjoint, add initial contributions
 -- The Map contains for each (type name T', type arguments As') combination
 -- that occurs (transitively) in T, the name of a function with type
--- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -o BuildState)'.
+-- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -> IO ())'.
 deinterleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
 deinterleaveData helpernames constrs = do
   dualvar <- newName "out"
@@ -903,8 +1027,13 @@ deinterleaveData helpernames constrs = do
   allfvars <- mapM (\i -> newName ("f" ++ show i)) [1..maxn]
   allavars <- mapM (\i -> newName ("a" ++ show i)) [1..maxn]
 
-  let composeLfuns [] = VarE 'PL.id
-      composeLfuns l = foldr1 (\a b -> InfixE (Just a) (VarE '(PL..)) (Just b)) l
+  bsvar <- newName "bs"
+
+  let composeActions [] = LamE [WildP] (VarE 'return `AppE` TupE [])
+      composeActions l =
+        LamE [VarP bsvar] $
+          foldr1 (\a b -> InfixE (Just a) (VarE '(>>)) (Just b))
+                 (map (`AppE` VarE bsvar) l)
 
   bodies <- sequence
     [do let dvars = take (length fieldtys) alldvars
@@ -918,9 +1047,11 @@ deinterleaveData helpernames constrs = do
                         -- irrefutable (partial) pattern: that's what you get with sum types in
                         -- a non-dependent context.
                         (LamE [ConP conname [] (map VarP avars)] $
-                           SigE (composeLfuns [VarE fvar `AppE` VarE avar
-                                              | (fvar, avar) <- zip fvars avars])
-                                (MulArrowT `AppT` ConT 'One `AppT` ConT ''BuildState `AppT` ConT ''BuildState))
+                           -- TODO: is this type signature still necessary now that we've moved
+                           -- away from linear types?
+                           SigE (composeActions [VarE fvar `AppE` VarE avar
+                                                | (fvar, avar) <- zip fvars avars])
+                                (MulArrowT `AppT` ConT 'Many `AppT` ConT ''BuildState `AppT` (ConT ''IO `AppT` TupleT 0)))
     | (conname, fieldtys) <- constrs]
 
   return $ LamE [VarP dualvar] $ CaseE (VarE dualvar)
@@ -930,17 +1061,17 @@ deinterleaveData helpernames constrs = do
     | ((conname, fieldtys), body) <- zip constrs bodies
     , let dvars = take (length fieldtys) alldvars]
 
--- Dt[T]                                 -- interleaved program output
---   -> (T                               -- primal result
---      ,T -> BuildState -o BuildState)  -- given adjoint, add initial contributions
+-- Dt[T]                            -- interleaved program output
+--   -> (T                          -- primal result
+--      ,T -> BuildState -> IO ())  -- given adjoint, add initial contributions
 -- The Map contains for each (type name T', type arguments As') combination
 -- that occurs (transitively) in T, the name of a function with type
--- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -o BuildState)'.
+-- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -> IO ())'.
 deinterleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
 deinterleaveType helpernames = \case
   DiscreteST -> do
     dname <- newName "d"
-    return $ LamE [VarP dname] $ pair (VarE dname) (LamE [WildP] (VarE 'PL.id))
+    [| \ $(varP dname) -> ($(varE dname), \_ _ -> return () :: IO ()) |]
 
   ScalarST -> do
     primalname <- newName "prim"
@@ -1004,7 +1135,7 @@ class NumOperation a where
     -> FwdM (DualNum a)        -- output
 
 instance NumOperation Double where
-  type DualNum Double = (Double, (Int, Contrib))
+  type DualNum Double = (Double, (NID, Contrib))
   applyBinaryOp (x, (xi, xcb)) (y, (yi, ycb)) primal grad = do
     let (dx, dy) = grad x y
     i <- fwdmGenId
