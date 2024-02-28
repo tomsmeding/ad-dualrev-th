@@ -152,14 +152,15 @@ newtype JobID = JobID Int
   deriving (Show)
 
 data JobDescr = JobDescr
-    JobID   -- ^ The ID of this job
-    Int     -- ^ Number of IDs generated in this thread (i.e. last ID + 1)
+    {-# UNPACK #-} !JobID   -- ^ The ID of this job
+    {-# UNPACK #-} !Int     -- ^ Number of IDs generated in this thread (i.e. last ID + 1)
     [Fork]  -- ^ Fork history in this thread, last fork at head
   deriving (Show)
 
-data Fork = Fork Int  -- ^ First ID after join
-                 JobDescr  -- ^ Left job
-                 JobDescr  -- ^ Right job
+data Fork = Fork
+    {-# UNPACK #-} !Int  -- ^ First ID after join
+    JobDescr  -- ^ Left job
+    JobDescr  -- ^ Right job
   deriving (Show)
 
 newtype FwdM a = FwdM
