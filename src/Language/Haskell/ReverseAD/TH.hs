@@ -18,7 +18,7 @@
 -- This warning is over-eager in TH quotes when the variables that the pattern
 -- binds are spliced instead of mentioned directly. See
 -- https://gitlab.haskell.org/ghc/ghc/-/issues/22057 . Fixed in GHC 9.6.1.
-{-# OPTIONS -Wno-unused-pattern-binds #-}
+-- {-# OPTIONS -Wno-unused-pattern-binds #-}
 
 module Language.Haskell.ReverseAD.TH (
   -- * Reverse AD
@@ -34,6 +34,7 @@ module Language.Haskell.ReverseAD.TH (
 
 import Control.Applicative (asum)
 import Control.Concurrent
+import Control.Monad (when)
 import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Trans.Class (lift)
 import Control.Parallel (par)
@@ -42,7 +43,7 @@ import Data.Char (isAlphaNum)
 import Data.Foldable (toList)
 import Data.Function ((&))
 import Data.Graph (stronglyConnComp, SCC(..))
-import Data.List (zip4)
+import Data.List (zip4, intercalate)
 import Data.Int (Int8, Int16, Int32, Int64)
 import Data.IORef
 import Data.Map.Strict (Map)
@@ -62,10 +63,16 @@ import System.IO.Unsafe
 
 -- import Control.Monad.IO.Class
 -- import Debug.Trace
--- import System.IO
+import System.IO
 
 import Data.Vector.Storable.Mutable.CAS
 import Language.Haskell.ReverseAD.TH.Orphans ()
+
+
+-- | Whether to enable debug prints in the differentiation code. This is quite
+-- spammy and should be turned off when not actually debugging.
+kDEBUG :: Bool
+kDEBUG = False
 
 
 -- === The program transformation ===
@@ -124,13 +131,12 @@ import Language.Haskell.ReverseAD.TH.Orphans ()
 -- | Parallel (strict) pair construction.
 --
 -- The definition of @x |*| y@ is @x \`'par'\` y \`'par'\` (x, y)@: @x@ and @y@
--- are evaluated in parallel. This also means that this pair constructor is
--- strict, in a sense.
+-- are evaluated in parallel. This also means that this pair constructor is, in
+-- a certain sense, strict.
 --
 -- In differentiation using 'reverseAD', this function is specially interpreted
 -- so that not only the forward pass, but also the reverse gradient pass runs
--- in parallel. This takes some additional administration, so benchmark whether
--- your parallel work is expensive enough to warrant using this combinator.
+-- in parallel.
 (|*|) :: a -> b -> (a, b)
 x |*| y = x `par` y `par` (x, y)
 
@@ -139,13 +145,14 @@ x |*| y = x `par` y `par` (x, y)
 -- The monad for the target program
 -- ------------------------------------------------------------
 
--- | The ID of a parallel job, starting from 1. The implicit main job has ID 0.
+-- | The ID of a parallel job, >=0. The implicit main job has ID 0, parallel
+-- jobs start from 1.
 newtype JobID = JobID Int
   deriving (Show)
 
 data JobDescr = JobDescr
     JobID   -- ^ The ID of this job
-    Int     -- ^ Last ID + 1 generated in this thread (first was 0)
+    Int     -- ^ Number of IDs generated in this thread (i.e. last ID + 1)
     [Fork]  -- ^ Fork history in this thread, last fork at head
   deriving (Show)
 
@@ -187,12 +194,12 @@ instance Monad FwdM where
 runFwdM :: FwdM a -> ([Fork], JobID, Int, a)
 runFwdM (FwdM f) = unsafePerformIO $ do
   jiref <- newIORef (JobID 1)
-  (hist, i, y) <- f mempty jiref (JobID 0) 0
+  (hist, i, y) <- f [] jiref (JobID 0) 0
   nextji <- readIORef jiref
   return (hist, nextji, i, y)
 
--- The 'a' is computed in the current job; 'b' is computed in a new job, of
--- which the ID is returned.
+-- 'a' and 'b' are computed in separate jobs, 'a' on the current thread and 'b'
+-- on a new thread.
 fwdmPar :: FwdM a -> FwdM b -> FwdM (a, b)
 fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \hist jr _curj i -> do
   ji1 <- atomicModifyIORef' jr (\ji@(JobID j) -> (JobID (j + 2), ji))
@@ -207,6 +214,7 @@ fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \hist jr _curj i -> do
 -- the node within this thread.
 data NID = NID {-# UNPACK #-} !JobID
                {-# UNPACK #-} !Int
+  deriving (Show)
 
 fwdmGenId :: FwdM NID
 fwdmGenId = FwdM (\hist _ curj i -> return (hist, i + 1, NID curj i))
@@ -223,12 +231,16 @@ fwdmGenIdInterleave = FwdM $ \hist _ (JobID curj) i ->
 -- ----------------------------------------------------------------------
 
 -- | For each thread, the unzipped vector of (Contrib, adjoint) pairs. The
--- inner "vector" is Nothing if the outputs from that thread haven't been used
--- yet.
+-- inner "vector" is Nothing while the items are still being allocated in
+-- 'allocBS'.
 type MaybeBuildState = MV.IOVector (Maybe (MV.IOVector Contrib, MVS.IOVector Double))
 type BuildState = MV.IOVector (MV.IOVector Contrib, MVS.IOVector Double)
 
 newtype Contrib = Contrib [(NID, Contrib, Double)]
+
+debugContrib :: Contrib -> String
+debugContrib (Contrib l) = "Contrib [" ++ intercalate "," (map go l) ++ "]"
+  where go (nid, _, d) = "(" ++ show nid ++ ", <>, " ++ show d ++ ")"
 
 -- TODO: This function is sequential in the total number of jobs started in the
 -- forward pass, which is technically not good: they were started in parallel,
@@ -253,17 +265,24 @@ allocBS (Fork _ jd1 jd2 : hist) threads = do
 
 resolve :: [Fork] -> Int -> BuildState -> IO ()
 resolve = \hist iout threads -> do
-  loopEnter (JobDescr (JobID 0) (iout - 1) hist) threads
+  when kDEBUG $ hPutStrLn stderr $ "\n---- ENTER RESOLVE ----"
+  loopEnter (JobDescr (JobID 0) iout hist) threads
   where
     loopEnter :: JobDescr -> BuildState -> IO ()
-    loopEnter (JobDescr ji i []) threads = loop 0 [] (NID ji i) threads
-    loopEnter (JobDescr ji i hist@(Fork nexti _ _ : _)) threads = loop nexti hist (NID ji i) threads
+    loopEnter (JobDescr ji i hist) threads = do
+      let joini = case hist of
+                    [] -> 0
+                    Fork nexti _ _ : _ -> nexti
+      let nid = NID ji (i - 1)
+      when kDEBUG $ hPutStrLn stderr $ "Enter job " ++ show ji ++ ", joini=" ++ show joini ++ " from " ++ show nid
+      loop joini hist nid threads
 
     loop :: Int -> [Fork] -> NID -> BuildState -> IO ()
     loop joini hist (NID jid@(JobID ji) i) threads
       | i < joini = case hist of
           [] -> return ()
           Fork _ jd1 jd2 : hist' -> do
+            when kDEBUG $ hPutStrLn stderr $ "Forking jobs (" ++ show (let JobDescr n _ _ = jd1 in n) ++ ") and (" ++ show (let JobDescr n _ _ = jd2 in n) ++ ")"
             done <- newEmptyMVar
             _ <- forkIO $ loopEnter jd2 threads >> putMVar done ()
             loopEnter jd1 threads
@@ -273,13 +292,14 @@ resolve = \hist iout threads -> do
           (cbarr, adjarr) <- MV.read threads ji
           cb <- MV.read cbarr i
           adj <- MVS.read adjarr i
+          when kDEBUG $ hPutStrLn stderr $ "Apply (" ++ show (NID jid i) ++ ") [adj=" ++ show adj ++ "]: " ++ debugContrib cb
           apply cb adj threads
           loop joini hist (NID jid (i - 1)) threads
 
     apply :: Contrib -> Double -> BuildState -> IO ()
     apply (Contrib []) _ _ = return ()
     apply (Contrib ((nid, cb, d) : cbs)) a threads = do
-      addContrib nid cb d threads
+      addContrib nid cb (a * d) threads
       apply (Contrib cbs) a threads
 
 -- This is the function called from the backpropagator built by deinterleave.

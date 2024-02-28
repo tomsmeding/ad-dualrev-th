@@ -436,8 +436,16 @@ main =
        (Just (\_ d -> (5*d, 5*d, 5*d)))
        YesFD] ++
 
+    [checkFDcontrol "parallel small"
+       $$(reverseADandControl @(Double, Double) @Double
+            [|| \(x, y) ->
+                  let p = (x * y * x) |*| (y + y + x)
+                  in fst p + snd p ||])
+       (Just (\(x, y) d -> ((2*x*y + 1) * d, (x^2 + 2) * d)))
+       YesFD] ++
+
     [changeArgs (\a -> a { maxSuccess = 1000 }) $
-     checkFDcontrol "parallel"
+     checkFDcontrol "parallel large"
        $$(reverseADandControl @(Double, Double) @Double
             [|| \(x, y) ->
                   let rotate (a, b) i =
