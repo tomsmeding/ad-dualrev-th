@@ -38,7 +38,7 @@ import Control.Monad (when)
 import Control.Monad.Trans.Maybe (MaybeT(..))
 import Control.Monad.Trans.Class (lift)
 import Control.Parallel (par)
-import Data.Bifunctor (second)
+import Data.Bifunctor (first, second)
 import Data.Char (isAlphaNum)
 import Data.Foldable (toList)
 import Data.Function ((&))
@@ -379,12 +379,16 @@ deriving instance Lift (SimpleType mf)
 type PolyType = SimpleType 'Poly
 type MonoType = SimpleType 'Mono
 
+discreteTypeNames :: [Name]
+discreteTypeNames =
+  [''Int, ''Int8, ''Int16, ''Int32, ''Int64
+  ,''Word, ''Word8, ''Word16, ''Word32, ''Word64
+  ,''Char, ''Bool]
+
 summariseType :: MonadFail m => Type -> m PolyType
 summariseType = \case
   ConT n
-    | n `elem` [''Int, ''Int8, ''Int16, ''Int32, ''Int64
-               ,''Word, ''Word8, ''Word16, ''Word32, ''Word64
-               ,''Char]
+    | n `elem` discreteTypeNames
     -> return DiscreteST
     | n == ''Double -> return ScalarST
     | n == ''Float -> fail "Only Double is an active type for now (Float isn't)"
@@ -393,15 +397,13 @@ summariseType = \case
   ParensT t -> summariseType t
   TupleT k -> return $ ConST (tupleTypeName k) []
   ListT -> return $ ConST ''[] []
-  t@AppT{} -> collectApps t []
+  t@AppT{} -> do
+    let (hd, args) = collectApps t
+    hd' <- summariseType hd
+    args' <- mapM summariseType args
+    smartAppsST hd' args'
   t -> fail $ "Unsupported type: " ++ pprint t
   where
-    collectApps :: MonadFail m => Type -> [PolyType] -> m PolyType
-    collectApps (AppT t1 t2) args = do
-      t2' <- summariseType t2
-      collectApps t1 (t2' : args)
-    collectApps t1 args = summariseType t1 >>= \t1' -> smartAppsST t1' args
-
     smartAppsST :: MonadFail m => PolyType -> [PolyType] -> m PolyType
     smartAppsST DiscreteST _ = fail $ "Discrete type does not take type parameters"
     smartAppsST ScalarST _ = fail $ "'Double' does not take type parameters"
@@ -626,7 +628,13 @@ ddr env = \case
     | name == 'error -> [| pure error |]
     | name == 'fst -> [| pure (pure . fst) |]
     | name == 'snd -> [| pure (pure . snd) |]
-    | otherwise -> fail $ "Free variables not supported in reverseAD: " ++ show name ++ " (env = " ++ show env ++ ")"
+    | otherwise -> do
+        typ <- reifyType name
+        let (params, retty) = unpackFunctionType typ
+        if all isDiscrete params && isDiscrete retty
+          then [| pure $(liftKleisliN (length params) (VarE name)) |]
+          else fail $ "Most free variables not supported in reverseAD: " ++ show name ++
+                      " (env = " ++ show env ++ ")"
 
   ConE name
     | otherwise -> do
@@ -907,16 +915,12 @@ ddrType = \ty ->
     go (MulArrowT `AppT` PromotedT multi `AppT` t1 `AppT` t)
       | multi == 'Many = go (ArrowT `AppT` t1 `AppT` t)
     go ty =
-      case second ($ []) (collectApps ty) of
+      case collectApps ty of
         (TupleT n, args) | length args == n ->
           foldl AppT (TupleT n) <$> traverse go args
         (ConT name, args) ->  -- I hope this one is correct
           foldl AppT (ConT name) <$> traverse go args
         _ -> Left ty  -- don't know how to handle this type
-
-    collectApps :: Type -> (Type, [Type] -> [Type])
-    collectApps (t1 `AppT` t2) = second (. (t2:)) (collectApps t1)
-    collectApps t = (t, id)
 
     pairt :: Type -> Type -> Type
     pairt t1 t2 = TupleT 2 `AppT` t1 `AppT` t2
@@ -1223,6 +1227,29 @@ extractTypeCon (ConT n) = Just (ConT n, [])
 extractTypeCon ListT = Just (ConT ''[], [])
 extractTypeCon (TupleT n) = Just (TupleT n, [])
 extractTypeCon _ = Nothing
+
+-- | Only unpacks normal function arrows, not linear ones.
+unpackFunctionType :: Type -> ([Type], Type)
+unpackFunctionType (ArrowT `AppT` ty `AppT` t) = first (ty :) (unpackFunctionType t)
+unpackFunctionType (MulArrowT `AppT` PromotedT multi `AppT` ty `AppT` t)
+  | multi == 'Many = first (ty :) (unpackFunctionType t)
+unpackFunctionType t = ([], t)
+
+isDiscrete :: Type -> Bool
+isDiscrete (ConT n) = n `elem` discreteTypeNames
+isDiscrete t@AppT{} =
+  let (hd, args) = collectApps t
+  in case hd of
+       TupleT n | length args == n -> all isDiscrete args
+       ListT | [arg] <- args -> isDiscrete arg
+       _ -> False
+isDiscrete _ = False
+
+collectApps :: Type -> (Type, [Type])
+collectApps = \t -> go t []
+  where
+    go (AppT t1 t2) prefix = go t1 (t2 : prefix)
+    go t prefix = (t, prefix)
 
 -- | Given an expression `e`, wraps it in `n` kleisli-lifted lambdas like
 --
