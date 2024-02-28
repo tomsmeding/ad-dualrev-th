@@ -47,3 +47,7 @@ newtype FSumMatVec s = FSumMatVec ([[s]], [s])
 newtype FRotVecQuat s = FRotVecQuat (Vec3 s, Quaternion s)
   deriving (Show, Functor, Foldable, Traversable)
   deriving (Approx, Arbitrary, NFData) via (Vec3 s, Quaternion s)
+
+newtype FParticles s = FParticles [((s, s), (s, s))]
+  deriving (Show, Functor, Foldable, Traversable)
+  deriving (Approx, Arbitrary, NFData) via [((s, s), (s, s))]

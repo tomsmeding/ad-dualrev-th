@@ -10,6 +10,7 @@
 {-# LANGUAGE RankNTypes #-}
 module Main where
 
+import Control.Concurrent
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
 import Control.Monad (when)
@@ -22,6 +23,7 @@ import System.Environment (getArgs)
 import System.Exit (die, exitSuccess, exitFailure)
 
 import DFunction
+import Language.Haskell.ReverseAD.TH ((|*|))
 import Test.Approx
 import Test.Framework hiding (scale)
 import Types
@@ -68,6 +70,32 @@ frotvecquat = $$(makeFunction
               in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
         in rotate_vec_by_quat topv topq ||])
 
+fparticles :: DFunction FParticles Identity
+fparticles = $$(makeFunction
+  [|| \(FParticles l) ->
+        let parmap _ [] = []
+            parmap f (x:xs) =
+              let p = f x |*| parmap f xs
+              in fst p : snd p
+            (a, b) .+ (c, d) = (a + c, b + d)
+            s .* (a, b) = (s * a, s * b)
+            forceField p = (-0.5) .* p
+            friction v = (-0.2) .* v
+            mass = 1.0
+            -- step :: (Double, Double) -> (Double, Double) -> Double
+            --      -> ((Double, Double), (Double, Double))
+            step p v dt =
+              let a = (1.0 / mass) .* (forceField p .+ friction v)
+              in (p .+ (dt .* v), v .+ (dt .* a))
+            -- loop :: Int -> (Double, Double) -> (Double, Double) -> (Double, Double)
+            loop n p v =
+              if n == (0 :: Int) then p
+                else let out = step p v 0.05
+                     in loop (n-1) (fst out) (snd out)
+            sum' [] = 0.0
+            sum' ((x,y):xs) = x*y + sum' xs
+        in Identity $ sum' (parmap (\(p, v) -> loop 1000 p v) l) ||])
+
 data Options = Options
   { argsHelp :: Bool
   , argsOutput :: Maybe FilePath
@@ -109,7 +137,10 @@ main = do
            ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)]
         ,changeArgs (\args -> args { maxSuccess = 5000 }) $
          tree "slow"
-           [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)]]
+           [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)]
+        ,changeArgs (\args -> args { maxSuccess = 50 }) $
+         tree "very slow"
+           [property "fparticles" (\x -> radWithTH fparticles x ~= radWithAD fparticles x)]]
 
     when (not checksOK) exitFailure
 
@@ -117,9 +148,10 @@ main = do
                                          , csvFile = argsCsv options }
   Criterion.runMode
     (Criterion.Run crconfig Criterion.Pattern (reverse (argsPatternsRev options)))
-    [bgroup "fmult"
-      [bench "TH" (nf (radWithTH fmult) (MkFMult (3.0, 4.0)))
-      ,bench "ad" (nf (radWithAD fmult) (MkFMult (3.0, 4.0)))]
+    [bgroup "fmult" $
+      let input = MkFMult (3.0, 4.0) in
+      [bench "TH" (nf (radWithTH fmult) input)
+      ,bench "ad" (nf (radWithAD fmult) input)]
     ,bgroup "fdotprod" $
       let run f n =
             let l1 = take (fromIntegral n) [1..]
@@ -136,10 +168,31 @@ main = do
       in [bench "TH" (toBenchmarkable (run radWithTH))
          ,bench "ad" (toBenchmarkable (run radWithAD))]
     ,bgroup "frotvecquat" $
-      [bench "TH" (nf (radWithTH frotvecquat) (FRotVecQuat (Vec3 1 2 3, Quaternion 4 5 6 7)))
-      ,bench "ad" (nf (radWithAD frotvecquat) (FRotVecQuat (Vec3 1 2 3, Quaternion 4 5 6 7)))]
+      let input = FRotVecQuat (Vec3 1 2 3, Quaternion 4 5 6 7) in
+      [bench "TH" (nf (radWithTH frotvecquat) input)
+      ,bench "ad" (nf (radWithAD frotvecquat) input)]
+    ,bgroup "fparticles" $
+      let input = FParticles [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]] in
+      [bgroup "TH"
+        [envNumCapabilities 1 $ bench "N1" (nf (radWithTH fparticles) input)
+        ,envNumCapabilities 2 $ bench "N2" (nf (radWithTH fparticles) input)
+        ,envNumCapabilities 4 $ bench "N4" (nf (radWithTH fparticles) input)]
+      ,bgroup "ad"
+        [envNumCapabilities 1 $ bench "N1" (nf (radWithAD fparticles) input)
+        ,envNumCapabilities 2 $ bench "N2" (nf (radWithAD fparticles) input)
+        ,envNumCapabilities 4 $ bench "N4" (nf (radWithAD fparticles) input)]
+      ]
     ]
   where
     blockN :: Int -> [a] -> [[a]]
     blockN _ [] = []
     blockN n l = let (pre, post) = splitAt n l in pre : blockN n post
+
+envNumCapabilities :: Int -> Benchmark -> Benchmark
+envNumCapabilities n bm =
+  envWithCleanup
+    (do cur <- getNumCapabilities
+        setNumCapabilities n
+        return cur)
+    (\prev -> setNumCapabilities prev)
+    (\_ -> bm)
