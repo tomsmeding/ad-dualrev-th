@@ -40,6 +40,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Parallel (par)
 import Data.Bifunctor (first, second)
 import Data.Char (isAlphaNum)
+import Data.Either (partitionEithers)
 import Data.Foldable (toList)
 import Data.Function ((&))
 import Data.Graph (stronglyConnComp, SCC(..))
@@ -755,7 +756,7 @@ ddr env = \case
     return (wrap (VarE 'pure `AppE` ListE (map VarE vars)))
 
   SigE e ty ->
-    SigE <$> ddr env e <*> ((ConT ''FwdM `AppT`) <$> ddrType ty)
+    [| $(ddr env e) :: FwdM $(ddrType ty) |]
 
   UnboundVarE n -> fail $ "Free variable in reverseAD: " ++ show n
 
@@ -815,17 +816,21 @@ ddrList env es = do
 -- collective let-block.
 ddrDecs :: Env -> [Dec] -> Q (Maybe (Exp -> Exp, [Name], Set Name))
 ddrDecs env decs = do
-  bindings <- flip traverse decs $ \case
-    ValD (VarP name) (NormalB e) [] -> return (name, e)
+  (signatures, bindings) <- fmap partitionEithers . flip traverse decs $ \case
+    ValD (VarP name) (NormalB e) [] -> return (Right (name, e))
+    SigD name ty -> ddrType ty >>= \ty' -> return (Left (name, ty'))
     dec -> notSupported "Declaration in let" (Just (show dec))
+
+  let signatureMap = Map.fromList signatures
 
   let extendedEnv = env <> Set.fromList (map fst bindings)
 
-  let processDec :: Dec -> Q (Name, Set Name, Exp)
+  let processDec :: Dec -> Q [(Name, Set Name, Exp)]
       processDec = \case
         ValD (VarP name) (NormalB e) [] -> do
           frees <- freeVars extendedEnv e
-          return (name, frees, e)
+          return [(name, frees, e)]
+        SigD{} -> return []
         dec -> fail $ "Unsupported declaration in let: " ++ show dec
 
       fromLam :: Exp -> Maybe (Pat, Exp)
@@ -835,15 +840,24 @@ ddrDecs env decs = do
       fromLam _ = Nothing
 
       handleComp :: Env -> SCC (Name, Exp) -> MaybeT Q Stmt
-      handleComp env' (AcyclicSCC (name, e)) = BindS (VarP name) <$> lift (ddr env' e)
+      handleComp env' (AcyclicSCC (name, e)) = do
+        e' <- lift (ddr env' e)
+        let e'' = case Map.lookup name signatureMap of
+                    Nothing -> e'
+                    Just sig -> SigE e' (AppT (ConT ''FwdM) sig)
+        return (BindS (VarP name) e'')
       handleComp env' (CyclicSCC (unzip -> (names, es)))
         | Just (unzip -> (pats, bodies)) <- traverse fromLam es = lift $ do
             bounds <- traverse boundVars pats
             bodies' <- traverse
                          (\(bound, body) -> ddr (env' <> Set.fromList names <> bound) body)
                          (zip bounds bodies)
-            pure $ LetS [ValD (VarP name) (NormalB (LamE [pat] body)) []
-                        | (name, pat, body) <- zip3 names pats bodies']
+            pure $ LetS $ concat
+              [let dec = ValD (VarP name) (NormalB (LamE [pat] body)) []
+               in case Map.lookup name signatureMap of
+                    Nothing -> [dec]
+                    Just sig -> [SigD name sig, dec]
+              | (name, pat, body) <- zip3 names pats bodies']
         | otherwise =
             MaybeT (return Nothing)
 
@@ -857,7 +871,7 @@ ddrDecs env decs = do
         stmts <- handleComps (env' <> Set.fromList bound) comps
         return (stmt : stmts)
 
-  tups <- mapM processDec decs
+  tups <- concat <$> mapM processDec decs
   let sccs = stronglyConnComp (map (\(name, frees, e) -> ((name, e), name, toList frees)) tups)
   mstmts <- runMaybeT $ handleComps env sccs
   let declared = map fst3 tups
@@ -906,7 +920,7 @@ ddrType = \ty ->
   where
     go :: Type -> Either Type Type
     go (ConT name)
-      | name == ''Double = Right (pairt (ConT ''Double) (pairt (ConT ''Int) (ConT ''Contrib)))
+      | name == ''Double = Right (pairt (ConT ''Double) (pairt (ConT ''NID) (ConT ''Contrib)))
       | name == ''Int = Right (ConT ''Int)
     go (ArrowT `AppT` t1 `AppT` t) = do
       t1' <- go t1
@@ -1267,9 +1281,11 @@ liftKleisliN n e = do
 --   f = \arg1 arg2 arg3 -> case (arg1, arg2, arg3) of
 --                            (a, b, c) -> E
 --                            (d, e, f) -> F
+--
+-- SigD, i.e. type signatures, are passed through unchanged.
 desugarDec :: (Quote m, MonadFail m) => Dec -> m Dec
 desugarDec = \case
-  dec@(ValD (VarP _) (NormalB _) []) -> return $ dec
+  dec@(ValD (VarP _) (NormalB _) []) -> return dec
 
   FunD _ [] -> fail "Function declaration with empty list of clauses?"
 
@@ -1294,6 +1310,8 @@ desugarDec = \case
         Left $ "Where blocks not supported in declaration of " ++ show name
       fromSimpleClause (Clause _ GuardedB{} _) =
         Left $ "Guards not supported in declaration of " ++ show name
+
+  SigD name typ -> return (SigD name typ)
 
   dec -> fail $ "Only simple let bindings supported in reverseAD: " ++ show dec
   where
