@@ -306,7 +306,8 @@ resolve = \hist iout threads -> do
       addContrib nid cb (a * d) threads
       apply (Contrib cbs) a threads
 
--- This is the function called from the backpropagator built by deinterleave.
+-- This is the function called from the backpropagator built by deinterleave,
+-- as well as from 'resolve'.
 addContrib :: NID -> Contrib -> Double -> BuildState -> IO ()
 addContrib (NID (JobID ji) i) cb adj threads = do
   (cbarr, adjarr) <- MV.read threads ji
