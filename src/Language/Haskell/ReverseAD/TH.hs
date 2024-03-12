@@ -195,6 +195,7 @@ mpure = pure
 -- - fork history on the main thread
 -- - highest JobID generated plus 1
 -- - highest id generated plus 1
+{-# NOINLINE runFwdM #-}
 runFwdM :: FwdM a -> ([Fork], JobID, Int, a)
 runFwdM (FwdM f) = unsafePerformIO $ do
   jiref <- newIORef (JobID 1)
@@ -320,6 +321,7 @@ addContrib (NID (JobID ji) i) cb adj threads = do
   -- hPutStrLn stderr $ "aC: [" ++ show ji ++ "] " ++ show i ++ ": " ++ show orig ++ " + " ++ show adj ++ " = " ++ show (orig + adj)
 
 -- | Returns adjoints of the main (initial) thread.
+{-# NOINLINE dualpass #-}
 dualpass :: [Fork] -> JobID -> Int -> (d -> BuildState -> IO ()) -> d -> VS.Vector Double
 dualpass hist (JobID numJobs) iout backprop adj = unsafePerformIO $ do
   threads' <- MV.replicate numJobs Nothing
