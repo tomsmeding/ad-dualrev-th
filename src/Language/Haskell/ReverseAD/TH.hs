@@ -625,7 +625,7 @@ ddr env = \case
         gname <- newName "g"
         xname <- newName "x"
         ddr env (LamE [VarP fname, VarP gname, VarP xname] (AppE (VarE fname) (AppE (VarE gname) (VarE xname))))
-    | name `elem` ['(+), '(-), '(*), '(/)] -> do
+    | name `elem` ['(+), '(-), '(*), '(/), '(|*|)] -> do
         xname <- newName "x"
         yname <- newName "y"
         ddr env (LamE [VarP xname, VarP yname] (InfixE (Just (VarE xname)) (VarE name) (Just (VarE yname))))
