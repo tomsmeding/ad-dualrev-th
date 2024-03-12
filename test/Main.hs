@@ -6,6 +6,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
+-- {-# OPTIONS -ddump-splices #-}
 module Main where
 
 import Prelude hiding ((^))
@@ -20,6 +21,7 @@ import Language.Haskell.ReverseAD.TH ((|*|))
 import ControlFun
 import FinDiff
 import ForwardAD
+import GenDAG
 import Test.Approx
 import Test.Framework hiding (elements, scale)
 import Types
@@ -29,13 +31,6 @@ import Types
 (^) :: Num a => a -> Int -> a
 (^) = (Prelude.^)
 
-
-checkControl :: (Arbitrary a, Arbitrary b, Approx a, Approx b, Show a, Show b)
-             => String -> (a -> (b, b -> a)) -> (a -> b) -> (a -> b -> a) -> Tree
-checkControl name program controlfun controlgrad =
-  property name $ \x adj ->
-    let (y1, df1) = program x
-    in y1 ~= controlfun x .&&. df1 adj ~= controlgrad x adj
 
 data DoCheckFinDiff = YesFD | NoFD
   deriving (Show)
@@ -463,5 +458,25 @@ main =
                 let ang = 300 * 0.1 + 0.05 * sum [sin (fromIntegral i) | i <- [1::Int .. 300]]
                 in (d * 2 * cos ang, d * 2 * cos ang)))
        YesFD] ++
+
+    [changeArgs (\a -> a { maxSuccess = 2000 }) $
+     checkFDcontrol "parallel random"
+       $$(reverseADandControl @(DAG Double, Double) @Double
+            [|| \(dag, srcval) ->
+                  let interpret par fork join extend = go
+                        where
+                          go s Source = s
+                          go s (Extend x g) = extend x (go s g)
+                          go s (Split (g1, g2) g) =
+                            let s' = go s g
+                                (s1, s2) = fork s'
+                                (s1', s2') = par (go s1 g1) (go s2 g2)
+                            in join (s1', s2')
+                      ffork x = (x + 2.0, x + 1.0)
+                      fjoin (x, y) = x + y * 0.9
+                      fextend x s = x * s / log ((x + s) * (x + s) + 2.0)
+                  in interpret (|*|) ffork fjoin fextend srcval dag ||])
+       Nothing
+       NoFD] ++
 
     []

@@ -291,7 +291,7 @@ resolve = \hist iout threads -> do
             _ <- forkIO $ loopEnter jd2 threads >> putMVar done ()
             loopEnter jd1 threads
             readMVar done
-            loopEnter (JobDescr jid i hist') threads
+            loopEnter (JobDescr jid (i + 1) hist') threads
       | otherwise = do
           (cbarr, adjarr) <- MV.read threads ji
           cb <- MV.read cbarr i

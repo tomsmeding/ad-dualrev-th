@@ -63,6 +63,7 @@ test-suite test
     ControlFun
     FinDiff
     ForwardAD
+    GenDAG
     Types
   ghc-options: -Wall -O2 -threaded -rtsopts
   build-depends:
