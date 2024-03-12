@@ -731,7 +731,7 @@ ddr env = \case
               ,NoBindS (CondE (VarE boolName) e2' e3')])
 
   LetE decs body -> do
-    decs' <- mapM desugarDec decs
+    decs' <- concat <$> mapM desugarDec decs
     (wrap, vars, _) <- ddrDecs env decs'
     body' <- ddr (env <> Set.fromList vars) body
     return $ wrap body'
@@ -740,12 +740,12 @@ ddr env = \case
     (wrap, [evar]) <- ddrList env [expr]
     matches' <- sequence
       [case mat of
-         Match pat (NormalB rhs) [] -> do
+         Match pat (NormalB rhs) wdecs -> do
            patbound <- boundVars pat
            pat' <- ddrPat pat
-           rhs' <- ddr (env <> patbound) rhs
+           rhs' <- ddr (env <> patbound) (letE' wdecs rhs)
            return (pat', rhs')
-         _ -> fail "Where blocks or guards not supported in case expressions"
+         _ -> fail "Guards not supported in case expressions"
       | mat <- matches]
     return $ wrap $
       CaseE (VarE evar)
@@ -1281,9 +1281,28 @@ liftKleisliN n e = do
 --                            (d, e, f) -> F
 --
 -- SigD, i.e. type signatures, are passed through unchanged.
-desugarDec :: (Quote m, MonadFail m) => Dec -> m Dec
+desugarDec :: (Quote m, MonadFail m) => Dec -> m [Dec]
 desugarDec = \case
-  dec@(ValD (VarP _) (NormalB _) []) -> return dec
+  ValD (VarP var) (NormalB rhs) wdecs ->
+    return [ValD (VarP var) (NormalB (letE' wdecs rhs)) []]
+
+  ValD pat (NormalB rhs) wdecs -> do
+    tupname <- newName "vartup"
+    xname <- newName "x"
+    vars <- toList <$> boundVars pat
+    let nvars = length vars
+    return $
+      ValD (VarP tupname)
+           (NormalB (CaseE (letE' wdecs rhs)
+              [Match pat (NormalB (TupE (map (Just . VarE) vars))) []]))
+           []
+      : [ValD (VarP var)
+              (NormalB (CaseE (VarE tupname)
+                 [Match (TupP (replicate i WildP ++ [VarP xname] ++ replicate (nvars - 1 - i) WildP))
+                        (NormalB (VarE xname))
+                        []]))
+              []
+        | (i, var) <- zip [0..] vars]
 
   FunD _ [] -> fail "Function declaration with empty list of clauses?"
 
@@ -1298,18 +1317,18 @@ desugarDec = \case
                          CaseE (TupE (map (Just . VarE) argnames))
                            [Match (TupP ps) (NormalB rhs) []
                            | (ps, rhs) <- cpairs]
-            return $ ValD (VarP name) (NormalB body) []
+            return [ValD (VarP name) (NormalB body) []]
         | otherwise ->
             fail $ "Clauses of declaration of " ++ show name ++
                    " do not all have the same number of arguments"
     where
       fromSimpleClause (Clause pats (NormalB body) []) = Right (pats, body)
-      fromSimpleClause (Clause _ _ (_:_)) =
-        Left $ "Where blocks not supported in declaration of " ++ show name
+      fromSimpleClause (Clause pats (NormalB body) wdecs) =
+        fromSimpleClause (Clause pats (NormalB (letE' wdecs body)) [])
       fromSimpleClause (Clause _ GuardedB{} _) =
         Left $ "Guards not supported in declaration of " ++ show name
 
-  SigD name typ -> return (SigD name typ)
+  SigD name typ -> return [SigD name typ]
 
   dec -> fail $ "Only simple let bindings supported in reverseAD: " ++ show dec
   where
@@ -1347,7 +1366,7 @@ freeVars env = \case
   CondE e1 e2 e3 -> combine (map (freeVars env) [e1, e2, e3])
   e@MultiIfE{} -> notSupported "Multi-way ifs" (Just (show e))
   LetE decs body -> do
-    decs' <- mapM desugarDec decs
+    decs' <- concat <$> mapM desugarDec decs
     (_, bound, frees) <- ddrDecs env decs'
     (frees <>) <$> freeVars (env <> Set.fromList bound) body
   CaseE e ms -> (<>) <$> freeVars env e <*> combine (map go ms)
@@ -1392,6 +1411,12 @@ boundVars = \case
   ListP ps -> combine (map boundVars ps)
   SigP p _ -> boundVars p
   p@ViewP{} -> notSupported "View patterns" (Just (show p))
+
+-- | Constructs a 'LetE', but returns the rhs untouched if the list is empty
+-- instead of creating an empty let block.
+letE' :: [Dec] -> Exp -> Exp
+letE' [] rhs = rhs
+letE' ds rhs = LetE ds rhs
 
 combine :: (Monad m, Monoid a) => [m a] -> m a
 combine = fmap mconcat . sequence
