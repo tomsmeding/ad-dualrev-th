@@ -35,8 +35,6 @@ module Language.Haskell.ReverseAD.TH (
 import Control.Applicative (asum)
 import Control.Concurrent
 import Control.Monad (when)
-import Control.Monad.Trans.Maybe (MaybeT(..))
-import Control.Monad.Trans.Class (lift)
 import Control.Parallel (par)
 import Data.Bifunctor (first, second)
 import Data.Char (isAlphaNum)
@@ -734,12 +732,9 @@ ddr env = \case
 
   LetE decs body -> do
     decs' <- mapM desugarDec decs
-    ddrDecs env decs' >>= \case
-      Just (wrap, vars, _) -> do
-        body' <- ddr (env <> Set.fromList vars) body
-        return $ wrap body'
-      Nothing ->
-        notSupported "Recursive non-function declarations in let" (Just (show (LetE decs body)))
+    (wrap, vars, _) <- ddrDecs env decs'
+    body' <- ddr (env <> Set.fromList vars) body
+    return $ wrap body'
 
   CaseE expr matches -> do
     (wrap, [evar]) <- ddrList env [expr]
@@ -815,11 +810,11 @@ ddrList env es = do
             DoE Nothing $ [BindS (VarP nx) e | (nx, e) <- zip names rhss] ++ [NoBindS rest]
          ,names)
 
--- | Assumes the declarations occur in a let block. If non-recursive (apart
--- from function bindings), returns a wrapper that defines all of the names,
--- the list of defined names, and the set of all free variables of the
--- collective let-block.
-ddrDecs :: Env -> [Dec] -> Q (Maybe (Exp -> Exp, [Name], Set Name))
+-- | Assumes the declarations occur in a let block. Checks that the
+-- non-function bindings are non-recursive.
+-- Returns a wrapper that defines all of the names, the list of defined names,
+-- and the set of all free variables of the collective let-block.
+ddrDecs :: Env -> [Dec] -> Q (Exp -> Exp, [Name], Set Name)
 ddrDecs env decs = do
   (signatures, bindings) <- fmap partitionEithers . flip traverse decs $ \case
     ValD (VarP name) (NormalB e) [] -> return (Right (name, e))
@@ -844,15 +839,15 @@ ddrDecs env decs = do
       fromLam (ParensE e) = fromLam e
       fromLam _ = Nothing
 
-      handleComp :: Env -> SCC (Name, Exp) -> MaybeT Q Stmt
+      handleComp :: Env -> SCC (Name, Exp) -> Q Stmt
       handleComp env' (AcyclicSCC (name, e)) = do
-        e' <- lift (ddr env' e)
+        e' <- ddr env' e
         let e'' = case Map.lookup name signatureMap of
                     Nothing -> e'
                     Just sig -> SigE e' (AppT (ConT ''FwdM) sig)
         return (BindS (VarP name) e'')
       handleComp env' (CyclicSCC (unzip -> (names, es)))
-        | Just (unzip -> (pats, bodies)) <- traverse fromLam es = lift $ do
+        | Just (unzip -> (pats, bodies)) <- traverse fromLam es = do
             bounds <- traverse boundVars pats
             bodies' <- traverse
                          (\(bound, body) -> ddr (env' <> Set.fromList names <> bound) body)
@@ -864,9 +859,9 @@ ddrDecs env decs = do
                     Just sig -> [SigD name sig, dec]
               | (name, pat, body) <- zip3 names pats bodies']
         | otherwise =
-            MaybeT (return Nothing)
+            notSupported "Recursive non-function bindings" (Just (show (length names, length es, zip names es)))
 
-      handleComps :: Env -> [SCC (Name, Exp)] -> MaybeT Q [Stmt]
+      handleComps :: Env -> [SCC (Name, Exp)] -> Q [Stmt]
       handleComps _ [] = return []
       handleComps env' (comp : comps) = do
         let bound = case comp of
@@ -878,15 +873,13 @@ ddrDecs env decs = do
 
   tups <- concat <$> mapM processDec decs
   let sccs = stronglyConnComp (map (\(name, frees, e) -> ((name, e), name, toList frees)) tups)
-  mstmts <- runMaybeT $ handleComps env sccs
+  stmts <- handleComps env sccs
   let declared = map fst3 tups
 
-  case mstmts of
-    Nothing -> return Nothing
-    Just stmts -> return $ Just
-                    (\rest -> DoE Nothing $ stmts ++ [NoBindS rest]
-                    ,declared
-                    ,Set.unions [frees | (_, frees, _) <- tups] Set.\\ Set.fromList declared)
+  return
+    (\rest -> DoE Nothing $ stmts ++ [NoBindS rest]
+    ,declared
+    ,Set.unions [frees | (_, frees, _) <- tups] Set.\\ Set.fromList declared)
 
 ddrPat :: Pat -> Q Pat
 ddrPat = \case
@@ -1354,9 +1347,9 @@ freeVars env = \case
   CondE e1 e2 e3 -> combine (map (freeVars env) [e1, e2, e3])
   e@MultiIfE{} -> notSupported "Multi-way ifs" (Just (show e))
   LetE decs body -> do
-    ddrDecs env decs >>= \case
-      Just (_, bound, frees) -> (frees <>) <$> freeVars (env <> Set.fromList bound) body
-      Nothing -> notSupported "Recursive declarations in let" (Just (show (LetE decs body)))
+    decs' <- mapM desugarDec decs
+    (_, bound, frees) <- ddrDecs env decs'
+    (frees <>) <$> freeVars (env <> Set.fromList bound) body
   CaseE e ms -> (<>) <$> freeVars env e <*> combine (map go ms)
     where go :: Match -> Q (Set Name)
           go (Match pat (NormalB rhs) []) = do
