@@ -189,6 +189,10 @@ instance Monad FwdM where
     let FwdM h = g x
     h hist1 jr curj i1
 
+-- | 'pure' with a restricted type.
+mpure :: a -> FwdM a
+mpure = pure
+
 -- Returns:
 -- - fork history on the main thread
 -- - highest JobID generated plus 1
@@ -559,7 +563,7 @@ transform inpStruc outStruc (LamE [pat] expr) = do
         let ($(varP histvar), $(varP outjivar), $(varP ioutvar), ($(varP outvar), $(varP rebuildvar))) = runFwdM $ do
               ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
               $(varP out'var) <- $(ddr patbound expr)
-              pure ($(varE out'var), $(varE rebuild'var))
+              mpure ($(varE out'var), $(varE rebuild'var))
             ($(varP primalvar), $(varP dualvar)) = $(deinterleave outStruc (VarE outvar))
         in ($(varE primalvar)
            ,\ $(varP adjvar) ->
@@ -584,35 +588,35 @@ type Env = Set Name
 ddr :: Env -> Exp -> Q Exp
 ddr env = \case
   VarE name
-    | name `Set.member` env -> [| pure $(varE name) |]
-    | name == 'fromIntegral -> [| pure fromIntegralOp |]
+    | name `Set.member` env -> [| mpure $(varE name) |]
+    | name == 'fromIntegral -> [| mpure fromIntegralOp |]
     | name == 'negate -> do
         xname <- newName "x"
-        [| pure (\ $(varP xname) -> applyUnaryOp $(varE xname) negate (\_ -> (-1))) |]
+        [| mpure (\ $(varP xname) -> applyUnaryOp $(varE xname) negate (\_ -> (-1))) |]
     | name == 'sqrt -> do
         xname <- newName "x"
         pname <- newName "p"
-        [| pure (\ $(varP xname) ->
+        [| mpure (\ $(varP xname) ->
               applyUnaryOp $(varE xname) sqrt (\ $(varP pname) -> 1 / (2 * sqrt $(varE pname)))) |]
     | name == 'exp -> do
         xname <- newName "x"
         primalname <- newName "p"
-        [| pure (\ $(varP xname) ->
+        [| mpure (\ $(varP xname) ->
               applyUnaryOp2 $(varE xname) exp (\_ $(varP primalname) -> $(varE primalname))) |]
     | name == 'log -> do
         xname <- newName "x"
         pname <- newName "p"
-        [| pure (\ $(varP xname) ->
+        [| mpure (\ $(varP xname) ->
               applyUnaryOp $(varE xname) log (\ $(varP pname) -> 1 / $(varE pname))) |]
     | name == 'sin -> do
         xname <- newName "x"
         pname <- newName "p"
-        [| pure (\ $(varP xname) ->
+        [| mpure (\ $(varP xname) ->
               applyUnaryOp $(varE xname) sin (\ $(varP pname) -> cos $(varE pname))) |]
     | name == 'cos -> do
         xname <- newName "x"
         pname <- newName "p"
-        [| pure (\ $(varP xname) ->
+        [| mpure (\ $(varP xname) ->
               applyUnaryOp $(varE xname) cos (\ $(varP pname) -> - sin $(varE pname))) |]
     | name == '($) -> do
         fname <- newName "f"
@@ -627,31 +631,31 @@ ddr env = \case
         xname <- newName "x"
         yname <- newName "y"
         ddr env (LamE [VarP xname, VarP yname] (InfixE (Just (VarE xname)) (VarE name) (Just (VarE yname))))
-    | name == 'error -> [| pure error |]
-    | name == 'fst -> [| pure (pure . fst) |]
-    | name == 'snd -> [| pure (pure . snd) |]
+    | name == 'error -> [| mpure error |]
+    | name == 'fst -> [| mpure (mpure . fst) |]
+    | name == 'snd -> [| mpure (mpure . snd) |]
     | otherwise -> do
         typ <- reifyType name
         let (params, retty) = unpackFunctionType typ
         if all isDiscrete params && isDiscrete retty
-          then [| pure $(liftKleisliN (length params) (VarE name)) |]
+          then [| mpure $(liftKleisliN (length params) (VarE name)) |]
           else fail $ "Most free variables not supported in reverseAD: " ++ show name ++
                       " (env = " ++ show env ++ ")"
 
   ConE name
     | otherwise -> do
         fieldtys <- checkDatacon name
-        (VarE 'pure `AppE`) <$> liftKleisliN (length fieldtys) (ConE name)
+        [| mpure $(liftKleisliN (length fieldtys) (ConE name)) |]
 
   LitE lit -> case lit of
     RationalL _ -> do
       iname <- newName "i"
       [| do $(varP iname) <- fwdmGenId
-            pure ($(litE lit), ($(varE iname), Contrib [])) |]
+            mpure ($(litE lit), ($(varE iname), Contrib [])) |]
     FloatPrimL _ -> fail "float prim?"
     DoublePrimL _ -> fail "double prim?"
-    IntegerL _ -> [| pure $(litE lit) |]
-    StringL _ -> [| pure $(litE lit) |]
+    IntegerL _ -> [| mpure $(litE lit) |]
+    StringL _ -> [| mpure $(litE lit) |]
     _ -> fail $ "literal? " ++ show lit
 
   AppE e1 e2 -> do
@@ -691,7 +695,7 @@ ddr env = \case
               (wrap, [x1name, x2name]) <- ddrList env [e1, e2]
               t1name <- newName "arg1"
               t2name <- newName "arg2"
-              return $ wrap $ VarE 'pure `AppE`
+              return $ wrap $ VarE 'mpure `AppE`
                 foldl AppE (VarE 'applyCmpOp)
                   [VarE x1name, VarE x2name
                   ,LamE [VarP t1name, VarP t2name] $
@@ -713,11 +717,11 @@ ddr env = \case
   LamE [pat] e -> do
     patbound <- boundVars pat
     e' <- ddr (env <> patbound) e
-    [| pure (\ $(pure pat) -> $(pure e')) |]
+    [| mpure (\ $(pure pat) -> $(pure e')) |]
 
   TupE mes | Just es <- sequence mes -> do
     (wrap, vars) <- ddrList env es
-    return (wrap $ VarE 'pure `AppE` TupE (map (Just . VarE) vars))
+    return (wrap $ VarE 'mpure `AppE` TupE (map (Just . VarE) vars))
 
   CondE e1 e2 e3 -> do
     e1' <- ddr env e1
@@ -754,7 +758,7 @@ ddr env = \case
 
   ListE es -> do
     (wrap, vars) <- ddrList env es
-    return (wrap (VarE 'pure `AppE` ListE (map VarE vars)))
+    return (wrap (VarE 'mpure `AppE` ListE (map VarE vars)))
 
   SigE e ty ->
     [| $(ddr env e) :: FwdM $(ddrType ty) |]
@@ -977,8 +981,8 @@ interleaveData helpernames constrs = do
         --   do (post₁, rebuild₁) <- $(interleaveType helpernames f₁) inp₁
         --      (post₂, rebuild₂) <- $(interleaveType helpernames f₂) inp₂
         --      (post₃, rebuild₃) <- $(interleaveType helpernames f₃) inp₃
-        --      pure (C post₁ post₂ post₃
-        --           ,\arr -> C (rebuild₁ arr) (rebuild₂ arr) (rebuild₃ arr))
+        --      mpure (C post₁ post₂ post₃
+        --            ,\arr -> C (rebuild₁ arr) (rebuild₂ arr) (rebuild₃ arr))
         --
         -- interleaveType helpernames (Monotype for T) :: Exp (T -> FwdM (Dt[T], Vector Double -> T))
         let inpvars = take (length fieldtys) allinpvars
@@ -992,7 +996,7 @@ interleaveData helpernames constrs = do
           | (inpvar, postvar, rebuildvar, expr)
                <- zip4 inpvars postvars rebuildvars exps]
           ++
-          [NoBindS $ VarE 'pure `AppE`
+          [NoBindS $ VarE 'mpure `AppE`
               pair (foldl AppE (ConE conname) (map VarE postvars))
                    (LamE [if null rebuildvars then WildP else VarP arrname] $
                       foldl AppE (ConE conname)
@@ -1019,7 +1023,7 @@ interleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
 interleaveType helpernames = \case
   DiscreteST -> do
     inpxvar <- newName "inpx"
-    [| \ $(varP inpxvar) -> pure ($(varE inpxvar), \_ -> $(varE inpxvar)) |]
+    [| \ $(varP inpxvar) -> mpure ($(varE inpxvar), \_ -> $(varE inpxvar)) |]
 
   ScalarST -> do
     inpxvar <- newName "inpx"
@@ -1027,8 +1031,8 @@ interleaveType helpernames = \case
     arrvar <- newName "arr"
     [| \ $(varP inpxvar) -> do
            $(varP ivar) <- fwdmGenIdInterleave
-           pure (($(varE inpxvar), (NID (JobID 0) $(varE ivar), Contrib []))
-                ,\ $(varP arrvar) -> $(varE arrvar) VS.! $(varE ivar)) |]
+           mpure (($(varE inpxvar), (NID (JobID 0) $(varE ivar), Contrib []))
+                 ,\ $(varP arrvar) -> $(varE arrvar) VS.! $(varE ivar)) |]
 
   ConST tyname argtys ->
     return $ VarE $ case Map.lookup (tyname, argtys) helpernames of
@@ -1273,7 +1277,7 @@ liftKleisliN :: Int -> Exp -> Q Exp
 liftKleisliN 0 e = return e
 liftKleisliN n e = do
   name <- newName "x"
-  [| \ $(varP name) -> pure $(liftKleisliN (n - 1) (e `AppE` VarE name)) |]
+  [| \ $(varP name) -> mpure $(liftKleisliN (n - 1) (e `AppE` VarE name)) |]
 
 -- Convert function declarations to simple variable declarations:
 --   f a b c = E
