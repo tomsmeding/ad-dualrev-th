@@ -479,4 +479,10 @@ main =
        Nothing
        NoFD] ++
 
+    -- TODO: test whether the reverse pass is really done in parallel with |*|,
+    -- or if it's only the forward pass. We're seeing speedups when a program
+    -- using |*| is run with -N2, but less than 50%, so at least theoretically
+    -- that could also be either only the forward pass or only the reverse
+    -- pass.
+
     []
