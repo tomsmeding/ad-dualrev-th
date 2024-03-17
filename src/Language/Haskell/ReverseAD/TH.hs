@@ -767,8 +767,9 @@ ddrDecs env decs = do
 ddrDecGroup :: Env -> DecGroup -> Q (Stmt, [Name])
 ddrDecGroup env (DecVar name msig rhs) = do
   rhs' <- ddr env rhs
-  let rhs'' = case msig of Just sig -> SigE rhs' (AppT (ConT ''FwdM) sig)
-                           Nothing -> rhs'
+  rhs'' <- case msig of Just sig -> do sig' <- ddrType sig
+                                       return $ SigE rhs' (AppT (ConT ''FwdM) sig')
+                        Nothing -> return rhs'
   return (BindS (VarP name) rhs'', [name])
 ddrDecGroup env (DecMutGroup lams) = do
   let names = [name | (name, _, _, _) <- lams]

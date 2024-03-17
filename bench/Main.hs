@@ -75,8 +75,8 @@ fparticles = $$(makeFunction
   [|| \(FParticles l) ->
         let parmap _ [] = []
             parmap f (x:xs) =
-              let p = f x |*| parmap f xs
-              in fst p : snd p
+              let (y, ys) = f x |*| parmap f xs
+              in y : ys
             (a, b) .+ (c, d) = (a + c, b + d)
             s .* (a, b) = (s * a, s * b)
             forceField p = (-0.5) .* p
@@ -90,8 +90,8 @@ fparticles = $$(makeFunction
             -- loop :: Int -> (Double, Double) -> (Double, Double) -> (Double, Double)
             loop n p v =
               if n == (0 :: Int) then p
-                else let out = step p v 0.05
-                     in loop (n-1) (fst out) (snd out)
+                else let (p', v') = step p v 0.05
+                     in loop (n-1) p' v'
             sum' [] = 0.0
             sum' ((x,y):xs) = x*y + sum' xs
         in Identity $ sum' (parmap (\(p, v) -> loop 1000 p v) l) ||])

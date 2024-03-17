@@ -434,8 +434,8 @@ main =
     [checkFDcontrol "parallel small"
        $$(reverseADandControl @(Double, Double) @Double
             [|| \(x, y) ->
-                  let p = (x * y * x) |*| (y + y + x)
-                  in fst p + snd p ||])
+                  let (a, b) = (x * y * x) |*| (y + y + x)
+                  in a + b ||])
        (Just (\(x, y) d -> ((2*x*y + 1) * d, (x^2 + 2) * d)))
        YesFD] ++
 
@@ -451,9 +451,8 @@ main =
                                          ,a * sin ang + b * cos ang)
                                          (i - 1)
                       n = 300 :: Int
-                      out = rotate (x, y) n |*| rotate (y, x) n
-                  in case out of
-                       ((a1, b1), (a2, b2)) -> a1 + b1 + a2 + b2 ||])
+                      ((a1, b1), (a2, b2)) = rotate (x, y) n |*| rotate (y, x) n
+                  in a1 + b1 + a2 + b2 ||])
        (Just (\_ d ->
                 let ang = 300 * 0.1 + 0.05 * sum [sin (fromIntegral i) | i <- [1::Int .. 300]]
                 in (d * 2 * cos ang, d * 2 * cos ang)))
