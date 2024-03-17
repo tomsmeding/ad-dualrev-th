@@ -129,18 +129,15 @@ main = do
 
   when (not (argsNoTest options)) $ do
     checksOK <- runTestsPatterns (reverse (argsPatternsRev options)) $
+      changeArgs (\args -> args { maxSuccess = 50000 }) $
       tree "correctness"
-        [changeArgs (\args -> args { maxSuccess = 50000 }) $
-         tree "fast"
-           [property "fmult" (\x -> radWithTH fmult x ~= radWithAD fmult x)
-           ,property "fdotprod" (\x -> radWithTH fdotprod x ~= radWithAD fdotprod x)
-           ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)]
+        [property "fmult" (\x -> radWithTH fmult x ~= radWithAD fmult x)
+        ,property "fdotprod" (\x -> radWithTH fdotprod x ~= radWithAD fdotprod x)
+        ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)
         ,changeArgs (\args -> args { maxSuccess = 5000 }) $
-         tree "slow"
-           [property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)]
+           property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)
         ,changeArgs (\args -> args { maxSuccess = 50 }) $
-         tree "very slow"
-           [property "fparticles" (\x -> radWithTH fparticles x ~= radWithAD fparticles x)]]
+           property "fparticles" (\x -> radWithTH fparticles x ~= radWithAD fparticles x)]
 
     when (not checksOK) exitFailure
 
