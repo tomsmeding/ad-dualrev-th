@@ -463,19 +463,19 @@ main =
      checkFDcontrol "parallel random"
        $$(reverseADandControl @(DAG Double, Double) @Double
             [|| \(dag, srcval) ->
-                  let interpret par fork join extend = go
+                  let interpret fork join extend = go
                         where
                           go s Source = s
                           go s (Extend x g) = extend x (go s g)
                           go s (Split (g1, g2) g) =
                             let s' = go s g
                                 (s1, s2) = fork s'
-                                (s1', s2') = par (go s1 g1) (go s2 g2)
+                                (s1', s2') = go s1 g1 |*| go s2 g2
                             in join (s1', s2')
                       ffork x = (x + 2.0, x + 1.0)
                       fjoin (x, y) = x + y * 0.9
                       fextend x s = x * s / log ((x + s) * (x + s) + 2.0)
-                  in interpret (|*|) ffork fjoin fextend srcval dag ||])
+                  in interpret ffork fjoin fextend srcval dag ||])
        Nothing
        NoFD] ++
 
