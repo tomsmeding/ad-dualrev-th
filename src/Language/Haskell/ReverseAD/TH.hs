@@ -7,6 +7,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -32,22 +33,16 @@ module Language.Haskell.ReverseAD.TH (
   (|*|),
 ) where
 
-import Control.Applicative (asum)
 import Control.Concurrent
 import Control.Monad (when)
 import Control.Parallel (par)
 import Data.Bifunctor (first, second)
 import Data.Char (isAlphaNum)
-import Data.Either (partitionEithers)
-import Data.Foldable (toList)
-import Data.Function ((&))
-import Data.Graph (stronglyConnComp, SCC(..))
 import Data.List (zip4, intercalate)
 import Data.Int (Int8, Int16, Int32, Int64)
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Typeable
@@ -57,7 +52,7 @@ import qualified Data.Vector.Storable.Mutable as MVS
 import Data.Word (Word8, Word16, Word32, Word64)
 import GHC.Exts (Multiplicity(..))
 import Language.Haskell.TH
-import Language.Haskell.TH.Syntax hiding (lift)
+import Language.Haskell.TH.Syntax as TH hiding (lift)
 import System.IO.Unsafe
 
 -- import Control.Monad.IO.Class
@@ -66,6 +61,8 @@ import System.IO
 
 import Data.Vector.Storable.Mutable.CAS
 import Language.Haskell.ReverseAD.TH.Orphans ()
+import Language.Haskell.ReverseAD.TH.Source as Source
+import Language.Haskell.ReverseAD.TH.Translate
 
 
 -- | Whether to enable debug prints in the differentiation code. This is quite
@@ -546,8 +543,15 @@ reverseAD' inpStruc outStruc (unTypeCode -> inputCode) =
     ex <- inputCode
     transform inpStruc' outStruc' ex
 
-transform :: Structure -> Structure -> Exp -> Q Exp
-transform inpStruc outStruc (LamE [pat] expr) = do
+transform :: Structure -> Structure -> TH.Exp -> Q TH.Exp
+transform inpStruc outStruc expr = do
+  expr' <- translate expr
+  case expr' of
+    ELam pat body -> transform' inpStruc outStruc pat body
+    _ -> fail $ "Top-level expression in reverseAD must be lambda, but is: " ++ show expr'
+
+transform' :: Structure -> Structure -> Pat -> Source.Exp -> Q TH.Exp
+transform' inpStruc outStruc pat expr = do
   patbound <- boundVars pat
   argvar <- newName "arg"
   rebuildvar <- newName "rebuild"
@@ -569,12 +573,6 @@ transform inpStruc outStruc (LamE [pat] expr) = do
         in ($(varE primalvar)
            ,\ $(varP adjvar) ->
                 $(varE rebuildvar) (dualpass $(varE histvar) $(varE outjivar) $(varE ioutvar) $(varE dualvar) $(varE adjvar))) |]
-transform inpStruc outStruc (LamE [] body) =
-  transform inpStruc outStruc body
-transform inpStruc outStruc (LamE (pat : pats) body) =
-  transform inpStruc outStruc (LamE [pat] (LamE pats body))
-transform _ _ expr =
-  fail $ "Top-level expression in reverseAD must be lambda, but is: " ++ show expr
 
 
 -- ----------------------------------------------------------------------
@@ -586,9 +584,9 @@ type Env = Set Name
 
 -- Γ |- t : a                        -- expression
 -- ~> Dt[Γ] |- D[i, t] : FwdM Dt[a]  -- result
-ddr :: Env -> Exp -> Q Exp
+ddr :: Env -> Source.Exp -> Q TH.Exp
 ddr env = \case
-  VarE name
+  EVar name
     | name `Set.member` env -> [| mpure $(varE name) |]
     | name == 'fromIntegral -> [| mpure fromIntegralOp |]
     | name == 'negate -> do
@@ -622,19 +620,28 @@ ddr env = \case
     | name == '($) -> do
         fname <- newName "f"
         xname <- newName "x"
-        ddr env (LamE [VarP fname, VarP xname] (AppE (VarE fname) (VarE xname)))
+        ddr env (ELam (VarP fname) $ ELam (VarP xname) $ EVar fname `EApp` EVar xname)
     | name == '(.) -> do
         fname <- newName "f"
         gname <- newName "g"
         xname <- newName "x"
-        ddr env (LamE [VarP fname, VarP gname, VarP xname] (AppE (VarE fname) (AppE (VarE gname) (VarE xname))))
-    | name `elem` ['(+), '(-), '(*), '(/), '(|*|)] -> do
+        ddr env (ELam (VarP fname) $ ELam (VarP gname) $ ELam (VarP xname) $ EVar fname `EApp` (EVar gname `EApp` EVar xname))
+    | name == '(+) -> ddrNumBinOp '(+) (False, False) (\_ _ -> [| (1, 1) |])
+    | name == '(-) -> ddrNumBinOp '(-) (False, False) (\_ _ -> [| (1, -1) |])
+    | name == '(*) -> ddrNumBinOp '(*) (True, True) (\x y -> [| ($y, $x) |])
+    | name == '(/) -> ddrNumBinOp '(/) (True, True) (\x y -> [| (recip $y, (- $x) / ($y * $y)) |])
+    | name `elem` ['(==), '(/=), '(<), '(>), '(<=), '(>=)] -> do
         xname <- newName "x"
         yname <- newName "y"
-        ddr env (LamE [VarP xname, VarP yname] (InfixE (Just (VarE xname)) (VarE name) (Just (VarE yname))))
+        [| mpure (\ $(varP xname) ->
+             mpure (\ $(varP yname) ->
+               mpure (applyCmpOp $(varE xname) $(varE yname)
+                                 $(varE name)))) |]
+    | name == '(|*|) ->
+        fail $ "The parallel combinator (|*|) should be applied directly; partially applying it is pointless."
     | name == 'error -> [| mpure error |]
-    | name == 'fst -> [| mpure (mpure . fst) |]
-    | name == 'snd -> [| mpure (mpure . snd) |]
+    | name == 'fst -> [| mpure (\x -> mpure (fst x)) |]
+    | name == 'snd -> [| mpure (\x -> mpure (snd x)) |]
     | otherwise -> do
         typ <- reifyType name
         let (params, retty) = unpackFunctionType typ
@@ -643,12 +650,11 @@ ddr env = \case
           else fail $ "Most free variables not supported in reverseAD: " ++ show name ++
                       " (env = " ++ show env ++ ")"
 
-  ConE name
-    | otherwise -> do
-        fieldtys <- checkDatacon name
-        [| mpure $(liftKleisliN (length fieldtys) (ConE name)) |]
+  ECon name -> do
+    fieldtys <- checkDatacon name
+    [| mpure $(liftKleisliN (length fieldtys) (ConE name)) |]
 
-  LitE lit -> case lit of
+  ELit lit -> case lit of
     RationalL _ -> do
       iname <- newName "i"
       [| do $(varP iname) <- fwdmGenId
@@ -659,72 +665,23 @@ ddr env = \case
     StringL _ -> [| mpure $(litE lit) |]
     _ -> fail $ "literal? " ++ show lit
 
-  AppE e1 e2 -> do
+  EVar name `EApp` e1 `EApp` e2 | name == '(|*|) ->
+    [| fwdmPar $(ddr env e1) $(ddr env e2) |]
+
+  EApp e1 e2 -> do
     (wrap, [funname, argname]) <- ddrList env [e1, e2]
     return (wrap (VarE funname `AppE` VarE argname))
 
-  -- Handle ($) specially in case the program needs the special type inference (let's hope it does not)
-  InfixE (Just e1) (VarE opname) (Just e2) | opname == '($) ->
-    ddr env (AppE e1 e2)
-
-  InfixE (Just e1) (VarE opname) (Just e2) | opname == '(|*|) -> do
-    [| fwdmPar $(ddr env e1) $(ddr env e2) |]
-
-  InfixE (Just e1) (VarE opname) (Just e2) -> do
-    let handleNum =
-          if | opname == '(+) -> Just ((False, False), \_ _ -> [| (1, 1) |])
-             | opname == '(-) -> Just ((False, False), \_ _ -> [| (1, (-1)) |])
-             | opname == '(*) -> Just ((True, True), \x y -> [| ($y, $x) |])
-             | opname == '(/) -> Just ((True, True), \x y -> [| (recip $y, (- $x) / ($y * $y)) |])
-             | otherwise -> Nothing
-            & \case
-              Nothing -> Nothing
-              Just ((gxused, gyused), gradientfun) -> Just $ do
-                (wrap, [x1name, x2name]) <- ddrList env [e1, e2]
-                t1name <- newName "arg1"
-                t2name <- newName "arg2"
-                wrap <$>
-                  [| applyBinaryOp
-                       $(varE x1name) $(varE x2name) $(varE opname)
-                       (\ $(if gxused then varP t1name else wildP)
-                          $(if gyused then varP t2name else wildP) ->
-                            $(gradientfun (varE t1name) (varE t2name))) |]
-
-        handleOrd =
-          if opname `elem` ['(==), '(/=), '(<), '(>), '(<=), '(>=)]
-            then Just $ do
-              (wrap, [x1name, x2name]) <- ddrList env [e1, e2]
-              t1name <- newName "arg1"
-              t2name <- newName "arg2"
-              return $ wrap $ VarE 'mpure `AppE`
-                foldl AppE (VarE 'applyCmpOp)
-                  [VarE x1name, VarE x2name
-                  ,LamE [VarP t1name, VarP t2name] $
-                     InfixE (Just (VarE t1name)) (VarE opname) (Just (VarE t2name))]
-            else Nothing
-
-        handleOther =  -- TODO: can we just put an infix operator in a VarE?
-          ddr env (VarE opname `AppE` e1 `AppE` e2)
-
-    fromMaybe handleOther (asum [handleNum, handleOrd])
-
-  InfixE (Just e1) (ConE constr) (Just e2) ->
-    ddr env (ConE constr `AppE` e1 `AppE` e2)
-
-  e@InfixE{} -> fail $ "Unsupported operator section: " ++ show e
-
-  ParensE e -> ParensE <$> ddr env e
-
-  LamE [pat] e -> do
+  ELam pat e -> do
     patbound <- boundVars pat
     e' <- ddr (env <> patbound) e
     [| mpure (\ $(pure pat) -> $(pure e')) |]
 
-  TupE mes | Just es <- sequence mes -> do
+  ETup es -> do
     (wrap, vars) <- ddrList env es
     return (wrap $ VarE 'mpure `AppE` TupE (map (Just . VarE) vars))
 
-  CondE e1 e2 e3 -> do
+  ECond e1 e2 e3 -> do
     e1' <- ddr env e1
     boolName <- newName "bool"
     e2' <- ddr env e2
@@ -733,79 +690,55 @@ ddr env = \case
               [BindS (VarP boolName) e1'
               ,NoBindS (CondE (VarE boolName) e2' e3')])
 
-  LetE decs body -> do
-    decs' <- concat <$> mapM desugarDec decs
-    (wrap, vars, _) <- ddrDecs env decs'
+  ELet decs body -> do
+    (wrap, vars) <- ddrDecs env decs
     body' <- ddr (env <> Set.fromList vars) body
     return $ wrap body'
 
-  CaseE expr matches -> do
+  ECase expr matches -> do
     (wrap, [evar]) <- ddrList env [expr]
     matches' <- sequence
-      [case mat of
-         Match pat (NormalB rhs) wdecs -> do
-           patbound <- boundVars pat
-           pat' <- ddrPat pat
-           rhs' <- ddr (env <> patbound) (letE' wdecs rhs)
-           return (pat', rhs')
-         _ -> fail "Guards not supported in case expressions"
-      | mat <- matches]
+      [do patbound <- boundVars pat
+          ddrPat pat
+          (pat,) <$> ddr (env <> patbound) rhs
+      | (pat, rhs) <- matches]
     return $ wrap $
       CaseE (VarE evar)
         [Match pat (NormalB rhs) [] | (pat, rhs) <- matches']
 
-  ListE es -> do
+  EList es -> do
     (wrap, vars) <- ddrList env es
     return (wrap (VarE 'mpure `AppE` ListE (map VarE vars)))
 
-  SigE e ty ->
+  ESig e ty ->
     [| $(ddr env e) :: FwdM $(ddrType ty) |]
 
-  UnboundVarE n -> fail $ "Free variable in reverseAD: " ++ show n
-
-  -- Constructs that we can express in terms of other, simpler constructs handled above
-  LamE [] e -> ddr env e  -- is this even a valid AST?
-  LamE (pat : pats@(_:_)) e -> ddr env (LamE [pat] (LamE pats e))
-  LamCaseE mats -> do
-    name <- newName "lcarg"
-    ddr env (LamE [VarP name] (CaseE (VarE name) mats))
-
-  -- tuple sections (these were excluded by the TupE case above)
-  TupE mes -> do
-    let trav _ [] argsf esf = return (argsf [], esf [])
-        trav i (Nothing : mes') argsf esf = do
-          name <- newName ("x" ++ show (i :: Int))
-          trav (i+1) mes' (argsf . (name :)) (esf . (VarE name :))
-        trav i (Just e : mes') argsf esf =
-          trav i mes' argsf (esf . (e :))
-
-    (args, es) <- trav 1 mes id id
-    ddr env (LamE (map VarP args) (TupE (map Just es)))
-
-  -- Unsupported constructs
-  e@AppTypeE{} -> notSupported "Type applications" (Just (show e))
-  e@UInfixE{} -> notSupported "UInfixE" (Just (show e))
-  e@UnboxedTupE{} -> notSupported "Unboxed tuples" (Just (show e))
-  e@UnboxedSumE{} -> notSupported "Unboxed sums" (Just (show e))
-  e@MultiIfE{} -> notSupported "Multi-way ifs" (Just (show e))
-  e@DoE{} -> notSupported "Do blocks" (Just (show e))
-  e@MDoE{} -> notSupported "MDo blocks" (Just (show e))
-  e@CompE{} -> notSupported "List comprehensions" (Just (show e))
-  e@ArithSeqE{} -> notSupported "Arithmetic sequences" (Just (show e))
-  e@RecConE{} -> notSupported "Records" (Just (show e))
-  e@RecUpdE{} -> notSupported "Records" (Just (show e))
-  e@StaticE{} -> notSupported "Cloud Haskell" (Just (show e))
-  e@LabelE{} -> notSupported "Overloaded labels" (Just (show e))
-  e@ImplicitParamVarE{} -> notSupported "Implicit parameters" (Just (show e))
-  e@GetFieldE{} -> notSupported "Records" (Just (show e))
-  e@ProjectionE{} -> notSupported "Records" (Just (show e))
-  e -> notSupported (takeWhile (/= ' ') (show e)) (Just (show e))
+ddrNumBinOp :: Name  -- ^ Primal operator
+            -> (Bool, Bool)  -- ^ Whether the gradient uses its (first, second) argument
+            -> (Q TH.Exp -> Q TH.Exp -> Q TH.Exp)
+                  -- ^ Gradient given inputs (assuming adjoint 1).
+                  -- Should return a pair: the partial derivaties with respect
+                  -- to the two inputs. The names are variable references for
+                  -- the two primal inputs.
+            -> Q TH.Exp
+ddrNumBinOp op (xused, yused) mkgrad = do
+  xname <- newName "x"
+  yname <- newName "y"
+  pxname <- newName "px"
+  pyname <- newName "py"
+  [| mpure (\ $(varP xname) ->
+       mpure (\ $(varP yname) ->
+         applyBinaryOp $(varE xname) $(varE yname)
+                       $(varE op)
+                       (\ $(if xused then varP pxname else wildP)
+                          $(if yused then varP pyname else wildP) ->
+                            $(mkgrad (varE pxname) (varE pyname))))) |]
 
 -- | Given list of expressions, returns a wrapper that defines a variable for
 -- each item in the list (differentiated), together with a list of the names of
 -- those variables.
 -- The expressions must all have the same, given, environment.
-ddrList :: Env -> [Exp] -> Q (Exp -> Exp, [Name])
+ddrList :: Env -> [Source.Exp] -> Q (TH.Exp -> TH.Exp, [Name])
 ddrList env es = do
   names <- mapM (\idx -> newName ("x" ++ show idx)) [1 .. length es]
   rhss <- mapM (ddr env) es
@@ -813,102 +746,68 @@ ddrList env es = do
             DoE Nothing $ [BindS (VarP nx) e | (nx, e) <- zip names rhss] ++ [NoBindS rest]
          ,names)
 
--- | Assumes the declarations occur in a let block. Checks that the
--- non-function bindings are non-recursive.
--- Returns a wrapper that defines all of the names, the list of defined names,
--- and the set of all free variables of the collective let-block.
-ddrDecs :: Env -> [Dec] -> Q (Exp -> Exp, [Name], Set Name)
+-- | Assumes the declarations occur in a let block.
+-- Returns:
+-- * a wrapper that defines all of the names;
+-- * the list of defined names.
+ddrDecs :: Env -> [DecGroup] -> Q (TH.Exp -> TH.Exp, [Name])
 ddrDecs env decs = do
-  (signatures, bindings) <- fmap partitionEithers . flip traverse decs $ \case
-    ValD (VarP name) (NormalB e) [] -> return (Right (name, e))
-    SigD name ty -> ddrType ty >>= \ty' -> return (Left (name, ty'))
-    dec -> notSupported "Declaration in let" (Just (show dec))
+  let ddrDecGroups _ [] = return ([], [])
+      ddrDecGroups env' (g : gs) = do
+        (stmt, bound) <- ddrDecGroup env' g
+        (rest, restbound) <- ddrDecGroups (env' <> Set.fromList bound) gs
+        return (stmt : rest, bound ++ restbound)
 
-  let signatureMap = Map.fromList signatures
-
-  let extendedEnv = env <> Set.fromList (map fst bindings)
-
-  let processDec :: Dec -> Q [(Name, Set Name, Exp)]
-      processDec = \case
-        ValD (VarP name) (NormalB e) [] -> do
-          frees <- freeVars extendedEnv e
-          return [(name, frees, e)]
-        SigD{} -> return []
-        dec -> fail $ "Unsupported declaration in let: " ++ show dec
-
-      fromLam :: Exp -> Maybe (Pat, Exp)
-      fromLam (LamE (p : vs) e) = Just (p, LamE vs e)
-      fromLam (LamE [] e) = fromLam e
-      fromLam (ParensE e) = fromLam e
-      fromLam _ = Nothing
-
-      handleComp :: Env -> SCC (Name, Exp) -> Q Stmt
-      handleComp env' (AcyclicSCC (name, e)) = do
-        e' <- ddr env' e
-        let e'' = case Map.lookup name signatureMap of
-                    Nothing -> e'
-                    Just sig -> SigE e' (AppT (ConT ''FwdM) sig)
-        return (BindS (VarP name) e'')
-      handleComp env' (CyclicSCC (unzip -> (names, es)))
-        | Just (unzip -> (pats, bodies)) <- traverse fromLam es = do
-            bounds <- traverse boundVars pats
-            bodies' <- traverse
-                         (\(bound, body) -> ddr (env' <> Set.fromList names <> bound) body)
-                         (zip bounds bodies)
-            pure $ LetS $ concat
-              [let dec = ValD (VarP name) (NormalB (LamE [pat] body)) []
-               in case Map.lookup name signatureMap of
-                    Nothing -> [dec]
-                    Just sig -> [SigD name sig, dec]
-              | (name, pat, body) <- zip3 names pats bodies']
-        | otherwise =
-            notSupported "Recursive non-function bindings" (Just (show (length names, length es, zip names es)))
-
-      handleComps :: Env -> [SCC (Name, Exp)] -> Q [Stmt]
-      handleComps _ [] = return []
-      handleComps env' (comp : comps) = do
-        let bound = case comp of
-                      AcyclicSCC (name, _) -> [name]
-                      CyclicSCC ps -> map fst ps
-        stmt <- handleComp env' comp
-        stmts <- handleComps (env' <> Set.fromList bound) comps
-        return (stmt : stmts)
-
-  tups <- concat <$> mapM processDec decs
-  let sccs = stronglyConnComp (map (\(name, frees, e) -> ((name, e), name, toList frees)) tups)
-  stmts <- handleComps env sccs
-  let declared = map fst3 tups
+  (stmts, declared) <- ddrDecGroups env decs
 
   return
-    (\rest -> DoE Nothing $ stmts ++ [NoBindS rest]
-    ,declared
-    ,Set.unions [frees | (_, frees, _) <- tups] Set.\\ Set.fromList declared)
+    (\body -> DoE Nothing $ stmts ++ [NoBindS body]
+    ,declared)
 
-ddrPat :: Pat -> Q Pat
+ddrDecGroup :: Env -> DecGroup -> Q (Stmt, [Name])
+ddrDecGroup env (DecVar name msig rhs) = do
+  rhs' <- ddr env rhs
+  let rhs'' = case msig of Just sig -> SigE rhs' (AppT (ConT ''FwdM) sig)
+                           Nothing -> rhs'
+  return (BindS (VarP name) rhs'', [name])
+ddrDecGroup env (DecMutGroup lams) = do
+  let names = [name | (name, _, _, _) <- lams]
+  decs <- concat <$> sequence
+    [do ddrPat pat
+        bound <- boundVars pat
+        rhs' <- ddr (env <> Set.fromList names <> bound) rhs
+        let dec = ValD (VarP name) (NormalB (LamE [pat] rhs')) []
+        case msig of
+          Just sig -> return [SigD name sig, dec]
+          Nothing -> return [dec]
+    | (name, msig, pat, rhs) <- lams]
+  return (LetS decs, names)
+
+-- | Only checks that the data constructors appearing in the pattern are of
+-- supported types.
+ddrPat :: Pat -> Q ()
 ddrPat = \case
   LitP{} -> fail "Literals in patterns unsupported"
-  p@VarP{} -> return p
-  TupP ps -> TupP <$> traverse ddrPat ps
-  UnboxedTupP ps -> UnboxedTupP <$> traverse ddrPat ps
+  VarP{} -> return ()
+  TupP ps -> mapM_ ddrPat ps
+  UnboxedTupP ps -> mapM_ ddrPat ps
   p@UnboxedSumP{} -> notSupported "Unboxed sums" (Just (show p))
   p@(ConP name tyapps args)
     | not (null tyapps) -> notSupported "Type applications in patterns" (Just (show p))
-    | name `elem` ['(:), '[]] -> ConP name [] <$> traverse ddrPat args
+    -- | name `elem` ['(:), '[]] -> mapM_ ddrPat args  -- TODO unnecessary special cases?
     | otherwise -> do
         -- ignore the field types; just validity is good enough, assuming that the user's code was okay
         _ <- checkDatacon name
-        ConP name [] <$> traverse ddrPat args
-  InfixP p1 name p2
-    | name == '(:) -> InfixP <$> ddrPat p1 <*> return name <*> ddrPat p2
-    | otherwise -> notSupported "This constructor in a pattern" (Just (show name))
+        mapM_ ddrPat args
+  InfixP p1 name p2 -> ddrPat (ConP name [] [p1, p2])
   p@UInfixP{} -> notSupported "UInfix patterns" (Just (show p))
-  ParensP p -> ParensP <$> ddrPat p
+  ParensP p -> ddrPat p
   p@TildeP{} -> notSupported "Irrefutable patterns" (Just (show p))
   p@BangP{} -> notSupported "Bang patterns" (Just (show p))
-  AsP name p -> AsP name <$> ddrPat p
-  WildP -> return WildP
+  AsP _ p -> ddrPat p
+  WildP -> return ()
   p@RecP{} -> notSupported "Records" (Just (show p))
-  ListP ps -> ListP <$> traverse ddrPat ps
+  ListP ps -> mapM_ ddrPat ps
   p@SigP{} -> notSupported "Type signatures in patterns, because then I need to rewrite types and I'm lazy" (Just (show p))
   p@ViewP{} -> notSupported "View patterns" (Just (show p))
 
@@ -947,7 +846,7 @@ ddrType = \ty ->
 
 -- input :: a
 -- result :: FwdM (Dt[a], VS.Vector Double -> a)
-interleave :: Quote m => Structure -> Exp -> m Exp
+interleave :: Quote m => Structure -> TH.Exp -> m TH.Exp
 interleave (Structure monotype dtypemap) input = do
   helpernames <- Map.fromAscList <$>
                    sequence [((n, ts),) <$> newName (genDataNameTag "inter" n ts)
@@ -964,7 +863,7 @@ interleave (Structure monotype dtypemap) input = do
 -- (type name T', type arguments As') combination that occurs (transitively) in
 -- T, the name of a function with type
 -- 'T' As' -> (Dt[T' As'], VS.Vector Double -> T' As')'.
-interleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
+interleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m TH.Exp
 interleaveData helpernames constrs = do
   inputvar <- newName "input"
   let maxn = maximum (map (length . snd) constrs)
@@ -1015,7 +914,7 @@ interleaveData helpernames constrs = do
 -- (type name T', type arguments As') combination that occurs in the type, the
 -- name of a function with type
 -- 'T' As' -> FwdM (Dt[T' As'], VS.Vector Double -> T' As')'.
-interleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
+interleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m TH.Exp
 interleaveType helpernames = \case
   DiscreteST -> do
     inpxvar <- newName "inpx"
@@ -1038,7 +937,7 @@ interleaveType helpernames = \case
 -- outexp :: Dt[T]                       -- interleaved program output
 -- result :: (T                          -- primal result
 --           ,T -> BuildState -> IO ())  -- given adjoint, add initial contributions
-deinterleave :: Quote m => Structure -> Exp -> m Exp
+deinterleave :: Quote m => Structure -> TH.Exp -> m TH.Exp
 deinterleave (Structure monotype dtypemap) outexp = do
   let dtypes = Map.keys dtypemap
   helpernames <- Map.fromAscList <$>
@@ -1057,7 +956,7 @@ deinterleave (Structure monotype dtypemap) outexp = do
 -- The Map contains for each (type name T', type arguments As') combination
 -- that occurs (transitively) in T, the name of a function with type
 -- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -> IO ())'.
-deinterleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m Exp
+deinterleaveData :: Quote m => Map (Name, [MonoType]) Name -> [(Name, [MonoType])] -> m TH.Exp
 deinterleaveData helpernames constrs = do
   dualvar <- newName "out"
   let maxn = maximum (map (length . snd) constrs)
@@ -1106,7 +1005,7 @@ deinterleaveData helpernames constrs = do
 -- The Map contains for each (type name T', type arguments As') combination
 -- that occurs (transitively) in T, the name of a function with type
 -- 'Dt[T' As'] -> (T' As', T' As' -> BuildState -> IO ())'.
-deinterleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m Exp
+deinterleaveType :: Quote m => Map (Name, [MonoType]) Name -> MonoType -> m TH.Exp
 deinterleaveType helpernames = \case
   DiscreteST -> do
     dname <- newName "d"
@@ -1269,166 +1168,14 @@ collectApps = \t -> go t []
 -- | Given an expression `e`, wraps it in `n` kleisli-lifted lambdas like
 --
 -- > \x1 -> pure (\x2 -> pure (... \xn -> pure (e x1 ... xn)))
-liftKleisliN :: Int -> Exp -> Q Exp
+liftKleisliN :: Int -> TH.Exp -> Q TH.Exp
 liftKleisliN 0 e = return e
 liftKleisliN n e = do
   name <- newName "x"
   [| \ $(varP name) -> mpure $(liftKleisliN (n - 1) (e `AppE` VarE name)) |]
 
--- Convert function declarations to simple variable declarations:
---   f a b c = E
---   f d e f = F
--- becomes
---   f = \arg1 arg2 arg3 -> case (arg1, arg2, arg3) of
---                            (a, b, c) -> E
---                            (d, e, f) -> F
---
--- SigD, i.e. type signatures, are passed through unchanged.
-desugarDec :: (Quote m, MonadFail m) => Dec -> m [Dec]
-desugarDec = \case
-  ValD (VarP var) (NormalB rhs) wdecs ->
-    return [ValD (VarP var) (NormalB (letE' wdecs rhs)) []]
-
-  ValD pat (NormalB rhs) wdecs -> do
-    tupname <- newName "vartup"
-    xname <- newName "x"
-    vars <- toList <$> boundVars pat
-    let nvars = length vars
-    return $
-      ValD (VarP tupname)
-           (NormalB (CaseE (letE' wdecs rhs)
-              [Match pat (NormalB (TupE (map (Just . VarE) vars))) []]))
-           []
-      : [ValD (VarP var)
-              (NormalB (CaseE (VarE tupname)
-                 [Match (TupP (replicate i WildP ++ [VarP xname] ++ replicate (nvars - 1 - i) WildP))
-                        (NormalB (VarE xname))
-                        []]))
-              []
-        | (i, var) <- zip [0..] vars]
-
-  FunD _ [] -> fail "Function declaration with empty list of clauses?"
-
-  FunD name clauses@(_:_) ->
-    case traverse fromSimpleClause clauses of
-      Left err -> fail err
-      Right cpairs
-        | allEqual [length pats | (pats, _) <- cpairs] -> do
-            let nargs = head [length pats | Clause pats _ _ <- clauses]
-            argnames <- mapM (\i -> newName ("arg" ++ show i)) [1..nargs]
-            let body = LamE (map VarP argnames) $
-                         CaseE (TupE (map (Just . VarE) argnames))
-                           [Match (TupP ps) (NormalB rhs) []
-                           | (ps, rhs) <- cpairs]
-            return [ValD (VarP name) (NormalB body) []]
-        | otherwise ->
-            fail $ "Clauses of declaration of " ++ show name ++
-                   " do not all have the same number of arguments"
-    where
-      fromSimpleClause (Clause pats (NormalB body) []) = Right (pats, body)
-      fromSimpleClause (Clause pats (NormalB body) wdecs) =
-        fromSimpleClause (Clause pats (NormalB (letE' wdecs body)) [])
-      fromSimpleClause (Clause _ GuardedB{} _) =
-        Left $ "Guards not supported in declaration of " ++ show name
-
-  SigD name typ -> return [SigD name typ]
-
-  dec -> fail $ "Only simple let bindings supported in reverseAD: " ++ show dec
-  where
-    allEqual :: Eq a => [a] -> Bool
-    allEqual [] = True
-    allEqual (x:xs) = all (== x) xs
-
-freeVars :: Env -> Exp -> Q (Set Name)
-freeVars env = \case
-  VarE n -> return (Set.singleton n)
-  ConE{} -> return mempty
-  LitE{} -> return mempty
-  AppE e1 e2 -> (<>) <$> freeVars env e1 <*> freeVars env e2
-  AppTypeE e1 _ -> freeVars env e1
-  InfixE me1 e2 me3 -> combine [maybe (return mempty) (freeVars env) me1
-                               ,freeVars env e2
-                               ,maybe (return mempty) (freeVars env) me3]
-  e@UInfixE{} -> notSupported "UInfixE" (Just (show e))
-  ParensE e -> freeVars env e
-  LamE pats e -> do
-    bound <- combine (map boundVars pats)
-    frees <- freeVars (env <> bound) e
-    return (frees Set.\\ bound)
-  LamCaseE mats ->
-    combine [case mat of
-               Match pat (NormalB e) [] -> do
-                 bound <- boundVars pat
-                 frees <- freeVars (env <> bound) e
-                 return (frees Set.\\ bound)
-               _ -> notSupported "Pattern in LambdaCase (neither guards nor where-blocks supported)" (Just (show mat))
-            | mat <- mats]
-  TupE es -> combine (map (maybe (return mempty) (freeVars env)) es)
-  UnboxedTupE es -> combine (map (maybe (return mempty) (freeVars env)) es)
-  e@UnboxedSumE{} -> notSupported "Unboxed sums" (Just (show e))
-  CondE e1 e2 e3 -> combine (map (freeVars env) [e1, e2, e3])
-  e@MultiIfE{} -> notSupported "Multi-way ifs" (Just (show e))
-  LetE decs body -> do
-    decs' <- concat <$> mapM desugarDec decs
-    (_, bound, frees) <- ddrDecs env decs'
-    (frees <>) <$> freeVars (env <> Set.fromList bound) body
-  CaseE e ms -> (<>) <$> freeVars env e <*> combine (map go ms)
-    where go :: Match -> Q (Set Name)
-          go (Match pat (NormalB rhs) []) = do
-            bound <- boundVars pat
-            frees <- freeVars (env <> bound) rhs
-            return (frees Set.\\ bound)
-          go mat = fail $ "Unsupported match in case: " ++ show mat
-  e@DoE{} -> notSupported "Do blocks" (Just (show e))
-  e@MDoE{} -> notSupported "MDo blocks" (Just (show e))
-  e@CompE{} -> notSupported "List comprehensions" (Just (show e))
-  e@ArithSeqE{} -> notSupported "Arithmetic sequences" (Just (show e))
-  ListE es -> combine (map (freeVars env) es)
-  SigE e _ -> freeVars env e
-  e@RecConE{} -> notSupported "Records" (Just (show e))
-  e@RecUpdE{} -> notSupported "Records" (Just (show e))
-  e@StaticE{} -> notSupported "Cloud Haskell" (Just (show e))
-  UnboundVarE n -> return (Set.singleton n)
-  e@LabelE{} -> notSupported "Overloaded labels" (Just (show e))
-  e@ImplicitParamVarE{} -> notSupported "Implicit parameters" (Just (show e))
-  e@GetFieldE{} -> notSupported "Records" (Just (show e))
-  e@ProjectionE{} -> notSupported "Records" (Just (show e))
-  e -> notSupported (takeWhile (/= ' ') (show e)) (Just (show e))
-
-boundVars :: MonadFail m => Pat -> m (Set Name)
-boundVars = \case
-  LitP _ -> return mempty
-  VarP n -> return (Set.singleton n)
-  TupP ps -> combine (map boundVars ps)
-  UnboxedTupP ps -> combine (map boundVars ps)
-  p@UnboxedSumP{} -> notSupported "Unboxed sums" (Just (show p))
-  ConP _ _ ps -> combine (map boundVars ps)
-  InfixP p1 _ p2 -> (<>) <$> boundVars p1 <*> boundVars p2
-  p@UInfixP{} -> notSupported "UInfixP" (Just (show p))
-  ParensP p -> boundVars p
-  TildeP p -> boundVars p
-  BangP p -> boundVars p
-  AsP n p -> Set.insert n <$> boundVars p
-  WildP -> return mempty
-  p@RecP{} -> notSupported "Records" (Just (show p))
-  ListP ps -> combine (map boundVars ps)
-  SigP p _ -> boundVars p
-  p@ViewP{} -> notSupported "View patterns" (Just (show p))
-
--- | Constructs a 'LetE', but returns the rhs untouched if the list is empty
--- instead of creating an empty let block.
-letE' :: [Dec] -> Exp -> Exp
-letE' [] rhs = rhs
-letE' ds rhs = LetE ds rhs
-
-combine :: (Monad m, Monoid a) => [m a] -> m a
-combine = fmap mconcat . sequence
-
-pair :: Exp -> Exp -> Exp
+pair :: TH.Exp -> TH.Exp -> TH.Exp
 pair e1 e2 = TupE [Just e1, Just e2]
-
-notSupported :: MonadFail m => String -> Maybe String -> m a
-notSupported descr mthing = fail $ descr ++ " not supported in reverseAD" ++ maybe "" (": " ++) mthing
 
 tvbName :: TyVarBndr () -> Name
 tvbName (PlainTV n _) = n
@@ -1436,6 +1183,3 @@ tvbName (KindedTV n _ _) = n
 
 mapUnionsWithKey :: (Foldable f, Ord k) => (k -> a -> a -> a) -> f (Map k a) -> Map k a
 mapUnionsWithKey f = foldr (Map.unionWithKey f) mempty
-
-fst3 :: (a, b, c) -> a
-fst3 (a, _, _) = a

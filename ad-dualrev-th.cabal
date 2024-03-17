@@ -13,7 +13,7 @@ copyright:     2022 Tom Smeding
 license:       MIT
 license-file:  LICENSE
 build-type:    Simple
-tested-with:   GHC == 9.2.2
+tested-with:   GHC == 9.6.4
 extra-source-files:
   README.md
 
@@ -27,6 +27,8 @@ library
   other-modules:
     Data.Vector.Storable.Mutable.CAS
     Language.Haskell.ReverseAD.TH.Orphans
+    Language.Haskell.ReverseAD.TH.Source
+    Language.Haskell.ReverseAD.TH.Translate
   hs-source-dirs:
     src
   ghc-options: -Wall
