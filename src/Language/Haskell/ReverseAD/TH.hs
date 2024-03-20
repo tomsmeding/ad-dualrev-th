@@ -272,7 +272,7 @@ resolve = \hist iout threads -> do
   where
     loopEnter :: JobDescr -> BuildState -> IO ()
     loopEnter (JobDescr ji i hist) threads = do
-      let joini = case hist of
+      let joini = case hist of  -- the last ID to be handled before the next fork
                     [] -> 0
                     Fork nexti _ _ : _ -> nexti
       let nid = NID ji (i - 1)
@@ -289,7 +289,7 @@ resolve = \hist iout threads -> do
             _ <- forkIO $ loopEnter jd2 threads >> putMVar done ()
             loopEnter jd1 threads
             readMVar done
-            loopEnter (JobDescr jid (i + 1) hist') threads
+            loopEnter (JobDescr jid (i + 1) hist') threads  -- +1 because a JobDescr contains last ID generated + 1
       | otherwise = do
           (cbarr, adjarr) <- MV.read threads ji
           cb <- MV.read cbarr i
