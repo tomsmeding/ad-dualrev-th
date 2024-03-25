@@ -146,71 +146,71 @@ x |*| y = x `par` y `par` (x, y)
 newtype JobID = JobID Int
   deriving (Show)
 
-data JobDescr = JobDescr
-    {-# UNPACK #-} !JobID   -- ^ The ID of this job
-    {-# UNPACK #-} !Int     -- ^ Number of IDs generated in this thread (i.e. last ID + 1)
-    [Fork]  -- ^ Fork history in this thread, last fork at head
+data BeforeJob
+  = Start  -- ^ Source of (this part of the) graph
+  | Fork JobDescr JobDescr JobDescr
+      -- ^ a b c: a forked into b and c, which joined into the current job
   deriving (Show)
 
-data Fork = Fork
-    {-# UNPACK #-} !Int  -- ^ First ID after join
-    JobDescr  -- ^ Left job
-    JobDescr  -- ^ Right job
+data JobDescr = JobDescr
+    BeforeJob
+    {-# UNPACK #-} !JobID   -- ^ The ID of this job
+    {-# UNPACK #-} !Int     -- ^ Number of IDs generated in this thread (i.e. last ID + 1)
   deriving (Show)
 
 newtype FwdM a = FwdM
-    ([Fork]       -- state: history of forks on this thread; the last one is at
-                  --   the head of the list
-  -> IORef JobID  -- reader context: the next job ID to generate
-  -> JobID        -- reader context: the job ID of the current thread
-  -> Int          -- state: the next node ID to generate
-  -> IO ([Fork], Int, a))
+    (BeforeJob    -- what came before the current job
+  -> IORef JobID  -- the next job ID to generate
+  -> JobID        -- the job ID of the current thread
+  -> Int          -- the next node ID to generate
+  -> IO (JobDescr, a))  -- the terminal job of this computation
+         -- TODO: unpack?
 
 instance Functor FwdM where
-  fmap f (FwdM g) = FwdM $ \hist jr curj i -> do
-    (hist1, i1, x) <- g hist jr curj i
-    return (hist1, i1, f x)
+  fmap f (FwdM g) = FwdM $ \prev jr curj i -> do
+    (jd, x) <- g prev jr curj i
+    return (jd, f x)
 
 instance Applicative FwdM where
-  pure x = FwdM (\hist _ _ i -> return (hist, i, x))
-  FwdM f <*> FwdM g = FwdM $ \hist jr curj i -> do
-    (hist1, i1, fun) <- f hist jr curj i
-    (hist2, i2, x) <- g hist1 jr curj i1
-    return (hist2, i2, fun x)
+  pure x = FwdM (\prev _ ji i -> return (JobDescr prev ji i, x))
+  FwdM f <*> FwdM g = FwdM $ \prev jr ji i -> do
+    (JobDescr prev1 ji1 i1, fun) <- f prev jr ji i
+    (JobDescr prev2 ji2 i2, x) <- g prev1 jr ji1 i1
+    return (JobDescr prev2 ji2 i2, fun x)
 
 instance Monad FwdM where
-  FwdM f >>= g = FwdM $ \hist jr curj i -> do
-    (hist1, i1, x) <- f hist jr curj i
+  FwdM f >>= g = FwdM $ \prev jr ji i -> do
+    (JobDescr prev1 ji1 i1, x) <- f prev jr ji i
     let FwdM h = g x
-    h hist1 jr curj i1
+    h prev1 jr ji1 i1
 
 -- | 'pure' with a restricted type.
 mpure :: a -> FwdM a
 mpure = pure
 
 -- Returns:
--- - fork history on the main thread
--- - highest JobID generated plus 1
--- - highest id generated plus 1
+-- - the terminal job, i.e. the job with which the computation ended
+-- - the maximal job ID generated plus 1
 {-# NOINLINE runFwdM #-}
-runFwdM :: FwdM a -> ([Fork], JobID, Int, a)
+runFwdM :: FwdM a -> (JobDescr, JobID, a)
 runFwdM (FwdM f) = unsafePerformIO $ do
   jiref <- newIORef (JobID 1)
-  (hist, i, y) <- f [] jiref (JobID 0) 0
+  (jd, y) <- f Start jiref (JobID 0) 0
   nextji <- readIORef jiref
-  return (hist, nextji, i, y)
+  return (jd, nextji, y)
 
 -- 'a' and 'b' are computed in separate jobs, 'a' on the current thread and 'b'
 -- on a new thread.
 fwdmPar :: FwdM a -> FwdM b -> FwdM (a, b)
-fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \hist jr _curj i -> do
-  ji1 <- atomicModifyIORef' jr (\ji@(JobID j) -> (JobID (j + 2), ji))
-  let ji2 = let JobID j = ji1 in JobID (j + 1)
+fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \prev jr ji i -> do
+  let jd0 = JobDescr prev ji i  -- the job we're now closing with a fork
+  (ji1, ji2, ji3) <-
+    atomicModifyIORef' jr (\(JobID j) -> (JobID (j + 3), (JobID j, JobID (j+1), JobID (j+2))))
   threadResult <- newEmptyMVar
-  _ <- forkIO $ f2 [] jr ji2 0 >>= putMVar threadResult
-  (hist1, i1, x) <- f1 [] jr ji1 0
-  (hist2, i2, y) <- readMVar threadResult
-  return (Fork i (JobDescr ji1 i1 hist1) (JobDescr ji2 i2 hist2) : hist, i, (x, y))
+  _ <- forkIO $ f2 Start jr ji2 0 >>= putMVar threadResult
+  (jd1, x) <- f1 Start jr ji1 0
+  (jd2, y) <- readMVar threadResult
+  return (JobDescr (Fork jd0 jd1 jd2) ji3 0, (x, y))
 
 -- | The tag on a node in the Contrib graph. Consists of a job ID and the ID of
 -- the node within this thread.
@@ -219,12 +219,12 @@ data NID = NID {-# UNPACK #-} !JobID
   deriving (Show)
 
 fwdmGenId :: FwdM NID
-fwdmGenId = FwdM (\hist _ curj i -> return (hist, i + 1, NID curj i))
+fwdmGenId = FwdM (\prev _ ji i -> return (JobDescr prev ji (i + 1), NID ji i))
 
 fwdmGenIdInterleave :: FwdM Int
-fwdmGenIdInterleave = FwdM $ \hist _ (JobID curj) i ->
-  if curj == 0
-    then return (hist, i + 1, i)
+fwdmGenIdInterleave = FwdM $ \prev _ ji@(JobID jiInt) i ->
+  if jiInt == 0
+    then return (JobDescr prev ji (i + 1), i)
     else error "fwdmGenIdInterleave: not on main thread"
 
 
@@ -248,55 +248,48 @@ debugContrib (Contrib l) = "Contrib [" ++ intercalate "," (map go l) ++ "]"
 -- forward pass, which is technically not good: they were started in parallel,
 -- so we are technically sequentialising a bit in the worst case here. It's not
 -- _so_ bad, though.
-allocBS :: [Fork] -> MaybeBuildState -> IO ()
-allocBS [] _ = return ()
-allocBS (Fork _ jd1 jd2 : hist) threads = do
-  allocJD jd1
-  allocJD jd2
-  allocBS hist threads
+allocBS :: JobDescr -> MaybeBuildState -> IO ()
+allocBS (JobDescr prev (JobID ji) n) = \threads -> do
+  -- hPutStrLn stderr $ "allocBS: ji=" ++ show ji
+  MV.read threads ji >>= \case
+    Just _ -> error $ "allocBS: already allocated? (" ++ show ji ++ ")"
+    Nothing -> do
+      cbarr <- MV.replicate n (Contrib [])
+      adjarr <- MVS.replicate n 0.0
+      MV.write threads ji (Just (cbarr, adjarr))
+  allocPrev prev threads
   where
-    allocJD :: JobDescr -> IO ()
-    allocJD (JobDescr (JobID ji) n subhist) = do
-      MV.read threads ji >>= \case
-        Just _ -> return ()
-        Nothing -> do
-          cbarr <- MV.replicate n (Contrib [])
-          adjarr <- MVS.replicate n 0.0
-          MV.write threads ji (Just (cbarr, adjarr))
-      allocBS subhist threads
+    allocPrev :: BeforeJob -> MaybeBuildState -> IO ()
+    allocPrev Start _ = return ()
+    allocPrev (Fork parent jd1 jd2) threads = do
+      allocBS jd1 threads
+      allocBS jd2 threads
+      allocBS parent threads
 
-resolve :: [Fork] -> Int -> BuildState -> IO ()
-resolve = \hist iout threads -> do
-  when kDEBUG $ hPutStrLn stderr $ "\n---- ENTER RESOLVE ----"
-  loopEnter (JobDescr (JobID 0) iout hist) threads
+resolve :: JobDescr -> BuildState -> IO ()
+resolve = \(JobDescr prev ji i) threads -> do
+  when kDEBUG $ hPutStrLn stderr $ "Enter job " ++ show ji ++ " from i=" ++ show (i - 1)
+  loop ji (i - 1) threads
+  case prev of
+    Start -> return ()
+    Fork jd0 jd1 jd2 -> do
+      let jidOf (JobDescr _ n _) = n
+      when kDEBUG $ hPutStrLn stderr $ "Forking jobs (" ++ show (jidOf jd1) ++ ") and (" ++ show (jidOf jd2) ++ "); parent (" ++ show (jidOf jd0) ++ ")"
+      done <- newEmptyMVar
+      _ <- forkIO $ resolve jd2 threads >> putMVar done ()
+      resolve jd1 threads
+      readMVar done
+      resolve jd0 threads
   where
-    loopEnter :: JobDescr -> BuildState -> IO ()
-    loopEnter (JobDescr ji i hist) threads = do
-      let joini = case hist of  -- the last ID to be handled before the next fork
-                    [] -> 0
-                    Fork nexti _ _ : _ -> nexti
-      let nid = NID ji (i - 1)
-      when kDEBUG $ hPutStrLn stderr $ "Enter job " ++ show ji ++ ", joini=" ++ show joini ++ " from " ++ show nid
-      loop joini hist nid threads
-
-    loop :: Int -> [Fork] -> NID -> BuildState -> IO ()
-    loop joini hist (NID jid@(JobID ji) i) threads
-      | i < joini = case hist of
-          [] -> return ()
-          Fork _ jd1 jd2 : hist' -> do
-            when kDEBUG $ hPutStrLn stderr $ "Forking jobs (" ++ show (let JobDescr n _ _ = jd1 in n) ++ ") and (" ++ show (let JobDescr n _ _ = jd2 in n) ++ ")"
-            done <- newEmptyMVar
-            _ <- forkIO $ loopEnter jd2 threads >> putMVar done ()
-            loopEnter jd1 threads
-            readMVar done
-            loopEnter (JobDescr jid (i + 1) hist') threads  -- +1 because a JobDescr contains last ID generated + 1
-      | otherwise = do
-          (cbarr, adjarr) <- MV.read threads ji
-          cb <- MV.read cbarr i
-          adj <- MVS.read adjarr i
-          when kDEBUG $ hPutStrLn stderr $ "Apply (" ++ show (NID jid i) ++ ") [adj=" ++ show adj ++ "]: " ++ debugContrib cb
-          apply cb adj threads
-          loop joini hist (NID jid (i - 1)) threads
+    loop :: JobID -> Int -> BuildState -> IO ()
+    loop _ (-1) _ = return ()
+    loop jid@(JobID ji) i threads = do
+      (cbarr, adjarr) <- MV.read threads ji
+      cb <- MV.read cbarr i
+      adj <- MVS.read adjarr i
+      when kDEBUG $ hPutStrLn stderr $ "Apply (" ++ show (NID jid i) ++ ") [adj=" ++ show adj ++ "]: " ++ debugContrib cb
+      apply cb adj threads
+      loop jid (i - 1) threads
 
     apply :: Contrib -> Double -> BuildState -> IO ()
     apply (Contrib []) _ _ = return ()
@@ -317,25 +310,26 @@ addContrib (NID (JobID ji) i) cb adj threads = do
   loop orig
   -- hPutStrLn stderr $ "aC: [" ++ show ji ++ "] " ++ show i ++ ": " ++ show orig ++ " + " ++ show adj ++ " = " ++ show (orig + adj)
 
--- | Returns adjoints of the main (initial) thread.
+-- | Returns adjoints of the initial job: job ID 0.
 {-# NOINLINE dualpass #-}
-dualpass :: [Fork] -> JobID -> Int -> (d -> BuildState -> IO ()) -> d -> VS.Vector Double
-dualpass hist (JobID numJobs) iout backprop adj = unsafePerformIO $ do
-  threads' <- MV.replicate numJobs Nothing
-  cbarr0 <- MV.replicate iout (Contrib [])
-  adjarr0 <- MVS.replicate iout 0.0
-  MV.write threads' 0 (Just (cbarr0, adjarr0))
-  allocBS hist threads'
-  threads <- MV.generateM numJobs (\i ->
+dualpass :: JobDescr -> JobID -> (d -> BuildState -> IO ()) -> d -> VS.Vector Double
+dualpass finaljob (JobID numjobs) backprop adj = unsafePerformIO $ do
+  -- hPutStrLn stderr $ "\n-------------------- ENTERING DUALPASS --------------------"
+  -- hPutStrLn stderr $ "dualpass: numjobs=" ++ show numjobs
+  threads' <- MV.replicate numjobs Nothing
+  allocBS finaljob threads'
+  threads <- MV.generateM numjobs (\i ->
                 MV.read threads' i >>= \case
                   Just p -> return p
                   Nothing -> error $ "Thread array not initialised: " ++ show i)
-  -- hPutStrLn stderr $ "hist = " ++ show hist
+  -- hPutStrLn stderr $ "prev = " ++ show prev
   -- hPutStrLn stderr $ "iout = " ++ show iout
   -- hPutStrLn stderr $ "adj = " ++ show adj
   backprop adj threads
   -- hPutStrLn stderr $ "-- resolve --"
-  resolve hist iout threads
+  resolve finaljob threads
+  adjarr0 <- snd <$> MV.read threads 0
+  -- hPutStrLn stderr $ "\n//////////////////// FINISHED DUALPASS ////////////////////"
   VS.freeze adjarr0
 
 
@@ -558,21 +552,20 @@ transform' inpStruc outStruc pat expr = do
   rebuild'var <- newName "rebuild'"
   outvar <- newName "out"
   out'var <- newName "out'"
-  histvar <- newName "hist"
-  outjivar <- newName "outji"
-  ioutvar <- newName "iout"
+  outjdvar <- newName "outjd"
+  outnextjivar <- newName "outnextji"
   primalvar <- newName "primal"
   dualvar <- newName "dual"
   adjvar <- newName "adjoint"
   [| \ $(varP argvar) ->
-        let ($(varP histvar), $(varP outjivar), $(varP ioutvar), ($(varP outvar), $(varP rebuildvar))) = runFwdM $ do
+        let ($(varP outjdvar), $(varP outnextjivar), ($(varP outvar), $(varP rebuildvar))) = runFwdM $ do
               ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
               $(varP out'var) <- $(ddr patbound expr)
               mpure ($(varE out'var), $(varE rebuild'var))
             ($(varP primalvar), $(varP dualvar)) = $(deinterleave outStruc (VarE outvar))
         in ($(varE primalvar)
            ,\ $(varP adjvar) ->
-                $(varE rebuildvar) (dualpass $(varE histvar) $(varE outjivar) $(varE ioutvar) $(varE dualvar) $(varE adjvar))) |]
+                $(varE rebuildvar) (dualpass $(varE outjdvar) $(varE outnextjivar) $(varE dualvar) $(varE adjvar))) |]
 
 
 -- ----------------------------------------------------------------------
