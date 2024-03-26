@@ -159,30 +159,27 @@ data JobDescr = JobDescr
   deriving (Show)
 
 newtype FwdM a = FwdM
-    (BeforeJob    -- what came before the current job
-  -> IORef JobID  -- the next job ID to generate
-  -> JobID        -- the job ID of the current thread
-  -> Int          -- the next node ID to generate
+    (IORef JobID  -- the next job ID to generate
+  -> JobDescr  -- job so far
   -> IO (JobDescr, a))  -- the terminal job of this computation
-         -- TODO: unpack?
 
 instance Functor FwdM where
-  fmap f (FwdM g) = FwdM $ \prev jr curj i -> do
-    (jd, x) <- g prev jr curj i
-    return (jd, f x)
+  fmap f (FwdM g) = FwdM $ \jr jd -> do
+    (jd1, x) <- g jr jd
+    return (jd1, f x)
 
 instance Applicative FwdM where
-  pure x = FwdM (\prev _ ji i -> return (JobDescr prev ji i, x))
-  FwdM f <*> FwdM g = FwdM $ \prev jr ji i -> do
-    (JobDescr prev1 ji1 i1, fun) <- f prev jr ji i
-    (JobDescr prev2 ji2 i2, x) <- g prev1 jr ji1 i1
-    return (JobDescr prev2 ji2 i2, fun x)
+  pure x = FwdM (\_ jd -> return (jd, x))
+  FwdM f <*> FwdM g = FwdM $ \jr jd -> do
+    (jd1, fun) <- f jr jd
+    (jd2, x) <- g jr jd1
+    return (jd2, fun x)
 
 instance Monad FwdM where
-  FwdM f >>= g = FwdM $ \prev jr ji i -> do
-    (JobDescr prev1 ji1 i1, x) <- f prev jr ji i
+  FwdM f >>= g = FwdM $ \jr jd -> do
+    (jd1, x) <- f jr jd
     let FwdM h = g x
-    h prev1 jr ji1 i1
+    h jr jd1
 
 -- | 'pure' with a restricted type.
 mpure :: a -> FwdM a
@@ -195,20 +192,19 @@ mpure = pure
 runFwdM :: FwdM a -> (JobDescr, JobID, a)
 runFwdM (FwdM f) = unsafePerformIO $ do
   jiref <- newIORef (JobID 1)
-  (jd, y) <- f Start jiref (JobID 0) 0
+  (jd, y) <- f jiref (JobDescr Start (JobID 0) 0)
   nextji <- readIORef jiref
   return (jd, nextji, y)
 
 -- 'a' and 'b' are computed in separate jobs, 'a' on the current thread and 'b'
 -- on a new thread.
 fwdmPar :: FwdM a -> FwdM b -> FwdM (a, b)
-fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \prev jr ji i -> do
-  let jd0 = JobDescr prev ji i  -- the job we're now closing with a fork
+fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr jd0 -> do
   (ji1, ji2, ji3) <-
     atomicModifyIORef' jr (\(JobID j) -> (JobID (j + 3), (JobID j, JobID (j+1), JobID (j+2))))
   threadResult <- newEmptyMVar
-  _ <- forkIO $ f2 Start jr ji2 0 >>= putMVar threadResult
-  (jd1, x) <- f1 Start jr ji1 0
+  _ <- forkIO $ f2 jr (JobDescr Start ji2 0) >>= putMVar threadResult
+  (jd1, x) <- f1 jr (JobDescr Start ji1 0)
   (jd2, y) <- readMVar threadResult
   return (JobDescr (Fork jd0 jd1 jd2) ji3 0, (x, y))
 
@@ -219,10 +215,10 @@ data NID = NID {-# UNPACK #-} !JobID
   deriving (Show)
 
 fwdmGenId :: FwdM NID
-fwdmGenId = FwdM (\prev _ ji i -> return (JobDescr prev ji (i + 1), NID ji i))
+fwdmGenId = FwdM (\_ (JobDescr prev ji i) -> return (JobDescr prev ji (i + 1), NID ji i))
 
 fwdmGenIdInterleave :: FwdM Int
-fwdmGenIdInterleave = FwdM $ \prev _ ji@(JobID jiInt) i ->
+fwdmGenIdInterleave = FwdM $ \_ (JobDescr prev ji@(JobID jiInt) i) ->
   if jiInt == 0
     then return (JobDescr prev ji (i + 1), i)
     else error "fwdmGenIdInterleave: not on main thread"
