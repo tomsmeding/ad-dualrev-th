@@ -1,13 +1,10 @@
 -- TODO:
 -- - Polymorphically recursive data types
 
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveLift #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -141,6 +138,17 @@ x |*| y = x `par` y `par` (x, y)
 -- The monad for the target program
 -- ------------------------------------------------------------
 
+-- | A helper function for fork-join parallelism, used in 'fwdmPar' and in
+-- 'resolve'.
+runInParallel :: IO a -> IO b -> IO (a, b)
+runInParallel m1 m2 = do
+  threadResult <- newEmptyMVar
+  _ <- forkIO $ m2 >>= putMVar threadResult
+  x <- m1
+  y <- readMVar threadResult
+  return (x, y)
+
+
 -- | The ID of a parallel job, >=0. The implicit main job has ID 0, parallel
 -- jobs start from 1.
 newtype JobID = JobID Int
@@ -202,10 +210,8 @@ fwdmPar :: FwdM a -> FwdM b -> FwdM (a, b)
 fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr jd0 -> do
   (ji1, ji2, ji3) <-
     atomicModifyIORef' jr (\(JobID j) -> (JobID (j + 3), (JobID j, JobID (j+1), JobID (j+2))))
-  threadResult <- newEmptyMVar
-  _ <- forkIO $ f2 jr (JobDescr Start ji2 0) >>= putMVar threadResult
-  (jd1, x) <- f1 jr (JobDescr Start ji1 0)
-  (jd2, y) <- readMVar threadResult
+  ((jd1, x), (jd2, y)) <- runInParallel (f1 jr (JobDescr Start ji1 0))
+                                        (f2 jr (JobDescr Start ji2 0))
   return (JobDescr (Fork jd0 jd1 jd2) ji3 0, (x, y))
 
 -- | The tag on a node in the Contrib graph. Consists of a job ID and the ID of
@@ -245,53 +251,55 @@ debugContrib (Contrib l) = "Contrib [" ++ intercalate "," (map go l) ++ "]"
 -- so we are technically sequentialising a bit in the worst case here. It's not
 -- _so_ bad, though.
 allocBS :: JobDescr -> MaybeBuildState -> IO ()
-allocBS (JobDescr prev (JobID ji) n) = \threads -> do
-  -- hPutStrLn stderr $ "allocBS: ji=" ++ show ji
-  MV.read threads ji >>= \case
-    Just _ -> error $ "allocBS: already allocated? (" ++ show ji ++ ")"
-    Nothing -> do
-      cbarr <- MV.replicate n (Contrib [])
-      adjarr <- MVS.replicate n 0.0
-      MV.write threads ji (Just (cbarr, adjarr))
-  allocPrev prev threads
+allocBS topjobdescr threads = go topjobdescr
   where
-    allocPrev :: BeforeJob -> MaybeBuildState -> IO ()
-    allocPrev Start _ = return ()
-    allocPrev (Fork parent jd1 jd2) threads = do
-      allocBS jd1 threads
-      allocBS jd2 threads
-      allocBS parent threads
+    go :: JobDescr -> IO ()
+    go (JobDescr prev (JobID ji) n) = do
+      -- hPutStrLn stderr $ "allocBS: ji=" ++ show ji
+      MV.read threads ji >>= \case
+        Just _ -> error $ "allocBS: already allocated? (" ++ show ji ++ ")"
+        Nothing -> do
+          cbarr <- MV.replicate n (Contrib [])
+          adjarr <- MVS.replicate n 0.0
+          MV.write threads ji (Just (cbarr, adjarr))
+      case prev of
+        Start -> return ()
+        Fork parent jd1 jd2 -> do
+          go jd1
+          go jd2
+          go parent
 
 resolve :: JobDescr -> BuildState -> IO ()
-resolve = \(JobDescr prev ji i) threads -> do
-  when kDEBUG $ hPutStrLn stderr $ "Enter job " ++ show ji ++ " from i=" ++ show (i - 1)
-  loop ji (i - 1) threads
-  case prev of
-    Start -> return ()
-    Fork jd0 jd1 jd2 -> do
-      let jidOf (JobDescr _ n _) = n
-      when kDEBUG $ hPutStrLn stderr $ "Forking jobs (" ++ show (jidOf jd1) ++ ") and (" ++ show (jidOf jd2) ++ "); parent (" ++ show (jidOf jd0) ++ ")"
-      done <- newEmptyMVar
-      _ <- forkIO $ resolve jd2 threads >> putMVar done ()
-      resolve jd1 threads
-      readMVar done
-      resolve jd0 threads
+resolve terminalJob threads = resolveTask terminalJob
   where
-    loop :: JobID -> Int -> BuildState -> IO ()
-    loop _ (-1) _ = return ()
-    loop jid@(JobID ji) i threads = do
-      (cbarr, adjarr) <- MV.read threads ji
+    resolveTask :: JobDescr -> IO ()
+    resolveTask (JobDescr prev ji i) = do
+      when kDEBUG $ hPutStrLn stderr $ "Enter job " ++ show ji ++ " from i=" ++ show (i - 1)
+      (cbarr, adjarr) <- MV.read threads (let JobID j = ji in j)
+      resolveJob ji (i - 1) cbarr adjarr
+      case prev of
+        Start -> return ()
+        Fork jd0 jd1 jd2 -> do
+          let jidOf (JobDescr _ n _) = n
+          when kDEBUG $ hPutStrLn stderr $ "Forking jobs (" ++ show (jidOf jd1) ++ ") and (" ++ show (jidOf jd2) ++ "); parent (" ++ show (jidOf jd0) ++ ")"
+          _ <- runInParallel (resolve jd1 threads)
+                             (resolve jd2 threads)
+          resolve jd0 threads
+
+    resolveJob :: JobID -> Int -> MV.IOVector Contrib -> MVS.IOVector Double -> IO ()
+    resolveJob _ (-1) _ _ = return ()
+    resolveJob jid i cbarr adjarr = do
       cb <- MV.read cbarr i
       adj <- MVS.read adjarr i
       when kDEBUG $ hPutStrLn stderr $ "Apply (" ++ show (NID jid i) ++ ") [adj=" ++ show adj ++ "]: " ++ debugContrib cb
-      apply cb adj threads
-      loop jid (i - 1) threads
+      apply cb adj
+      resolveJob jid (i - 1) cbarr adjarr
 
-    apply :: Contrib -> Double -> BuildState -> IO ()
-    apply (Contrib []) _ _ = return ()
-    apply (Contrib ((nid, cb, d) : cbs)) a threads = do
+    apply :: Contrib -> Double -> IO ()
+    apply (Contrib []) _ = return ()
+    apply (Contrib ((nid, cb, d) : cbs)) a = do
       addContrib nid cb (a * d) threads
-      apply (Contrib cbs) a threads
+      apply (Contrib cbs) a
 
 -- This is the function called from the backpropagator built by deinterleave,
 -- as well as from 'resolve'.
