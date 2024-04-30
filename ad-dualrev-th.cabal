@@ -34,6 +34,9 @@ library
   ghc-options: -Wall
   build-depends:
       base >=4.7 && <4.19
+    , bytestring
+    , deepseq
+    , clock
     , containers
     , mtl
     , parallel
@@ -91,9 +94,12 @@ benchmark bench
     , ad-dualrev-th
     , test-framework
     , ad ^>= 4.5
+    , clock
     -- criterion lower bound: to support ghc 9.2.4
     , criterion ^>= 1.6
     , deepseq
     , QuickCheck
     , template-haskell
   default-language: Haskell2010
+  -- This is required to allow profiling an executable that uses TH. See cabal#5961
+  other-extensions: TemplateHaskell

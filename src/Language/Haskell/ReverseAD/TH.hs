@@ -12,6 +12,8 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# OPTIONS -fno-cse -fno-full-laziness #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- This warning is over-eager in TH quotes when the variables that the pattern
 -- binds are spliced instead of mentioned directly. See
@@ -21,6 +23,7 @@
 module Language.Haskell.ReverseAD.TH (
   -- * Reverse AD
   reverseAD,
+  reverseAD_tm,
   reverseAD',
   -- * Structure descriptions
   Structure,
@@ -28,10 +31,12 @@ module Language.Haskell.ReverseAD.TH (
   structureFromType,
   -- * Special methods
   (|*|),
+
+  evlog, traceEvlog,
 ) where
 
 import Control.Concurrent
-import Control.Monad (when)
+import Control.Monad (when, forM_)
 import Control.Parallel (par)
 import Data.Bifunctor (first, second)
 import Data.Char (isAlphaNum)
@@ -50,9 +55,15 @@ import Data.Word (Word8, Word16, Word32, Word64)
 import GHC.Exts (Multiplicity(..))
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax as TH hiding (lift)
+import System.Clock
 import System.IO.Unsafe
 
--- import Control.Monad.IO.Class
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
+import Control.DeepSeq
+import Control.Exception (evaluate)
+
+import Control.Monad.IO.Class
 -- import Debug.Trace
 import System.IO
 
@@ -173,19 +184,19 @@ newtype FwdM a = FwdM
 
 instance Functor FwdM where
   fmap f (FwdM g) = FwdM $ \jr jd -> do
-    (jd1, x) <- g jr jd
+    (jd1, !x) <- g jr jd
     return (jd1, f x)
 
 instance Applicative FwdM where
   pure x = FwdM (\_ jd -> return (jd, x))
   FwdM f <*> FwdM g = FwdM $ \jr jd -> do
-    (jd1, fun) <- f jr jd
-    (jd2, x) <- g jr jd1
+    (jd1, !fun) <- f jr jd
+    (jd2, !x) <- g jr jd1
     return (jd2, fun x)
 
 instance Monad FwdM where
   FwdM f >>= g = FwdM $ \jr jd -> do
-    (jd1, x) <- f jr jd
+    (jd1, !x) <- f jr jd
     let FwdM h = g x
     h jr jd1
 
@@ -193,15 +204,24 @@ instance Monad FwdM where
 mpure :: a -> FwdM a
 mpure = pure
 
+-- runFwdM :: FwdM a -> (JobDescr, JobID, a)
+-- runFwdM = runFwdM' Nothing
+
 -- Returns:
 -- - the terminal job, i.e. the job with which the computation ended
 -- - the maximal job ID generated plus 1
-{-# NOINLINE runFwdM #-}
-runFwdM :: FwdM a -> (JobDescr, JobID, a)
-runFwdM (FwdM f) = unsafePerformIO $ do
+{-# NOINLINE runFwdM' #-}
+runFwdM' :: Maybe (IORef Double) -> FwdM a -> (JobDescr, JobID, a)
+runFwdM' mfwdtmref (FwdM f) = unsafePerformIO $ do
+  evlog "fwdm start"
+  tstart <- getTime Monotonic
   jiref <- newIORef (JobID 1)
   (jd, y) <- f jiref (JobDescr Start (JobID 0) 0)
   nextji <- readIORef jiref
+  evlog "fwdm end"
+  tend <- getTime Monotonic
+  forM_ mfwdtmref $ \ref -> writeIORef ref (fromIntegral (toNanoSecs (diffTimeSpec tstart tend)) / 1e9)
+  -- hPutStrLn stderr $ "fwdm: " ++ show (fromIntegral (toNanoSecs (diffTimeSpec tstart tend)) / 1e6 :: Double) ++ "ms"
   return (jd, nextji, y)
 
 -- 'a' and 'b' are computed in separate jobs, 'a' on the current thread and 'b'
@@ -213,6 +233,10 @@ fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr jd0 -> do
   ((jd1, x), (jd2, y)) <- runInParallel (f1 jr (JobDescr Start ji1 0))
                                         (f2 jr (JobDescr Start ji2 0))
   return (JobDescr (Fork jd0 jd1 jd2) ji3 0, (x, y))
+
+-- | Allow defeating laziness.
+fwdmEvaluate :: a -> FwdM a
+fwdmEvaluate x = FwdM $ \_ jd -> evaluate x >>= \x' -> return (jd, x')
 
 -- | The tag on a node in the Contrib graph. Consists of a job ID and the ID of
 -- the node within this thread.
@@ -320,21 +344,35 @@ dualpass :: JobDescr -> JobID -> (d -> BuildState -> IO ()) -> d -> VS.Vector Do
 dualpass finaljob (JobID numjobs) backprop adj = unsafePerformIO $ do
   -- hPutStrLn stderr $ "\n-------------------- ENTERING DUALPASS --------------------"
   -- hPutStrLn stderr $ "dualpass: numjobs=" ++ show numjobs
+  evlog "dual start"
+  -- t1 <- getTime Monotonic
+  -- hPutStrLn stderr $ "dual(numjobs=" ++ show numjobs ++ ")"
   threads' <- MV.replicate numjobs Nothing
   allocBS finaljob threads'
   threads <- MV.generateM numjobs (\i ->
                 MV.read threads' i >>= \case
                   Just p -> return p
                   Nothing -> error $ "Thread array not initialised: " ++ show i)
+  evlog "dual allocated"
+  -- t2 <- getTime Monotonic
   -- hPutStrLn stderr $ "prev = " ++ show prev
   -- hPutStrLn stderr $ "iout = " ++ show iout
   -- hPutStrLn stderr $ "adj = " ++ show adj
   backprop adj threads
   -- hPutStrLn stderr $ "-- resolve --"
+  evlog "dual bped"
+  -- t3 <- getTime Monotonic
   resolve finaljob threads
+  evlog "dual resolved"
+  -- t4 <- getTime Monotonic
   adjarr0 <- snd <$> MV.read threads 0
   -- hPutStrLn stderr $ "\n//////////////////// FINISHED DUALPASS ////////////////////"
-  VS.freeze adjarr0
+  res <- VS.freeze adjarr0
+  evlog "dual frozen"
+  -- t5 <- getTime Monotonic
+  -- let tms = [t1, t2, t3, t4, t5]
+  -- hPutStrLn stderr $ "dual: " ++ intercalate " / " (zipWith (\t t' -> show (fromIntegral (toNanoSecs (diffTimeSpec t t')) / 1e6 :: Double) ++ "ms") tms (tail tms))
+  return res
 
 
 -- ------------------------------------------------------------
@@ -345,6 +383,9 @@ dualpass finaljob (JobID numjobs) backprop adj = unsafePerformIO $ do
 -- 'structureFromTypeable' or 'structureFromType' to construct a 'Structure'.
 data Structure = Structure MonoType DataTypes
   deriving (Show)
+
+instance NFData Structure where
+  rnf (Structure m ds) = rnf m `seq` rnf (show ds)
 
 -- | Analyse the 'Type' and give a 'Structure' that describes the type for use
 -- in 'reverseAD''.
@@ -380,6 +421,12 @@ deriving instance Lift (SimpleType mf)
 
 type PolyType = SimpleType 'Poly
 type MonoType = SimpleType 'Mono
+
+instance NFData (SimpleType mf) where
+  rnf DiscreteST = ()
+  rnf ScalarST = ()
+  rnf (VarST n) = n `seq` ()
+  rnf (ConST n ts) = n `seq` rnf ts
 
 discreteTypeNames :: [Name]
 discreteTypeNames =
@@ -526,50 +573,62 @@ exploreRecursiveType tau = do
 reverseAD :: forall a b. (Typeable a, Typeable b)
           => Code Q (a -> b)
           -> Code Q (a -> (b, b -> a))
-reverseAD = reverseAD' (structureFromTypeable (Proxy @a)) (structureFromTypeable (Proxy @b))
+reverseAD = reverseAD' Nothing (structureFromTypeable (Proxy @a)) (structureFromTypeable (Proxy @b))
+
+reverseAD_tm :: forall a b. (Typeable a, Typeable b)
+             => Code Q (IORef Double)
+             -> Code Q (a -> b)
+             -> Code Q (a -> (b, b -> a))
+reverseAD_tm fwdtmref = reverseAD' (Just fwdtmref) (structureFromTypeable (Proxy @a)) (structureFromTypeable (Proxy @b))
 
 -- | Same as 'reverseAD', but with user-supplied 'Structure's.
 reverseAD' :: forall a b.
-              Q Structure  -- ^ Structure of @a@
+              Maybe (Code Q (IORef Double))
+           -> Q Structure  -- ^ Structure of @a@
            -> Q Structure  -- ^ Structure of @b@
            -> Code Q (a -> b)
            -> Code Q (a -> (b, b -> a))
-reverseAD' inpStruc outStruc (unTypeCode -> inputCode) =
+reverseAD' mfwdtmref inpStruc outStruc (unTypeCode -> inputCode) =
   unsafeCodeCoerce $ do
     inpStruc' <- inpStruc
     outStruc' <- outStruc
     ex <- inputCode
-    transform inpStruc' outStruc' ex
+    transform mfwdtmref inpStruc' outStruc' ex
 
-transform :: Structure -> Structure -> TH.Exp -> Q TH.Exp
-transform inpStruc outStruc expr = do
+transform :: Maybe (Code Q (IORef Double)) -> Structure -> Structure -> TH.Exp -> Q TH.Exp
+transform mfwdtmref inpStruc outStruc expr = do
   expr' <- translate expr
   case expr' of
-    ELam pat body -> transform' inpStruc outStruc pat body
+    ELam pat body -> transform' mfwdtmref inpStruc outStruc pat body
     _ -> fail $ "Top-level expression in reverseAD must be lambda, but is: " ++ show expr'
 
-transform' :: Structure -> Structure -> Pat -> Source.Exp -> Q TH.Exp
-transform' inpStruc outStruc pat expr = do
+transform' :: Maybe (Code Q (IORef Double)) -> Structure -> Structure -> Pat -> Source.Exp -> Q TH.Exp
+transform' mfwdtmref inpStruc outStruc pat expr = do
+  _ <- liftIO $ evaluate (force inpStruc)
+  _ <- liftIO $ evaluate (force outStruc)
   patbound <- boundVars pat
   argvar <- newName "arg"
   rebuildvar <- newName "rebuild"
   rebuild'var <- newName "rebuild'"
   outvar <- newName "out"
-  out'var <- newName "out'"
   outjdvar <- newName "outjd"
   outnextjivar <- newName "outnextji"
   primalvar <- newName "primal"
+  primal'var <- newName "primal'"
   dualvar <- newName "dual"
+  dual'var <- newName "dual'"
   adjvar <- newName "adjoint"
   [| \ $(varP argvar) ->
-        let ($(varP outjdvar), $(varP outnextjivar), ($(varP outvar), $(varP rebuildvar))) = runFwdM $ do
-              ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
-              $(varP out'var) <- $(ddr patbound expr)
-              mpure ($(varE out'var), $(varE rebuild'var))
-            ($(varP primalvar), $(varP dualvar)) = $(deinterleave outStruc (VarE outvar))
+        let ($(varP outjdvar), $(varP outnextjivar), ($(varP rebuildvar), $(varP primalvar), $(varP dualvar))) =
+              runFwdM' $(maybe [| Nothing |] (\c -> [| Just $(unTypeCode c) |]) mfwdtmref) $ do
+                ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
+                $(varP outvar) <- $(ddr patbound expr)
+                ($(varP primal'var), $(varP dual'var)) <- mpure $(deinterleave outStruc (VarE outvar))
+                _ <- fwdmEvaluate $(varE primal'var)
+                mpure ($(varE rebuild'var), $(varE primal'var), $(varE dual'var))
         in ($(varE primalvar)
            ,\ $(varP adjvar) ->
-                $(varE rebuildvar) (dualpass $(varE outjdvar) $(varE outnextjivar) $(varE dualvar) $(varE adjvar))) |]
+                $(varE rebuildvar) $! dualpass $(varE outjdvar) $(varE outnextjivar) $(varE dualvar) $(varE adjvar)) |]
 
 
 -- ----------------------------------------------------------------------
@@ -776,7 +835,8 @@ ddrDecGroup env (DecMutGroup lams) = do
         rhs' <- ddr (env <> Set.fromList names <> bound) rhs
         let dec = ValD (VarP name) (NormalB (LamE [pat] rhs')) []
         case msig of
-          Just sig -> return [SigD name sig, dec]
+          Just sig -> do sig' <- ddrType sig
+                         return [SigD name sig', dec]
           Nothing -> return [dec]
     | (name, msig, pat, rhs) <- lams]
   return (LetS decs, names)
@@ -1181,3 +1241,18 @@ tvbName (KindedTV n _ _) = n
 
 mapUnionsWithKey :: (Foldable f, Ord k) => (k -> a -> a -> a) -> f (Map k a) -> Map k a
 mapUnionsWithKey f = foldr (Map.unionWithKey f) mempty
+
+{-# NOINLINE traceEvlog #-}
+traceEvlog :: String -> a -> a
+traceEvlog s x = unsafePerformIO $ evlog s >> return x
+
+evlog :: String -> IO ()
+evlog s = do
+  clk <- getTime Monotonic
+  withMVar evlogfile $ \f -> do
+    BS.hPut f $ BS8.pack (show (fromIntegral (toNanoSecs clk) / 1e9 :: Double) ++ ' ' : s ++ "\n")
+    hFlush f
+
+{-# NOINLINE evlogfile #-}
+evlogfile :: MVar Handle
+evlogfile = unsafePerformIO $ newMVar =<< openFile "evlogfile.txt" AppendMode

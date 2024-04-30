@@ -13,17 +13,21 @@ module Main where
 import Control.Concurrent
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
-import Control.Monad (when)
+import Control.Monad
 import Criterion
 import Criterion.Types (Config(..))
 import qualified Criterion.Main as Criterion
 import qualified Criterion.Main.Options as Criterion
 import Data.Functor.Identity
+import System.Clock
 import System.Environment (getArgs)
 import System.Exit (die, exitSuccess, exitFailure)
+import System.Mem (performGC)
+import System.IO
+import Data.IORef
 
 import DFunction
-import Language.Haskell.ReverseAD.TH ((|*|))
+import Language.Haskell.ReverseAD.TH ((|*|), evlog, reverseAD_tm)
 import Test.Approx
 import Test.Framework hiding (scale)
 import Types
@@ -70,8 +74,8 @@ frotvecquat = $$(makeFunction
               in scale (2.0 * dot u v) u `vadd` scale (s * s - dot u u) v `vadd` scale (2.0 * s) (cross u v)
         in rotate_vec_by_quat topv topq ||])
 
-fparticles :: DFunction FParticles Identity
-fparticles = $$(makeFunction
+fparticles_gen :: Int -> DFunction FParticles Identity
+fparticles_gen iters = $$(makeFunction
   [|| \(FParticles l) ->
         let parmap _ [] = []
             parmap f (x:xs) =
@@ -94,14 +98,78 @@ fparticles = $$(makeFunction
                      in loop (n-1) p' v'
             sum' [] = 0.0
             sum' ((x,y):xs) = x*y + sum' xs
-        in Identity $ sum' (parmap (\(p, v) -> loop 1000 p v) l) ||])
+        in Identity $ sum' (parmap (\(p, v) -> loop iters p v) l) ||])
+
+fparticles :: DFunction FParticles Identity
+fparticles = fparticles_gen 1000
+
+{-# NOINLINE fparticles_gen_ad #-}
+fparticles_gen_ad :: Int -> IORef Double -> [((Double, Double), (Double, Double))] -> (Double, Double -> [((Double, Double), (Double, Double))])
+fparticles_gen_ad iters ref = $$(reverseAD_tm [|| ref ||]
+  [|| \l ->
+        let parmap _ [] = []
+            parmap f (x:xs) =
+              let (y, ys) = f x |*| parmap f xs
+              in y : ys
+            (a, b) .+ (c, d) = (a + c, b + d)
+            s .* (a, b) = (s * a, s * b)
+            forceField p = (-0.5) .* p
+            friction v = (-0.2) .* v
+            mass = 1.0
+            step :: (Double, Double) -> (Double, Double) -> Double
+                 -> ((Double, Double), (Double, Double))
+            step p v dt =
+              let a = (1.0 / mass) .* (forceField p .+ friction v)
+              in (p .+ (dt .* v), v .+ (dt .* a))
+            loop :: Int -> (Double, Double) -> (Double, Double) -> (Double, Double)
+            loop n p v =
+              if n == (0 :: Int) then p
+                else let (p', v') = step p v 0.05
+                     in loop (n-1) p' v'
+            sum' [] = 0.0
+            sum' ((x,y):xs) = x*y + sum' xs
+        in sum' (parmap (\(p, v) -> loop iters p v) l) ||])
+
+runParTest :: IO ()
+runParTest = do
+  getNumCapabilities >>= \num -> hPutStrLn stderr ("Using " ++ show num ++ " threads")
+  let input = [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]]
+  -- forM_ [250, 500 .. 10000] $ \iters -> do
+  fwdtmref <- newIORef (-1.0)
+  forM_ [10000] $ \iters -> do
+    _ <- func fwdtmref iters input 0
+    tms <- forM [1..10] (func fwdtmref iters input)
+    fwdtm <- readIORef fwdtmref
+    print tms
+    let tm = sum tms / fromIntegral (length tms)
+    putStrLn $ show iters ++ " " ++ show tm ++ " " ++ show fwdtm
+    hFlush stdout
+  where
+    {-# NOINLINE func #-}
+    func :: IORef Double -> Int -> [((Double, Double), (Double, Double))] -> Int -> IO Double
+    func fwdtmref iters input _ = fmap fst $ timed $ do
+      let (primal, dual) = fparticles_gen_ad iters fwdtmref input
+      _ <- evaluate (primal :: Double)
+      _ <- evaluate (force (dual 1.0))
+      return ()
+
+    timed :: IO a -> IO (Double, a)
+    timed act = do
+      performGC
+      evlog "bench start"
+      t1 <- getTime Monotonic
+      res <- act
+      evlog "bench end"
+      t2 <- getTime Monotonic
+      return (fromIntegral (toNanoSecs (diffTimeSpec t1 t2)) / 1e9, res)
 
 data Options = Options
   { argsHelp :: Bool
   , argsOutput :: Maybe FilePath
   , argsCsv :: Maybe FilePath
   , argsNoTest :: Bool
-  , argsPatternsRev :: [String] }
+  , argsPatternsRev :: [String]
+  , argsParTest :: Bool }
   deriving (Show)
 
 parseArgs :: [String] -> Options -> Either String Options
@@ -111,6 +179,7 @@ parseArgs ("--help" : _) a = return $ a { argsHelp = True }
 parseArgs ("-o" : path : ss) a = parseArgs ss (a { argsOutput = Just path })
 parseArgs ("--notest" : ss) a = parseArgs ss (a { argsNoTest = True })
 parseArgs ("--csv" : path : ss) a = parseArgs ss (a { argsCsv = Just path })
+parseArgs ("--partest" : ss) a = parseArgs ss (a { argsParTest = True })
 parseArgs ("" : _) _ = Left "Unexpected empty argument"
 parseArgs (s@(c0:_) : ss) a
   | c0 /= '-' = parseArgs ss (a { argsPatternsRev = s : argsPatternsRev a })
@@ -118,13 +187,17 @@ parseArgs (s : _) _ = Left ("Unrecognised argument '" ++ s ++ "'")
 
 main :: IO ()
 main = do
-  options <- getArgs >>= \args -> case parseArgs args (Options False Nothing Nothing False []) of
+  options <- getArgs >>= \args -> case parseArgs args (Options False Nothing Nothing False [] False) of
                Left err -> die err
                Right opts -> return opts
 
   when (argsHelp options) $ do
     putStrLn "Usage: bench [-o <criterion-output.html>] [--notest] [--csv <results.csv>]\n\
              \             [test patterns...]"
+    exitSuccess
+
+  when (argsParTest options) $ do
+    runParTest
     exitSuccess
 
   when (not (argsNoTest options)) $ do
