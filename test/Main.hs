@@ -347,7 +347,8 @@ main =
        (Just (\_ (Vec3 a b c) -> Vec3 (a + c) (a + b) (b + c)))
        YesFD] ++
 
-    [checkFDcontrol "quaternion newtype"
+    [changeArgs (\a -> a { maxSuccess = 10000 }) $
+     checkFDcontrol "quaternion newtype"
        $$(reverseADandControl @(Vec3N Double, QuaternionN Double) @(Vec3N Double)
             [|| \(topv, topq) ->
                   let q_to_vec (QuaternionN (x, y, z, _)) = Vec3N (x, y, z)
@@ -364,7 +365,8 @@ main =
        Nothing
        YesFD] ++
 
-    [checkFDcontrol "quaternion data"
+    [changeArgs (\a -> a { maxSuccess = 10000 }) $
+     checkFDcontrol "quaternion data"
        $$(reverseADandControl @(Vec3 Double, Quaternion Double) @(Vec3 Double)
             [|| \(topv, topq) ->
                   let q_to_vec (Quaternion x y z _) = Vec3 x y z

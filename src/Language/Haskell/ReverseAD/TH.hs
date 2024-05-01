@@ -15,6 +15,7 @@
 {-# OPTIONS -fno-cse -fno-full-laziness #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE Strict, StrictData #-}
+{-# LANGUAGE RankNTypes #-}
 
 -- This warning is over-eager in TH quotes when the variables that the pattern
 -- binds are spliced instead of mentioned directly. See
@@ -154,6 +155,7 @@ x |*| y = x `par` y `par` (x, y)
 -- | A helper function for fork-join parallelism, used in 'fwdmPar' and in
 -- 'resolve'. Requires that we're currently already executing inside a thread
 -- pool thread.
+{-
 runInParallel :: IO a -> IO b -> IO (a, b)
 runInParallel m1 m2 = do
   cell2 <- newEmptyMVar
@@ -163,6 +165,9 @@ runInParallel m1 m2 = do
   tryStealJob ref2
   res2 <- readMVar cell2
   return (res1, res2)
+-}
+-- runInParallel :: IO a -> IO b -> IO (a, b)
+-- runInParallel m1 m2 = concurrently m1 m2
 
 -- | The ID of a parallel job, >=0. The implicit main job has ID 0, parallel
 -- jobs start from 1.
@@ -184,28 +189,28 @@ data JobDescr = JobDescr
 newtype FwdM a = FwdM
     (IORef JobID  -- the next job ID to generate
   -> JobDescr  -- job so far
-  -> IO (JobDescr, a))  -- the terminal job of this computation
+  -> (JobDescr -> a -> IO ()) -> IO ())  -- the terminal job of this computation
 
 instance Functor FwdM where
-  fmap f (FwdM g) = FwdM $ \jr !jd -> do
-    (!jd1, !x) <- g jr jd
-    return (jd1, f x)
+  fmap f (FwdM g) = FwdM $ \jr !jd k ->
+    g jr jd $ \ !jd1 !x ->
+      k jd1 (f x)
 
 instance Applicative FwdM where
-  pure !x = FwdM (\_ !jd -> return (jd, x))
-  FwdM f <*> FwdM g = FwdM $ \jr !jd -> do
-    (!jd1, !fun) <- f jr jd
-    (!jd2, !x) <- g jr jd1
-    return (jd2, fun x)
+  pure !x = FwdM (\_ !jd k -> k jd x)
+  FwdM f <*> FwdM g = FwdM $ \jr !jd k ->
+    f jr jd $ \ !jd1 !fun ->
+      g jr jd1 $ \ !jd2 !x ->
+        k jd2 (fun x)
 
 instance Monad FwdM where
-  FwdM f >>= g = FwdM $ \jr !jd -> do
-    (!jd1, !x) <- f jr jd
-    let FwdM h = g x
-    h jr jd1
+  FwdM f >>= g = FwdM $ \jr !jd k ->
+    f jr jd $ \ !jd1 !x ->
+      let FwdM h = g x
+      in h jr jd1 k
 
 instance MonadIO FwdM where
-  liftIO m = FwdM $ \_ !jd -> m >>= \x -> return (jd, x)
+  liftIO m = FwdM $ \_ !jd k -> m >>= k jd
 
 -- | 'pure' with a restricted type.
 mpure :: a -> FwdM a
@@ -224,8 +229,8 @@ runFwdM' mfwdtmref (FwdM f) = unsafePerformIO $ do
   tstart <- getTime Monotonic
   jiref <- newIORef (JobID 1)
   resvar <- newEmptyMVar
-  _ <- submitJob globalThreadPool (f jiref (JobDescr Start (JobID 0) 0)) (putMVar resvar)
-  (jd, y) <- readMVar resvar
+  _ <- submitJob globalThreadPool (f jiref (JobDescr Start (JobID 0) 0) (curry (putMVar resvar))) return
+  (jd, y) <- takeMVar resvar
   nextji <- readIORef jiref
   evlog "fwdm end"
   tend <- getTime Monotonic
@@ -233,17 +238,23 @@ runFwdM' mfwdtmref (FwdM f) = unsafePerformIO $ do
   -- hPutStrLn stderr $ "fwdm: " ++ show (fromIntegral (toNanoSecs (diffTimeSpec tstart tend)) / 1e6 :: Double) ++ "ms"
   return (jd, nextji, y)
 
--- 'a' and 'b' are computed in separate jobs, 'a' on the current thread and 'b'
--- on a new thread.
+-- 'a' and 'b' are computed in new, separate jobs.
 fwdmPar :: FwdM a -> FwdM b -> FwdM (a, b)
-fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr !jd0 -> do
+fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr !jd0 k -> do
   (ji1, ji2, ji3) <-
     atomicModifyIORef' jr (\(JobID j) -> (JobID (j + 3), (JobID j, JobID (j+1), JobID (j+2))))
   debug "! Starting fork"
-  ((jd1, x), (jd2, y)) <- runInParallel (f1 jr (JobDescr Start ji1 0))
-                                        (f2 jr (JobDescr Start ji2 0))
-  debug "! Joined"
-  return (JobDescr (Fork jd0 jd1 jd2) ji3 0, (x, y))
+  cell1 <- newEmptyMVar
+  cell2 <- newEmptyMVar
+  forkJoin globalThreadPool
+    (f1 jr (JobDescr Start ji1 0) (\jd1 x -> debug "! join left" >> putMVar cell1 (jd1, x)))
+    (f2 jr (JobDescr Start ji2 0) (\jd2 y -> debug "! join right" >> putMVar cell2 (jd2, y)))
+    (\() () -> do
+      (jd1, x) <- takeMVar cell1
+      (jd2, y) <- takeMVar cell2
+      debug "! Joined"
+      _ <- submitJob globalThreadPool (k (JobDescr (Fork jd0 jd1 jd2) ji3 0) (x, y)) return
+      return ())
 
 -- | The tag on a node in the Contrib graph. Consists of a job ID and the ID of
 -- the node within this thread.
@@ -252,12 +263,12 @@ data NID = NID {-# UNPACK #-} !JobID
   deriving (Show)
 
 fwdmGenId :: FwdM NID
-fwdmGenId = FwdM (\_ (JobDescr prev ji i) -> return (JobDescr prev ji (i + 1), NID ji i))
+fwdmGenId = FwdM $ \_ (JobDescr prev ji i) k -> k (JobDescr prev ji (i + 1)) (NID ji i)
 
 fwdmGenIdInterleave :: FwdM Int
-fwdmGenIdInterleave = FwdM $ \_ (JobDescr prev ji@(JobID jiInt) i) ->
+fwdmGenIdInterleave = FwdM $ \_ (JobDescr prev ji@(JobID jiInt) i) k ->
   if jiInt == 0
-    then return (JobDescr prev ji (i + 1), i)
+    then k (JobDescr prev ji (i + 1)) i
     else error "fwdmGenIdInterleave: not on main thread"
 
 
@@ -315,28 +326,37 @@ allocBS topjobdescr threads = go topjobdescr
           go parent
 
 resolve :: JobDescr -> BuildState -> IO ()
-resolve terminalJob threads = resolveTask terminalJob
+resolve terminalJob threads = do
+  cell <- newEmptyMVar
+  _ <- submitJob globalThreadPool (resolveTask terminalJob (putMVar cell ())) return
+  takeMVar cell
   where
-    resolveTask :: JobDescr -> IO ()
-    resolveTask (JobDescr prev ji i) = do
+    resolveTask :: JobDescr -> IO () -> IO ()
+    resolveTask (JobDescr prev ji i) k = do
       when kDEBUG $ hPutStrLn stderr $ "Enter job " ++ show ji ++ " from i=" ++ show (i - 1)
       (cbarr, adjarr) <- MV.read threads (let JobID j = ji in j)
       resolveJob ji (i - 1) cbarr adjarr
       case prev of
-        Start -> return ()
+        Start -> k
         Fork jd0 jd1 jd2 -> do
           let jidOf (JobDescr _ n _) = n
           when kDEBUG $ hPutStrLn stderr $ "Forking jobs (" ++ show (jidOf jd1) ++ ") and (" ++ show (jidOf jd2) ++ "); parent (" ++ show (jidOf jd0) ++ ")"
-          _ <- runInParallel (resolve jd1 threads)
-                             (resolve jd2 threads)
-          resolve jd0 threads
+          cell1 <- newEmptyMVar
+          cell2 <- newEmptyMVar
+          forkJoin globalThreadPool
+            (resolveTask jd1 (putMVar cell1 ()))
+            (resolveTask jd2 (putMVar cell2 ()))
+            (\_ _ -> do takeMVar cell1 >> takeMVar cell2
+                        _ <- submitJob globalThreadPool (resolveTask jd0 k) return
+                        return ())
 
     resolveJob :: JobID -> Int -> MV.IOVector Contrib -> MVS.IOVector Double -> IO ()
     resolveJob _ (-1) _ _ = return ()
     resolveJob jid i cbarr adjarr = do
       cb <- MV.read cbarr i
       adj <- MVS.read adjarr i
-      when kDEBUG $ hPutStrLn stderr $ "Apply (" ++ show (NID jid i) ++ ") [adj=" ++ show adj ++ "]: " ++ debugContrib cb
+      when kDEBUG $
+        liftIO $ hPutStrLn stderr $ "Apply (" ++ show (NID jid i) ++ ") [adj=" ++ show adj ++ "]: " ++ debugContrib cb
       apply cb adj
       resolveJob jid (i - 1) cbarr adjarr
 
@@ -385,9 +405,7 @@ dualpass finaljob (JobID numjobs) backprop adj = unsafePerformIO $ do
   -- hPutStrLn stderr $ "-- resolve --"
   evlog "dual bped"
   -- t3 <- getTime Monotonic
-  resmvar <- newEmptyMVar
-  _ <- submitJob globalThreadPool (resolve finaljob threads) (putMVar resmvar)
-  readMVar resmvar
+  resolve finaljob threads
   evlog "dual resolved"
   -- t4 <- getTime Monotonic
   adjarr0 <- snd <$> MV.read threads 0

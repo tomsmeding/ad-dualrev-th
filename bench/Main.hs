@@ -137,24 +137,26 @@ runParTest = do
   -- forM_ [10000, 20000 .. 100000] $ \iters -> do
   forM_ [70000] $ \iters -> do
     _ <- func iters input 0
-    (ptms, dtms) <- unzip <$> forM [1..1] (func iters input)
+    (tottms, ptms, dtms) <- unzip3 <$> forM [1..1] (func iters input)
     -- print (ptms, dtms)
-    putStrLn $ show iters ++ " " ++ show (average ptms) ++ " " ++ show (average dtms)
+    putStrLn $ show iters ++ " " ++ show (average tottms) ++ " " ++ show (average ptms) ++ " " ++ show (average dtms)
     hFlush stdout
   where
     {-# NOINLINE func #-}
-    func :: Int -> [((Double, Double), (Double, Double))] -> Int -> IO (Double, Double)
+    func :: Int -> [((Double, Double), (Double, Double))] -> Int -> IO (Double, Double, Double)
     func iters input _ = do
-      hPutStrLn stderr "=== func ==="
-      let (primal, dual) = fparticles_gen_ad iters input
-      (tm1, _) <- timed $ evaluate (primal :: Double)
-      (tm2, _) <- timed $ evaluate (force (dual 1.0))
-      return (tm1, tm2)
+      performGC
+      -- hPutStrLn stderr "=== func ==="
+      (tmtot, (tm1, tm2)) <- timed $ do
+        let (primal, dual) = fparticles_gen_ad iters input
+        (tm1, _) <- timed $ evaluate (primal :: Double)
+        (tm2, _) <- timed $ evaluate (force (dual 1.0))
+        return (tm1, tm2)
+      return (tmtot, tm1, tm2)
 
     {-# NOINLINE timed #-}
     timed :: IO a -> IO (Double, a)
     timed act = do
-      performGC
       evlog "bench start"
       t1 <- getTime Monotonic
       res <- act
