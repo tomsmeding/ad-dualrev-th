@@ -14,6 +14,7 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS -fno-cse -fno-full-laziness #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE Strict, StrictData #-}
 
 -- This warning is over-eager in TH quotes when the variables that the pattern
 -- binds are spliced instead of mentioned directly. See
@@ -32,7 +33,7 @@ module Language.Haskell.ReverseAD.TH (
   -- * Special methods
   (|*|),
 
-  evlog, traceEvlog,
+  evlog,
 ) where
 
 import Control.Concurrent
@@ -67,7 +68,7 @@ import Control.Monad.IO.Class
 -- import Debug.Trace
 import System.IO
 
-import qualified Control.Concurrent.ForkJoin as FJ
+import Control.Concurrent.ThreadPool
 import Data.Vector.Storable.Mutable.CAS
 import Language.Haskell.ReverseAD.TH.Orphans ()
 import Language.Haskell.ReverseAD.TH.Source as Source
@@ -151,14 +152,17 @@ x |*| y = x `par` y `par` (x, y)
 -- ------------------------------------------------------------
 
 -- | A helper function for fork-join parallelism, used in 'fwdmPar' and in
--- 'resolve'.
+-- 'resolve'. Requires that we're currently already executing inside a thread
+-- pool thread.
 runInParallel :: IO a -> IO b -> IO (a, b)
 runInParallel m1 m2 = do
-  cell1 <- submitJob globalThreadPool m1
-  cell2 <- submitJob globalThreadPool m2
-  x <- readMVar cell1
-  y <- readMVar cell2
-  return (x, y)
+  cell2 <- newEmptyMVar
+  -- TODO: we don't actually use the functionality of the out-of-worker-thread continuation; we can just remove that functionality from the thread pool.
+  ref2 <- submitJob globalThreadPool m2 (putMVar cell2)
+  res1 <- m1
+  tryStealJob ref2
+  res2 <- readMVar cell2
+  return (res1, res2)
 
 -- | The ID of a parallel job, >=0. The implicit main job has ID 0, parallel
 -- jobs start from 1.
@@ -167,12 +171,12 @@ newtype JobID = JobID Int
 
 data BeforeJob
   = Start  -- ^ Source of (this part of the) graph
-  | Fork JobDescr JobDescr JobDescr
+  | Fork !JobDescr !JobDescr !JobDescr
       -- ^ a b c: a forked into b and c, which joined into the current job
   deriving (Show)
 
 data JobDescr = JobDescr
-    BeforeJob
+    !BeforeJob
     {-# UNPACK #-} !JobID   -- ^ The ID of this job
     {-# UNPACK #-} !Int     -- ^ Number of IDs generated in this thread (i.e. last ID + 1)
   deriving (Show)
@@ -183,22 +187,25 @@ newtype FwdM a = FwdM
   -> IO (JobDescr, a))  -- the terminal job of this computation
 
 instance Functor FwdM where
-  fmap f (FwdM g) = FwdM $ \jr jd -> do
-    (jd1, !x) <- g jr jd
+  fmap f (FwdM g) = FwdM $ \jr !jd -> do
+    (!jd1, !x) <- g jr jd
     return (jd1, f x)
 
 instance Applicative FwdM where
-  pure x = FwdM (\_ jd -> return (jd, x))
-  FwdM f <*> FwdM g = FwdM $ \jr jd -> do
-    (jd1, !fun) <- f jr jd
-    (jd2, !x) <- g jr jd1
+  pure !x = FwdM (\_ !jd -> return (jd, x))
+  FwdM f <*> FwdM g = FwdM $ \jr !jd -> do
+    (!jd1, !fun) <- f jr jd
+    (!jd2, !x) <- g jr jd1
     return (jd2, fun x)
 
 instance Monad FwdM where
-  FwdM f >>= g = FwdM $ \jr jd -> do
-    (jd1, !x) <- f jr jd
+  FwdM f >>= g = FwdM $ \jr !jd -> do
+    (!jd1, !x) <- f jr jd
     let FwdM h = g x
     h jr jd1
+
+instance MonadIO FwdM where
+  liftIO m = FwdM $ \_ !jd -> m >>= \x -> return (jd, x)
 
 -- | 'pure' with a restricted type.
 mpure :: a -> FwdM a
@@ -216,7 +223,9 @@ runFwdM' mfwdtmref (FwdM f) = unsafePerformIO $ do
   evlog "fwdm start"
   tstart <- getTime Monotonic
   jiref <- newIORef (JobID 1)
-  (jd, y) <- f jiref (JobDescr Start (JobID 0) 0)
+  resvar <- newEmptyMVar
+  _ <- submitJob globalThreadPool (f jiref (JobDescr Start (JobID 0) 0)) (putMVar resvar)
+  (jd, y) <- readMVar resvar
   nextji <- readIORef jiref
   evlog "fwdm end"
   tend <- getTime Monotonic
@@ -227,16 +236,14 @@ runFwdM' mfwdtmref (FwdM f) = unsafePerformIO $ do
 -- 'a' and 'b' are computed in separate jobs, 'a' on the current thread and 'b'
 -- on a new thread.
 fwdmPar :: FwdM a -> FwdM b -> FwdM (a, b)
-fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr jd0 -> do
+fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr !jd0 -> do
   (ji1, ji2, ji3) <-
     atomicModifyIORef' jr (\(JobID j) -> (JobID (j + 3), (JobID j, JobID (j+1), JobID (j+2))))
+  debug "! Starting fork"
   ((jd1, x), (jd2, y)) <- runInParallel (f1 jr (JobDescr Start ji1 0))
                                         (f2 jr (JobDescr Start ji2 0))
+  debug "! Joined"
   return (JobDescr (Fork jd0 jd1 jd2) ji3 0, (x, y))
-
--- | Allow defeating laziness.
-fwdmEvaluate :: a -> FwdM a
-fwdmEvaluate x = FwdM $ \_ jd -> evaluate x >>= \x' -> return (jd, x')
 
 -- | The tag on a node in the Contrib graph. Consists of a job ID and the ID of
 -- the node within this thread.
@@ -264,11 +271,25 @@ fwdmGenIdInterleave = FwdM $ \_ (JobDescr prev ji@(JobID jiInt) i) ->
 type MaybeBuildState = MV.IOVector (Maybe (MV.IOVector Contrib, MVS.IOVector Double))
 type BuildState = MV.IOVector (MV.IOVector Contrib, MVS.IOVector Double)
 
-newtype Contrib = Contrib [(NID, Contrib, Double)]
+-- contrib edge: edge in the contribution graph
+data CEdge = CEdge {-# UNPACK #-} !NID
+                   !Contrib
+                   {-# UNPACK #-} !Double
+
+data Contrib
+  = C0
+  | C1 {-# UNPACK #-} !CEdge
+  | C2 {-# UNPACK #-} !CEdge {-# UNPACK #-} !CEdge
+  | C3 ![CEdge]
 
 debugContrib :: Contrib -> String
-debugContrib (Contrib l) = "Contrib [" ++ intercalate "," (map go l) ++ "]"
-  where go (nid, _, d) = "(" ++ show nid ++ ", <>, " ++ show d ++ ")"
+debugContrib C0 = "Contrib []"
+debugContrib (C1 e) = "Contrib [" ++ debugCEdge e ++ "]"
+debugContrib (C2 e1 e2) = "Contrib [" ++ debugCEdge e1 ++ "," ++ debugCEdge e2 ++ "]"
+debugContrib (C3 l) = "Contrib [" ++ intercalate "," (map debugCEdge l) ++ "]"
+
+debugCEdge :: CEdge -> String
+debugCEdge (CEdge nid _ d) = "(" ++ show nid ++ ", <>, " ++ show d ++ ")"
 
 -- TODO: This function is sequential in the total number of jobs started in the
 -- forward pass, which is technically not good: they were started in parallel,
@@ -283,7 +304,7 @@ allocBS topjobdescr threads = go topjobdescr
       MV.read threads ji >>= \case
         Just _ -> error $ "allocBS: already allocated? (" ++ show ji ++ ")"
         Nothing -> do
-          cbarr <- MV.replicate n (Contrib [])
+          cbarr <- MV.replicate n C0
           adjarr <- MVS.replicate n 0.0
           MV.write threads ji (Just (cbarr, adjarr))
       case prev of
@@ -320,10 +341,12 @@ resolve terminalJob threads = resolveTask terminalJob
       resolveJob jid (i - 1) cbarr adjarr
 
     apply :: Contrib -> Double -> IO ()
-    apply (Contrib []) _ = return ()
-    apply (Contrib ((nid, cb, d) : cbs)) a = do
-      addContrib nid cb (a * d) threads
-      apply (Contrib cbs) a
+    apply C0 _ = return ()
+    apply (C1 e) a = applyEdge a e
+    apply (C2 e1 e2) a = applyEdge a e1 >> applyEdge a e2
+    apply (C3 l) a = mapM_ (applyEdge a) l
+
+    applyEdge a (CEdge nid cb d) = addContrib nid cb (a * d) threads
 
 -- This is the function called from the backpropagator built by deinterleave,
 -- as well as from 'resolve'.
@@ -362,7 +385,9 @@ dualpass finaljob (JobID numjobs) backprop adj = unsafePerformIO $ do
   -- hPutStrLn stderr $ "-- resolve --"
   evlog "dual bped"
   -- t3 <- getTime Monotonic
-  resolve finaljob threads
+  resmvar <- newEmptyMVar
+  _ <- submitJob globalThreadPool (resolve finaljob threads) (putMVar resmvar)
+  readMVar resmvar
   evlog "dual resolved"
   -- t4 <- getTime Monotonic
   adjarr0 <- snd <$> MV.read threads 0
@@ -624,7 +649,10 @@ transform' mfwdtmref inpStruc outStruc pat expr = do
                 ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
                 $(varP outvar) <- $(ddr patbound expr)
                 ($(varP primal'var), $(varP dual'var)) <- mpure $(deinterleave outStruc (VarE outvar))
-                _ <- fwdmEvaluate $(varE primal'var)
+                liftIO $ debug "evaluate start"
+                _ <- return $! $(varE primal'var)
+                _ <- return $! $(varE dual'var)
+                liftIO $ debug "evaluate done"
                 mpure ($(varE rebuild'var), $(varE primal'var), $(varE dual'var))
         in ($(varE primalvar)
            ,\ $(varP adjvar) ->
@@ -634,6 +662,11 @@ transform' mfwdtmref inpStruc outStruc pat expr = do
 -- ----------------------------------------------------------------------
 -- The compositional code transformation
 -- ----------------------------------------------------------------------
+
+-- "Dual" number
+data DN = DN {-# UNPACK #-} !Double
+             {-# UNPACK #-} !NID
+             !Contrib
 
 -- Set of names bound in the program at this point
 type Env = Set Name
@@ -714,7 +747,7 @@ ddr env = \case
     RationalL _ -> do
       iname <- newName "i"
       [| do $(varP iname) <- fwdmGenId
-            mpure ($(litE lit), ($(varE iname), Contrib [])) |]
+            mpure (DN $(litE lit) $(varE iname) C0) |]
     FloatPrimL _ -> fail "float prim?"
     DoublePrimL _ -> fail "double prim?"
     IntegerL _ -> [| mpure $(litE lit) |]
@@ -878,7 +911,7 @@ ddrType = \ty ->
   where
     go :: Type -> Either Type Type
     go (ConT name)
-      | name == ''Double = Right (pairt (ConT ''Double) (pairt (ConT ''NID) (ConT ''Contrib)))
+      | name == ''Double = Right (ConT ''DN)
       | name == ''Int = Right (ConT ''Int)
     go (ArrowT `AppT` t1 `AppT` t) = do
       t1' <- go t1
@@ -893,9 +926,6 @@ ddrType = \ty ->
         (ConT name, args) ->  -- I hope this one is correct
           foldl AppT (ConT name) <$> traverse go args
         _ -> Left ty  -- don't know how to handle this type
-
-    pairt :: Type -> Type -> Type
-    pairt t1 t2 = TupleT 2 `AppT` t1 `AppT` t2
 
 
 -- ----------------------------------------------------------------------
@@ -984,7 +1014,7 @@ interleaveType helpernames = \case
     arrvar <- newName "arr"
     [| \ $(varP inpxvar) -> do
            $(varP ivar) <- fwdmGenIdInterleave
-           mpure (($(varE inpxvar), (NID (JobID 0) $(varE ivar), Contrib []))
+           mpure (DN $(varE inpxvar) (NID (JobID 0) $(varE ivar)) C0
                  ,\ $(varP arrvar) -> $(varE arrvar) VS.! $(varE ivar)) |]
 
   ConST tyname argtys ->
@@ -1073,7 +1103,7 @@ deinterleaveType helpernames = \case
     primalname <- newName "prim"
     idname <- newName "id"
     cbname <- newName "cb"
-    return $ LamE [TupP [VarP primalname, TupP [VarP idname, VarP cbname]]] $
+    return $ LamE [ConP 'DN [] [VarP primalname, VarP idname, VarP cbname]] $
       pair (VarE primalname)
            (VarE 'addContrib `AppE` VarE idname `AppE` VarE cbname)  -- partially-applied
 
@@ -1131,22 +1161,22 @@ class NumOperation a where
     -> FwdM (DualNum a)        -- output
 
 instance NumOperation Double where
-  type DualNum Double = (Double, (NID, Contrib))
-  applyBinaryOp (x, (xi, xcb)) (y, (yi, ycb)) primal grad = do
+  type DualNum Double = DN
+  applyBinaryOp (DN x xi xcb) (DN y yi ycb) primal grad = do
     let (dx, dy) = grad x y
     i <- fwdmGenId
-    pure (primal x y, (i, Contrib [(xi, xcb, dx), (yi, ycb, dy)]))
-  applyUnaryOp (x, (xi, xcb)) primal grad = do
+    pure (DN (primal x y) i (C2 (CEdge xi xcb dx) (CEdge yi ycb dy)))
+  applyUnaryOp (DN x xi xcb) primal grad = do
     i <- fwdmGenId
-    pure (primal x, (i, Contrib [(xi, xcb, grad x)]))
-  applyUnaryOp2 (x, (xi, xcb)) primal grad = do
+    pure (DN (primal x) i (C1 (CEdge xi xcb (grad x))))
+  applyUnaryOp2 (DN x xi xcb) primal grad = do
     i <- fwdmGenId
     let pr = primal x
-    pure (pr, (i, Contrib [(xi, xcb, grad x pr)]))
-  applyCmpOp (x, _) (y, _) f = f x y
+    pure (DN pr i (C1 (CEdge xi xcb (grad x pr))))
+  applyCmpOp (DN x _ _) (DN y _ _) f = f x y
   fromIntegralOp x = do
     i <- fwdmGenId
-    pure (fromIntegral x, (i, Contrib []))
+    pure (DN (fromIntegral x) i C0)
 
 instance NumOperation Int where
   type DualNum Int = Int
@@ -1242,11 +1272,11 @@ tvbName (KindedTV n _ _) = n
 mapUnionsWithKey :: (Foldable f, Ord k) => (k -> a -> a -> a) -> f (Map k a) -> Map k a
 mapUnionsWithKey f = foldr (Map.unionWithKey f) mempty
 
-{-# NOINLINE traceEvlog #-}
-traceEvlog :: String -> a -> a
-traceEvlog s x = unsafePerformIO $ evlog s >> return x
+kENABLE_EVLOG :: Bool
+kENABLE_EVLOG = False
 
 evlog :: String -> IO ()
+evlog _ | not kENABLE_EVLOG = return ()
 evlog s = do
   clk <- getTime Monotonic
   withMVar evlogfile $ \f -> do

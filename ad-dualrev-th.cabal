@@ -25,7 +25,7 @@ library
   exposed-modules:
     Language.Haskell.ReverseAD.TH
   other-modules:
-    Control.Concurrent.ForkJoin
+    -- Control.Concurrent.ForkJoin
     Control.Concurrent.ThreadPool
     Data.Vector.Storable.Mutable.CAS
     Language.Haskell.ReverseAD.TH.Orphans
@@ -33,7 +33,7 @@ library
     Language.Haskell.ReverseAD.TH.Translate
   hs-source-dirs:
     src
-  ghc-options: -Wall
+  ghc-options: -Wall -O2
   build-depends:
       base >=4.7 && <4.19
     , bytestring

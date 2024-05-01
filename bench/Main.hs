@@ -133,11 +133,11 @@ runParTest :: IO ()
 runParTest = do
   getNumCapabilities >>= \num -> hPutStrLn stderr ("Using " ++ show num ++ " threads")
   let input = [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]]
-  forM_ [250, 500 .. 5000] $ \iters -> do
+  -- forM_ [500, 1000 .. 10000] $ \iters -> do
   -- forM_ [10000, 20000 .. 100000] $ \iters -> do
-  -- forM_ [100000] $ \iters -> do
+  forM_ [70000] $ \iters -> do
     _ <- func iters input 0
-    (ptms, dtms) <- unzip <$> forM [1..10] (func iters input)
+    (ptms, dtms) <- unzip <$> forM [1..1] (func iters input)
     -- print (ptms, dtms)
     putStrLn $ show iters ++ " " ++ show (average ptms) ++ " " ++ show (average dtms)
     hFlush stdout
@@ -145,6 +145,7 @@ runParTest = do
     {-# NOINLINE func #-}
     func :: Int -> [((Double, Double), (Double, Double))] -> Int -> IO (Double, Double)
     func iters input _ = do
+      hPutStrLn stderr "=== func ==="
       let (primal, dual) = fparticles_gen_ad iters input
       (tm1, _) <- timed $ evaluate (primal :: Double)
       (tm2, _) <- timed $ evaluate (force (dual 1.0))
