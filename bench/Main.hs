@@ -24,10 +24,9 @@ import System.Environment (getArgs)
 import System.Exit (die, exitSuccess, exitFailure)
 import System.Mem (performGC)
 import System.IO
-import Data.IORef
 
 import DFunction
-import Language.Haskell.ReverseAD.TH ((|*|), evlog, reverseAD_tm)
+import Language.Haskell.ReverseAD.TH ((|*|), evlog, reverseAD)
 import Test.Approx
 import Test.Framework hiding (scale)
 import Types
@@ -104,8 +103,8 @@ fparticles :: DFunction FParticles Identity
 fparticles = fparticles_gen 1000
 
 {-# NOINLINE fparticles_gen_ad #-}
-fparticles_gen_ad :: Int -> IORef Double -> [((Double, Double), (Double, Double))] -> (Double, Double -> [((Double, Double), (Double, Double))])
-fparticles_gen_ad iters ref = $$(reverseAD_tm [|| ref ||]
+fparticles_gen_ad :: Int -> [((Double, Double), (Double, Double))] -> (Double, Double -> [((Double, Double), (Double, Double))])
+fparticles_gen_ad iters = $$(reverseAD
   [|| \l ->
         let parmap _ [] = []
             parmap f (x:xs) =
@@ -134,25 +133,24 @@ runParTest :: IO ()
 runParTest = do
   getNumCapabilities >>= \num -> hPutStrLn stderr ("Using " ++ show num ++ " threads")
   let input = [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]]
-  -- forM_ [250, 500 .. 10000] $ \iters -> do
-  fwdtmref <- newIORef (-1.0)
-  forM_ [10000] $ \iters -> do
-    _ <- func fwdtmref iters input 0
-    tms <- forM [1..10] (func fwdtmref iters input)
-    fwdtm <- readIORef fwdtmref
-    print tms
-    let tm = sum tms / fromIntegral (length tms)
-    putStrLn $ show iters ++ " " ++ show tm ++ " " ++ show fwdtm
+  forM_ [250, 500 .. 5000] $ \iters -> do
+  -- forM_ [10000, 20000 .. 100000] $ \iters -> do
+  -- forM_ [100000] $ \iters -> do
+    _ <- func iters input 0
+    (ptms, dtms) <- unzip <$> forM [1..10] (func iters input)
+    -- print (ptms, dtms)
+    putStrLn $ show iters ++ " " ++ show (average ptms) ++ " " ++ show (average dtms)
     hFlush stdout
   where
     {-# NOINLINE func #-}
-    func :: IORef Double -> Int -> [((Double, Double), (Double, Double))] -> Int -> IO Double
-    func fwdtmref iters input _ = fmap fst $ timed $ do
-      let (primal, dual) = fparticles_gen_ad iters fwdtmref input
-      _ <- evaluate (primal :: Double)
-      _ <- evaluate (force (dual 1.0))
-      return ()
+    func :: Int -> [((Double, Double), (Double, Double))] -> Int -> IO (Double, Double)
+    func iters input _ = do
+      let (primal, dual) = fparticles_gen_ad iters input
+      (tm1, _) <- timed $ evaluate (primal :: Double)
+      (tm2, _) <- timed $ evaluate (force (dual 1.0))
+      return (tm1, tm2)
 
+    {-# NOINLINE timed #-}
     timed :: IO a -> IO (Double, a)
     timed act = do
       performGC
@@ -162,6 +160,8 @@ runParTest = do
       evlog "bench end"
       t2 <- getTime Monotonic
       return (fromIntegral (toNanoSecs (diffTimeSpec t1 t2)) / 1e9, res)
+
+    average l = sum l / fromIntegral (length l)
 
 data Options = Options
   { argsHelp :: Bool
