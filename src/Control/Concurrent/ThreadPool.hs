@@ -1,9 +1,9 @@
-{-# LANGUAGE ForeignFunctionInterface #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 module Control.Concurrent.ThreadPool (
   -- * Pools
   Pool,
@@ -25,10 +25,10 @@ import Control.Exception
 import Control.Monad
 import Data.IORef
 import qualified Data.Vector as V
+import Numeric
 import System.Clock
 import System.IO
 import System.IO.Unsafe
-import Numeric
 
 
 foreign import ccall "setup_rts_gc_took_tom" c_setup_rts_gc_took_tom :: IO ()
