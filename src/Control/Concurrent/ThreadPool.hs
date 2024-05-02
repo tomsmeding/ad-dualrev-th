@@ -10,6 +10,7 @@ module Control.Concurrent.ThreadPool (
   mkPool,
   mkPoolN,
   globalThreadPool,
+  scalePool,
 
   -- * Running jobs
   submitJob,
@@ -44,7 +45,7 @@ tsdiff2float t = fromIntegral (toNanoSecs t) / 1e6 :: Double
 
 
 kENABLE_DEBUG :: Bool
-kENABLE_DEBUG = True
+kENABLE_DEBUG = False
 
 {-# NOINLINE epoch #-}
 epoch :: TimeSpec
@@ -66,9 +67,8 @@ debug s = do
 
 
 -- | A thread pool.
-data Pool = Pool (Chan Job) (V.Vector Worker) (IORef Int)
+data Pool = Pool (Chan Job) (MVar (V.Vector Worker)) (IORef Int)
 
--- I don't think the ThreadId is actually used.
 newtype Worker = Worker ThreadId
 
 data Job = forall a. Job !Int !(IORef (Maybe (JobPayload a)))
@@ -94,8 +94,9 @@ mkPoolN :: Int -> IO Pool
 mkPoolN n = do
   chan <- newChan
   workers <- forM [0 .. n-1] (startWorker chan)
+  listref <- newMVar (V.fromListN n workers)
   jidref <- newIORef 0
-  return (Pool chan (V.fromListN n workers) jidref)
+  return (Pool chan listref jidref)
 
 startWorker :: Chan Job -> Int -> IO Worker
 startWorker chan i = Worker <$> forkOn i loop
@@ -110,6 +111,18 @@ startWorker chan i = Worker <$> forkOn i loop
         debug $ "[" ++ show jobid ++ "] << popped job"
         runJobHere job
         loop
+
+-- | When the target size is smaller than the original size, this mercilessly
+-- and immediately kills some workers. If you have jobs running, they may well
+-- be cancelled.
+scalePool :: Pool -> Int -> IO ()
+scalePool (Pool chan listref _) target =
+  modifyMVar listref $ \workers -> do
+    -- either tokill == [] or news == []
+    let (remain, tokill) = splitAt target (V.toList workers)
+    forM_ tokill $ \(Worker tid) -> killThread tid
+    news <- forM [V.length workers .. target - 1] $ \i -> startWorker chan i
+    return (V.fromList (remain ++ news), ())
 
 runJobHere :: Job -> IO ()
 runJobHere (Job jobid ref) = do

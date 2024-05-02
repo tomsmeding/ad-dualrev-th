@@ -23,10 +23,10 @@ source-repository head
 
 library
   exposed-modules:
+    Control.Concurrent.ThreadPool
     Language.Haskell.ReverseAD.TH
   other-modules:
     -- Control.Concurrent.ForkJoin
-    Control.Concurrent.ThreadPool
     Data.Vector.Storable.Mutable.CAS
     Language.Haskell.ReverseAD.TH.Orphans
     Language.Haskell.ReverseAD.TH.Source

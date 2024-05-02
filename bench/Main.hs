@@ -25,6 +25,7 @@ import System.Exit (die, exitSuccess, exitFailure)
 import System.Mem (performGC)
 import System.IO
 
+import Control.Concurrent.ThreadPool
 import DFunction
 import Language.Haskell.ReverseAD.TH ((|*|), evlog, reverseAD)
 import Test.Approx
@@ -120,24 +121,26 @@ fparticles_gen_ad iters = $$(reverseAD
             step p v dt =
               let a = (1.0 / mass) .* (forceField p .+ friction v)
               in (p .+ (dt .* v), v .+ (dt .* a))
-            loop :: Int -> (Double, Double) -> (Double, Double) -> (Double, Double)
-            loop n p v =
+            -- isum :: Int -> Int -> Int
+            -- isum n k = if n == 0 then k else isum (n - 1) (k * k + k)
+            loop :: Int -> {- Int -> -} (Double, Double) -> (Double, Double) -> (Double, Double)
+            loop n {- k -} p v =
               if n == (0 :: Int) then p
                 else let (p', v') = step p v 0.05
-                     in loop (n-1) p' v'
+                     in loop (n-1) {- (isum 50 k) -} p' v'
             sum' [] = 0.0
             sum' ((x,y):xs) = x*y + sum' xs
-        in sum' (parmap (\(p, v) -> loop iters p v) l) ||])
+        in sum' (parmap (\(p, v) -> loop iters {- 0 -} p v) l) ||])
 
 runParTest :: IO ()
 runParTest = do
   getNumCapabilities >>= \num -> hPutStrLn stderr ("Using " ++ show num ++ " threads")
   let input = [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]]
-  -- forM_ [500, 1000 .. 10000] $ \iters -> do
+  forM_ [500, 1000 .. 10000] $ \iters -> do
   -- forM_ [10000, 20000 .. 100000] $ \iters -> do
-  forM_ [70000] $ \iters -> do
+  -- forM_ [70000] $ \iters -> do
     _ <- func iters input 0
-    (tottms, ptms, dtms) <- unzip3 <$> forM [1..1] (func iters input)
+    (tottms, ptms, dtms) <- unzip3 <$> forM [1..10] (func iters input)
     -- print (ptms, dtms)
     putStrLn $ show iters ++ " " ++ show (average tottms) ++ " " ++ show (average ptms) ++ " " ++ show (average dtms)
     hFlush stdout
@@ -266,6 +269,9 @@ envNumCapabilities n bm =
   envWithCleanup
     (do cur <- getNumCapabilities
         setNumCapabilities n
+        scalePool globalThreadPool n
         return cur)
-    (\prev -> setNumCapabilities prev)
+    (\prev -> do
+        setNumCapabilities prev
+        scalePool globalThreadPool prev)
     (\_ -> bm)
