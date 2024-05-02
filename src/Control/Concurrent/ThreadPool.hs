@@ -14,8 +14,6 @@ module Control.Concurrent.ThreadPool (
 
   -- * Running jobs
   submitJob,
-  JobRef,
-  tryStealJob,
   forkJoin,
 
   -- * Debug
@@ -71,11 +69,7 @@ data Pool = Pool (Chan Job) (MVar (V.Vector Worker)) (IORef Int)
 
 newtype Worker = Worker ThreadId
 
-data Job = forall a. Job !Int !(IORef (Maybe (JobPayload a)))
-
-data JobPayload a = JobPayload
-  (IO a)        -- the work that will be done on the worker thread
-  (a -> IO ())  -- consumer of the result, spawned in a simple forkIO (should be very cheap)
+data Job = Job !Int !(IO ())
 
 {-# NOINLINE globalThreadPool #-}
 -- | A statically allocated thread pool.
@@ -102,14 +96,17 @@ startWorker :: Chan Job -> Int -> IO Worker
 startWorker chan i = Worker <$> forkOn i loop
   where
     loop = do
-      debug $ "waiting"
+      debug "waiting"
       -- When the pool is dropped, the channels are also dropped, and this
       -- readChan will block indefinitely, raising the exception, which makes
       -- the worker exit and all is good.
       mjob <- catch (Just <$> readChan chan) $ \(_ :: BlockedIndefinitelyOnMVar) -> return Nothing
-      forM_ @Maybe mjob $ \ job@(Job jobid _) -> do
+      forM_ @Maybe mjob $ \(Job jobid work) -> do
         debug $ "[" ++ show jobid ++ "] << popped job"
-        runJobHere job
+        t1 <- getTime Monotonic
+        work
+        t2 <- getTime Monotonic
+        debug $ "[" ++ show jobid ++ "] job took " ++ show (tsdiff2float (diffTimeSpec t1 t2)) ++ " ms"
         loop
 
 -- | When the target size is smaller than the original size, this mercilessly
@@ -124,49 +121,15 @@ scalePool (Pool chan listref _) target =
     news <- forM [V.length workers .. target - 1] $ \i -> startWorker chan i
     return (V.fromList (remain ++ news), ())
 
-runJobHere :: Job -> IO ()
-runJobHere (Job jobid ref) = do
-  mpair <- atomicModifyIORef' ref (\case Nothing -> (Nothing, Nothing)
-                                         Just x  -> (Nothing, Just x))
-  case mpair of
-    Nothing -> do
-      debug $ "[" ++ show jobid ++ "] (got stolen job)"
-    Just (JobPayload work cont) -> do  -- only do work if it hasn't been stolen yet
-      t1 <- getTime Monotonic
-      debug $ "[" ++ show jobid ++ "] accepted"
-      res <- work
-      t2 <- getTime Monotonic
-      debug $ "[" ++ show jobid ++ "] job took " ++ show (tsdiff2float (diffTimeSpec t1 t2)) ++ " ms"
-      _ <- forkIO $ do
-        me <- myThreadId
-        debug $ "[" ++ show jobid ++ "] running cont -> " ++ show me
-        cont res
-      return ()
-
--- | A reference to a job so that it can be stolen.
-data JobRef a = JobRef !Int (IORef (Maybe (JobPayload a)))
-
--- | Submit a job to a thread pool. The second argument (@work@) is the work to
--- be done on the worker thread; the third argument (@cont@) is a handler for
--- the result that runs /outside/ of the worker thread. This can make it easier
--- to prevent deadlocks due to submitting jobs from within a worker job.
-submitJob :: Pool -> IO a -> (a -> IO ()) -> IO (JobRef a)
-submitJob (Pool chan _ jidref) work cont = do
+-- | Submit a job to a thread pool.
+submitJob :: Pool -> IO () -> IO ()
+submitJob (Pool chan _ jidref) work = do
   jobid <- atomicModifyIORef' jidref (\i -> (i + 1, i))
   debug $ "[" ++ show jobid ++ "] >> submitJob"
-  ref <- newIORef (Just (JobPayload work cont))
-  writeChan chan (Job jobid ref)
-  return (JobRef jobid ref)
+  writeChan chan (Job jobid work)
 
--- | If the job has not started executing on a worker thread yet, run it here
--- in this thread. The claiming of the job is atomic, so the job will be run
--- only once in total. Furthermore this function is idempotent: running it
--- multiple times simply does nothing when the job was already stolen.
-tryStealJob :: JobRef a -> IO ()
-tryStealJob (JobRef jobid ref) = do
-  debug $ "[" ++ show jobid ++ "] trying to steal job:"
-  runJobHere (Job jobid ref)
-
+-- | Submit two jobs to the thread pool. The continuation (@a -> b -> IO ()@)
+-- will be run on a new thread spawned with 'forkIO' outside of the threadpool.
 forkJoin :: Pool -> IO a -> IO b -> (a -> b -> IO ()) -> IO ()
 forkJoin pool m1 m2 mk = do
   cell1 <- newEmptyMVar
@@ -181,6 +144,5 @@ forkJoin pool m1 m2 mk = do
             Nothing -> return ()  -- we saw each others' values, other was first
             Just cont -> f cont x y
 
-  _ <- submitJob pool m1 (finish cell1 cell2 id)
-  _ <- submitJob pool m2 (finish cell2 cell1 flip)
-  return ()
+  submitJob pool (m1 >>= \x -> forkIO (finish cell1 cell2 id x) >> return ())
+  submitJob pool (m2 >>= \y -> forkIO (finish cell2 cell1 flip y) >> return ())

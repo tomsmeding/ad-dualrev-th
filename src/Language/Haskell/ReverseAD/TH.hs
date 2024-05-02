@@ -231,7 +231,7 @@ fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr !jd0 k -> do
       (jd1, x) <- takeMVar cell1
       (jd2, y) <- takeMVar cell2
       debug "! Joined"
-      _ <- submitJob globalThreadPool (k (JobDescr (Fork jd0 jd1 jd2) ji3 0) (x, y)) return
+      submitJob globalThreadPool (k (JobDescr (Fork jd0 jd1 jd2) ji3 0) (x, y))
       return ())
 
 -- | The tag on a node in the Contrib graph. Consists of a job ID and the ID of
@@ -325,7 +325,7 @@ resolve terminalJob threads = do
             (resolveTask jd1 (putMVar cell1 ()))
             (resolveTask jd2 (putMVar cell2 ()))
             (\_ _ -> do takeMVar cell1 >> takeMVar cell2
-                        _ <- submitJob globalThreadPool (resolveTask jd0 k) return
+                        submitJob globalThreadPool (resolveTask jd0 k)
                         return ())
 
     resolveJob :: JobID -> Int -> MV.IOVector Contrib -> MVS.IOVector Double -> IO ()
