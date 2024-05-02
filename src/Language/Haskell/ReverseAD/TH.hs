@@ -33,6 +33,7 @@ module Language.Haskell.ReverseAD.TH (
   -- * Special methods
   (|*|),
 
+  -- * Debug
   evlog,
 ) where
 
@@ -877,7 +878,6 @@ ddrPat = \case
   p@UnboxedSumP{} -> notSupported "Unboxed sums" (Just (show p))
   p@(ConP name tyapps args)
     | not (null tyapps) -> notSupported "Type applications in patterns" (Just (show p))
-    -- | name `elem` ['(:), '[]] -> mapM_ ddrPat args  -- TODO unnecessary special cases?
     | otherwise -> do
         -- ignore the field types; just validity is good enough, assuming that the user's code was okay
         _ <- checkDatacon name
