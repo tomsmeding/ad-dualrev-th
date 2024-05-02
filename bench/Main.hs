@@ -253,15 +253,17 @@ main = do
       [bench "TH" (nf (radWithTH frotvecquat) input)
       ,bench "ad" (nf (radWithAD frotvecquat) input)]
     ,bgroup "fparticles" $
-      let input = FParticles [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]] in
+      let input = FParticles [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]]
+          run f n = evaluate (force (f (fparticles_gen (fromIntegral n)) input)) >> return ()
+      in
       [bgroup "TH"
-        [envNumCapabilities 1 $ bench "N1" (nf (radWithTH fparticles) input)
-        ,envNumCapabilities 2 $ bench "N2" (nf (radWithTH fparticles) input)
-        ,envNumCapabilities 4 $ bench "N4" (nf (radWithTH fparticles) input)]
+        [envNumCapabilities 1 $ bench "N1" (toBenchmarkable (run radWithTH))
+        ,envNumCapabilities 2 $ bench "N2" (toBenchmarkable (run radWithTH))
+        ,envNumCapabilities 4 $ bench "N4" (toBenchmarkable (run radWithTH))]
       ,bgroup "ad"
-        [envNumCapabilities 1 $ bench "N1" (nf (radWithAD fparticles) input)
-        ,envNumCapabilities 2 $ bench "N2" (nf (radWithAD fparticles) input)
-        ,envNumCapabilities 4 $ bench "N4" (nf (radWithAD fparticles) input)]
+        [envNumCapabilities 1 $ bench "N1" (toBenchmarkable (run radWithAD))
+        ,envNumCapabilities 2 $ bench "N2" (toBenchmarkable (run radWithAD))
+        ,envNumCapabilities 4 $ bench "N4" (toBenchmarkable (run radWithAD))]
       ]
     ]
   where
