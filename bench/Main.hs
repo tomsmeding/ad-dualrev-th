@@ -174,6 +174,7 @@ data Options = Options
   , argsOutput :: Maybe FilePath
   , argsCsv :: Maybe FilePath
   , argsNoTest :: Bool
+  , argsNoBench :: Bool
   , argsPatternsRev :: [String]
   , argsParTest :: Bool }
   deriving (Show)
@@ -184,6 +185,7 @@ parseArgs ("-h" : _) a = return $ a { argsHelp = True }
 parseArgs ("--help" : _) a = return $ a { argsHelp = True }
 parseArgs ("-o" : path : ss) a = parseArgs ss (a { argsOutput = Just path })
 parseArgs ("--notest" : ss) a = parseArgs ss (a { argsNoTest = True })
+parseArgs ("--nobench" : ss) a = parseArgs ss (a { argsNoBench = True })
 parseArgs ("--csv" : path : ss) a = parseArgs ss (a { argsCsv = Just path })
 parseArgs ("--partest" : ss) a = parseArgs ss (a { argsParTest = True })
 parseArgs ("" : _) _ = Left "Unexpected empty argument"
@@ -193,7 +195,7 @@ parseArgs (s : _) _ = Left ("Unrecognised argument '" ++ s ++ "'")
 
 main :: IO ()
 main = do
-  options <- getArgs >>= \args -> case parseArgs args (Options False Nothing Nothing False [] False) of
+  options <- getArgs >>= \args -> case parseArgs args (Options False Nothing Nothing False False [] False) of
                Left err -> die err
                Right opts -> return opts
 
@@ -219,6 +221,9 @@ main = do
            property "fparticles" (\x -> radWithTH fparticles x ~= radWithAD fparticles x)]
 
     when (not checksOK) exitFailure
+
+  when (argsNoBench options) $
+    exitSuccess
 
   let crconfig = Criterion.defaultConfig { reportFile = argsOutput options
                                          , csvFile = argsCsv options }
