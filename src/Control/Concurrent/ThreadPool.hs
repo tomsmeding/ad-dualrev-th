@@ -14,7 +14,6 @@ module Control.Concurrent.ThreadPool (
 
   -- * Running jobs
   submitJob,
-  forkJoin,
 
   -- * Debug
   debug,
@@ -127,22 +126,3 @@ submitJob (Pool chan _ jidref) work = do
   jobid <- atomicModifyIORef' jidref (\i -> (i + 1, i))
   debug $ "[" ++ show jobid ++ "] >> submitJob"
   writeChan chan (Job jobid work)
-
--- | Submit two jobs to the thread pool. The continuation (@a -> b -> IO ()@)
--- will be run on a new thread spawned with 'forkIO' outside of the threadpool.
-forkJoin :: Pool -> IO a -> IO b -> (a -> b -> IO ()) -> IO ()
-forkJoin pool m1 m2 mk = do
-  cell1 <- newEmptyMVar
-  cell2 <- newEmptyMVar
-  contcell <- newMVar mk
-
-  let finish mycell othercell f x = do
-        putMVar mycell x
-        tryReadMVar othercell >>= \case
-          Nothing -> return ()  -- other is not yet done, other will see our value
-          Just y -> tryTakeMVar contcell >>= \case
-            Nothing -> return ()  -- we saw each others' values, other was first
-            Just cont -> f cont x y
-
-  submitJob pool (m1 >>= \x -> forkIO (finish cell1 cell2 id x) >> return ())
-  submitJob pool (m2 >>= \y -> forkIO (finish cell2 cell1 flip y) >> return ())

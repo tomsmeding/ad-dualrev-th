@@ -224,15 +224,16 @@ fwdmPar (FwdM f1) (FwdM f2) = FwdM $ \jr !jd0 k -> do
   debug "! Starting fork"
   cell1 <- newEmptyMVar
   cell2 <- newEmptyMVar
-  forkJoin globalThreadPool
-    (f1 jr (JobDescr Start ji1 0) (\jd1 x -> debug "! join left" >> putMVar cell1 (jd1, x)))
-    (f2 jr (JobDescr Start ji2 0) (\jd2 y -> debug "! join right" >> putMVar cell2 (jd2, y)))
-    (\() () -> do
-      (jd1, x) <- takeMVar cell1
-      (jd2, y) <- takeMVar cell2
-      debug "! Joined"
-      submitJob globalThreadPool (k (JobDescr (Fork jd0 jd1 jd2) ji3 0) (x, y))
-      return ())
+  submitJob globalThreadPool (f1 jr (JobDescr Start ji1 0)
+                                 (\jd1 x -> debug "! join left" >> putMVar cell1 (jd1, x)))
+  submitJob globalThreadPool (f2 jr (JobDescr Start ji2 0)
+                                 (\jd2 y -> debug "! join right" >> putMVar cell2 (jd2, y)))
+  _ <- forkIO $ do
+    (jd1, x) <- takeMVar cell1
+    (jd2, y) <- takeMVar cell2
+    debug "! Joined"
+    submitJob globalThreadPool (k (JobDescr (Fork jd0 jd1 jd2) ji3 0) (x, y))
+  return ()
 
 -- | The tag on a node in the Contrib graph. Consists of a job ID and the ID of
 -- the node within this thread.
@@ -321,12 +322,13 @@ resolve terminalJob threads = do
           when kDEBUG $ hPutStrLn stderr $ "Forking jobs (" ++ show (jidOf jd1) ++ ") and (" ++ show (jidOf jd2) ++ "); parent (" ++ show (jidOf jd0) ++ ")"
           cell1 <- newEmptyMVar
           cell2 <- newEmptyMVar
-          forkJoin globalThreadPool
-            (resolveTask jd1 (putMVar cell1 ()))
-            (resolveTask jd2 (putMVar cell2 ()))
-            (\_ _ -> do takeMVar cell1 >> takeMVar cell2
-                        submitJob globalThreadPool (resolveTask jd0 k)
-                        return ())
+          submitJob globalThreadPool (resolveTask jd1 (putMVar cell1 ()))
+          submitJob globalThreadPool (resolveTask jd2 (putMVar cell2 ()))
+          _ <- forkIO $ do
+            takeMVar cell1
+            takeMVar cell2
+            submitJob globalThreadPool (resolveTask jd0 k)
+          return ()
 
     resolveJob :: JobID -> Int -> MV.IOVector Contrib -> MVS.IOVector Double -> IO ()
     resolveJob _ (-1) _ _ = return ()
