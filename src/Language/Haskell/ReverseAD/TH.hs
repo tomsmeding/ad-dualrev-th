@@ -25,7 +25,6 @@
 module Language.Haskell.ReverseAD.TH (
   -- * Reverse AD
   reverseAD,
-  reverseAD_tm,
   reverseAD',
   -- * Structure descriptions
   Structure,
@@ -38,7 +37,7 @@ module Language.Haskell.ReverseAD.TH (
 ) where
 
 import Control.Concurrent
-import Control.Monad (when, forM_)
+import Control.Monad (when)
 import Control.Parallel (par)
 import Data.Bifunctor (first, second)
 import Data.Char (isAlphaNum)
@@ -206,10 +205,9 @@ mpure = pure
 -- - the terminal job, i.e. the job with which the computation ended
 -- - the maximal job ID generated plus 1
 {-# NOINLINE runFwdM' #-}
-runFwdM' :: Maybe (IORef Double) -> FwdM a -> (JobDescr, JobID, a)
-runFwdM' mfwdtmref (FwdM f) = unsafePerformIO $ do
+runFwdM' :: FwdM a -> (JobDescr, JobID, a)
+runFwdM' (FwdM f) = unsafePerformIO $ do
   evlog "fwdm start"
-  tstart <- getTime Monotonic
   jiref <- newIORef (JobID 1)
   resvar <- newEmptyMVar
   _ <- submitJob globalThreadPool (f jiref (JobDescr Start (JobID 0) 0) (curry (putMVar resvar))) return
@@ -217,9 +215,6 @@ runFwdM' mfwdtmref (FwdM f) = unsafePerformIO $ do
   (jd, y) <- takeMVar resvar
   nextji <- readIORef jiref
   evlog "fwdm end"
-  tend <- getTime Monotonic
-  forM_ mfwdtmref $ \ref -> writeIORef ref (fromIntegral (toNanoSecs (diffTimeSpec tstart tend)) / 1e9)
-  -- hPutStrLn stderr $ "fwdm: " ++ show (fromIntegral (toNanoSecs (diffTimeSpec tstart tend)) / 1e6 :: Double) ++ "ms"
   return (jd, nextji, y)
 
 -- 'a' and 'b' are computed in new, separate jobs.
@@ -601,37 +596,30 @@ exploreRecursiveType tau = do
 reverseAD :: forall a b. (Typeable a, Typeable b)
           => Code Q (a -> b)
           -> Code Q (a -> (b, b -> a))
-reverseAD = reverseAD' Nothing (structureFromTypeable (Proxy @a)) (structureFromTypeable (Proxy @b))
-
-reverseAD_tm :: forall a b. (Typeable a, Typeable b)
-             => Code Q (IORef Double)
-             -> Code Q (a -> b)
-             -> Code Q (a -> (b, b -> a))
-reverseAD_tm fwdtmref = reverseAD' (Just fwdtmref) (structureFromTypeable (Proxy @a)) (structureFromTypeable (Proxy @b))
+reverseAD = reverseAD' (structureFromTypeable (Proxy @a)) (structureFromTypeable (Proxy @b))
 
 -- | Same as 'reverseAD', but with user-supplied 'Structure's.
 reverseAD' :: forall a b.
-              Maybe (Code Q (IORef Double))
-           -> Q Structure  -- ^ Structure of @a@
+              Q Structure  -- ^ Structure of @a@
            -> Q Structure  -- ^ Structure of @b@
            -> Code Q (a -> b)
            -> Code Q (a -> (b, b -> a))
-reverseAD' mfwdtmref inpStruc outStruc (unTypeCode -> inputCode) =
+reverseAD' inpStruc outStruc (unTypeCode -> inputCode) =
   unsafeCodeCoerce $ do
     inpStruc' <- inpStruc
     outStruc' <- outStruc
     ex <- inputCode
-    transform mfwdtmref inpStruc' outStruc' ex
+    transform inpStruc' outStruc' ex
 
-transform :: Maybe (Code Q (IORef Double)) -> Structure -> Structure -> TH.Exp -> Q TH.Exp
-transform mfwdtmref inpStruc outStruc expr = do
+transform :: Structure -> Structure -> TH.Exp -> Q TH.Exp
+transform inpStruc outStruc expr = do
   expr' <- translate expr
   case expr' of
-    ELam pat body -> transform' mfwdtmref inpStruc outStruc pat body
+    ELam pat body -> transform' inpStruc outStruc pat body
     _ -> fail $ "Top-level expression in reverseAD must be lambda, but is: " ++ show expr'
 
-transform' :: Maybe (Code Q (IORef Double)) -> Structure -> Structure -> Pat -> Source.Exp -> Q TH.Exp
-transform' mfwdtmref inpStruc outStruc pat expr = do
+transform' :: Structure -> Structure -> Pat -> Source.Exp -> Q TH.Exp
+transform' inpStruc outStruc pat expr = do
   _ <- liftIO $ evaluate (force inpStruc)
   _ <- liftIO $ evaluate (force outStruc)
   patbound <- boundVars pat
@@ -648,7 +636,7 @@ transform' mfwdtmref inpStruc outStruc pat expr = do
   adjvar <- newName "adjoint"
   [| \ $(varP argvar) ->
         let ($(varP outjdvar), $(varP outnextjivar), ($(varP rebuildvar), $(varP primalvar), $(varP dualvar))) =
-              runFwdM' $(maybe [| Nothing |] (\c -> [| Just $(unTypeCode c) |]) mfwdtmref) $ do
+              runFwdM' $ do
                 ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
                 $(varP outvar) <- $(ddr patbound expr)
                 ($(varP primal'var), $(varP dual'var)) <- mpure $(deinterleave outStruc (VarE outvar))
