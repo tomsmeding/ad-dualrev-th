@@ -152,23 +152,6 @@ x |*| y = x `par` y `par` (x, y)
 -- The monad for the target program
 -- ------------------------------------------------------------
 
--- | A helper function for fork-join parallelism, used in 'fwdmPar' and in
--- 'resolve'. Requires that we're currently already executing inside a thread
--- pool thread.
-{-
-runInParallel :: IO a -> IO b -> IO (a, b)
-runInParallel m1 m2 = do
-  cell2 <- newEmptyMVar
-  -- TODO: we don't actually use the functionality of the out-of-worker-thread continuation; we can just remove that functionality from the thread pool.
-  ref2 <- submitJob globalThreadPool m2 (putMVar cell2)
-  res1 <- m1
-  tryStealJob ref2
-  res2 <- readMVar cell2
-  return (res1, res2)
--}
--- runInParallel :: IO a -> IO b -> IO (a, b)
--- runInParallel m1 m2 = concurrently m1 m2
-
 -- | The ID of a parallel job, >=0. The implicit main job has ID 0, parallel
 -- jobs start from 1.
 newtype JobID = JobID Int
@@ -230,6 +213,7 @@ runFwdM' mfwdtmref (FwdM f) = unsafePerformIO $ do
   jiref <- newIORef (JobID 1)
   resvar <- newEmptyMVar
   _ <- submitJob globalThreadPool (f jiref (JobDescr Start (JobID 0) 0) (curry (putMVar resvar))) return
+  -- f jiref (JobDescr Start (JobID 0) 0) (curry (putMVar resvar))
   (jd, y) <- takeMVar resvar
   nextji <- readIORef jiref
   evlog "fwdm end"
@@ -330,6 +314,7 @@ resolve terminalJob threads = do
   cell <- newEmptyMVar
   _ <- submitJob globalThreadPool (resolveTask terminalJob (putMVar cell ())) return
   takeMVar cell
+  -- resolveTask terminalJob (return ())
   where
     resolveTask :: JobDescr -> IO () -> IO ()
     resolveTask (JobDescr prev ji i) k = do
