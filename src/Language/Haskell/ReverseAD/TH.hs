@@ -210,8 +210,7 @@ runFwdM' (FwdM f) = unsafePerformIO $ do
   evlog "fwdm start"
   jiref <- newIORef (JobID 1)
   resvar <- newEmptyMVar
-  _ <- submitJob globalThreadPool (f jiref (JobDescr Start (JobID 0) 0) (curry (putMVar resvar))) return
-  -- f jiref (JobDescr Start (JobID 0) 0) (curry (putMVar resvar))
+  f jiref (JobDescr Start (JobID 0) 0) (curry (putMVar resvar))
   (jd, y) <- takeMVar resvar
   nextji <- readIORef jiref
   evlog "fwdm end"
@@ -307,9 +306,8 @@ allocBS topjobdescr threads = go topjobdescr
 resolve :: JobDescr -> BuildState -> IO ()
 resolve terminalJob threads = do
   cell <- newEmptyMVar
-  _ <- submitJob globalThreadPool (resolveTask terminalJob (putMVar cell ())) return
+  resolveTask terminalJob (putMVar cell ())
   takeMVar cell
-  -- resolveTask terminalJob (return ())
   where
     resolveTask :: JobDescr -> IO () -> IO ()
     resolveTask (JobDescr prev ji i) k = do
