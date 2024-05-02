@@ -83,7 +83,11 @@ kDEBUG = False
 
 -- === The program transformation ===
 --
--- Dt[Double] = (Double, (Int, Contrib))
+-- type DN = (Double, NID, Contrib)
+-- type NID = (JobID, Int)
+-- data Contrib = Contrib [(NID, Contrib, Double)]
+--
+-- Dt[Double] = DN
 -- Dt[()] = ()
 -- Dt[(a, b)] = (Dt[a], Dt[b])
 -- Dt[a -> b] = Dt[a] -> FwdM Dt[b]
@@ -94,13 +98,14 @@ kDEBUG = False
 -- Dt[Γ, x : a] = Dt[Γ], x : Dt[a]
 --
 -- FwdM is a monad with:
---   gen :: FwdM Int
+--   gen :: FwdM NID
+--   par :: FwdM a -> FwdM b -> FwdM (a, b)
 --
 -- Γ |- t : a
 -- ~> Dt[Γ] |- D[t] : FwdM Dt[a]
--- D[r] = do i <- gen; pure (r, (i, Contrib []))
+-- D[r] = do i <- gen; pure (r, i, Contrib [])
 -- D[x] = pure x
--- D[()] = ((), i)
+-- D[()] = pure ()
 -- D[(s, t)] = do x <- D[s]
 --                y <- D[t]
 --                pure (x, y)
@@ -121,13 +126,12 @@ kDEBUG = False
 -- D[let x = s in t] = do x <- D[s]
 --                        D[t]
 -- D[op t1..tn] =
---   do (x1, (i1, cb1)) = D[t1]
---      (x2, (i2, cb2)) = D[t1]
+--   do (x1, i1, cb1) = D[t1]
+--      (x2, i2, cb2) = D[t1]
 --      ...
---      (xn, (in, cbn)) = D[tn]
+--      (xn, in, cbn) = D[tn]
 --      i <- gen
---      pure (op x1..xn
---           ,(i, Contrib [(i1, cb1, dop_1 x1..xn), ..., (in, cbn, dop_n x1..xn)]))
+--      pure (op x1..xn, i, Contrib [(i1, cb1, dop_1 x1..xn), ..., (in, cbn, dop_n x1..xn)])
 
 
 -- ----------------------------------------------------------------------
@@ -198,15 +202,12 @@ instance MonadIO FwdM where
 mpure :: a -> FwdM a
 mpure = pure
 
--- runFwdM :: FwdM a -> (JobDescr, JobID, a)
--- runFwdM = runFwdM' Nothing
-
 -- Returns:
 -- - the terminal job, i.e. the job with which the computation ended
 -- - the maximal job ID generated plus 1
-{-# NOINLINE runFwdM' #-}
-runFwdM' :: FwdM a -> (JobDescr, JobID, a)
-runFwdM' (FwdM f) = unsafePerformIO $ do
+{-# NOINLINE runFwdM #-}
+runFwdM :: FwdM a -> (JobDescr, JobID, a)
+runFwdM (FwdM f) = unsafePerformIO $ do
   evlog "fwdm start"
   jiref <- newIORef (JobID 1)
   resvar <- newEmptyMVar
@@ -636,14 +637,14 @@ transform' inpStruc outStruc pat expr = do
   adjvar <- newName "adjoint"
   [| \ $(varP argvar) ->
         let ($(varP outjdvar), $(varP outnextjivar), ($(varP rebuildvar), $(varP primalvar), $(varP dualvar))) =
-              runFwdM' $ do
+              runFwdM $ do
                 ($(pure pat), $(varP rebuild'var)) <- $(interleave inpStruc (VarE argvar))
                 $(varP outvar) <- $(ddr patbound expr)
                 ($(varP primal'var), $(varP dual'var)) <- mpure $(deinterleave outStruc (VarE outvar))
-                liftIO $ debug "evaluate start"
-                _ <- return $! $(varE primal'var)
-                _ <- return $! $(varE dual'var)
-                liftIO $ debug "evaluate done"
+                -- liftIO $ debug "evaluate start"
+                -- _ <- return $! $(varE primal'var)
+                -- _ <- return $! $(varE dual'var)
+                -- liftIO $ debug "evaluate done"
                 mpure ($(varE rebuild'var), $(varE primal'var), $(varE dual'var))
         in ($(varE primalvar)
            ,\ $(varP adjvar) ->
@@ -662,8 +663,8 @@ data DN = DN {-# UNPACK #-} !Double
 -- Set of names bound in the program at this point
 type Env = Set Name
 
--- Γ |- t : a                        -- expression
--- ~> Dt[Γ] |- D[i, t] : FwdM Dt[a]  -- result
+-- Γ |- t : a                     -- expression
+-- ~> Dt[Γ] |- D[t] : FwdM Dt[a]  -- result
 ddr :: Env -> Source.Exp -> Q TH.Exp
 ddr env = \case
   EVar name
