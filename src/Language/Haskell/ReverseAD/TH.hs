@@ -171,10 +171,15 @@ data JobDescr = JobDescr
     {-# UNPACK #-} !Int     -- ^ Number of IDs generated in this thread (i.e. last ID + 1)
   deriving (Show)
 
+-- | Isomorphic to: @ReaderT (IORef JobID) (StateT JobDescr (ContT () IO)) a@
+--
+-- The 'IORef' contains the next job ID to generate. The input 'JobDescr' is
+-- the task so far; the output 'JobDescr' describes the terminal job of this
+-- task (including its history).
 newtype FwdM a = FwdM
-    (IORef JobID  -- the next job ID to generate
-  -> JobDescr  -- job so far
-  -> (JobDescr -> a -> IO ()) -> IO ())  -- the terminal job of this computation
+    (IORef JobID
+  -> JobDescr
+  -> (JobDescr -> a -> IO ()) -> IO ())
 
 instance Functor FwdM where
   fmap f (FwdM g) = FwdM $ \jr !jd k ->
