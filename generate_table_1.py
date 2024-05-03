@@ -13,10 +13,10 @@ def uniq(it):
         seen.add(x)
     return res
 
-def run_benchmarks():
+def run_benchmarks(args):
     with tempfile.TemporaryDirectory() as workdir:
         print("Running benchmarks; this will take about a minute or two, depending on machine speed and load.", file=sys.stderr)
-        subprocess.check_call(["cabal", "run", "bench", "--", "--csv", workdir + "/out.csv"])
+        subprocess.check_call(["cabal", "run", "bench", "--", "--csv", workdir + "/out.csv"] + args)
         with open(workdir + "/out.csv") as f:
             return f.read()
 
@@ -30,6 +30,9 @@ def human_bench_name(name):
     if name == "fdotprod": return "dot product"
     if name == "fsummatvec": return "sum-mat-vec"
     if name == "frotvecquat": return "rotate_vec_by_quat"
+    if name == "fparticles/N1": return "particles (-N1)"
+    if name == "fparticles/N2": return "particles (-N2)"
+    if name == "fparticles/N4": return "particles (-N4)"
     return name
 
 Result = namedtuple("Result", ["name", "impl", "mean", "halfci"])
@@ -67,7 +70,9 @@ def print_table(table):
         print()
 
 def main():
-    csv = run_benchmarks()
+    args = sys.argv[1:]
+
+    csv = run_benchmarks(args)
     data = [line.split(",") for line in csv.split("\n") if len(line) > 0]
     results = [parse_result(row) for row in data[1:]]
 
