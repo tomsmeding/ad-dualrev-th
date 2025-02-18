@@ -103,6 +103,32 @@ fparticles_gen iters = $$(makeFunction
 fparticles :: DFunction FParticles Identity
 fparticles = fparticles_gen 1000
 
+fneural :: DFunction FNeural Identity
+fneural = $$(makeFunction
+  [|| \(FNeural (layers, Vector input)) ->
+        let zipWith' f (x:xs) (y:ys) = f x y : zipWith' f xs ys
+            zipWith' _ _ _ = []
+            sum' [] = 0.0
+            sum' (x:xs) = x + sum' xs
+            dotp v1 v2 = sum' (zipWith' (*) v1 v2)
+            map' _ [] = []
+            map' f (x:xs) = f x : map' f xs
+            maximum' acc [] = acc
+            maximum' acc (x:xs) = maximum' (if x > acc then x else acc) xs
+
+            mat @. vec = map' (\row -> dotp row vec) mat
+            (+.) = zipWith' (+)
+
+            relu x = if x >= 0.0 then x else 0.0
+            safeSoftmax vec = let m = maximum' 0.0 vec
+                                  factor = sum' (map' (\z -> exp (z - m)) vec)
+                              in map' (\z -> exp (z - m) / factor) vec
+            forward [] x = safeSoftmax x
+            forward ((Matrix weights, Vector bias) : lys) x =
+              let x' = map' relu ((weights @. x) +. bias)
+              in forward lys x'
+        in Identity $ sum' $ forward layers input ||])
+
 {-# NOINLINE fparticles_gen_ad #-}
 fparticles_gen_ad :: Int -> [((Double, Double), (Double, Double))] -> (Double, Double -> [((Double, Double), (Double, Double))])
 fparticles_gen_ad iters = $$(reverseAD
@@ -218,7 +244,9 @@ main = do
         ,changeArgs (\args -> args { maxSuccess = 5000 }) $
            property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)
         ,changeArgs (\args -> args { maxSuccess = 50 }) $
-           property "fparticles" (\x -> radWithTH fparticles x ~= radWithAD fparticles x)]
+           property "fparticles" (\x -> radWithTH fparticles x ~= radWithAD fparticles x)
+        ,changeArgs (\args -> args { maxSuccess = 100 }) $
+           property "fneural" (\x -> radWithTH fneural x ~= radWithAD fneural x)]
 
     when (not checksOK) exitFailure
 
@@ -263,6 +291,17 @@ main = do
         ,envNumCapabilities 2 $ bench "N2" (nf (radWithAD fparticles) input)
         ,envNumCapabilities 4 $ bench "N4" (nf (radWithAD fparticles) input)]
       ]
+    ,bgroup "fneural" $
+      let genMatrix nin nout = Matrix [[sin (fromIntegral @Int (i+j)) | j <- [0..nin-1]]
+                                      | i <- [0..nout-1]]
+          genVector nout = Vector [sin (0.41 * fromIntegral @Int i) | i <- [0..nout-1]]
+          -- 50 inputs; 2 hidden layers (100; 50); final softmax, then sum the outputs.
+          nIn = 50; n1 = 100; n2 = 50
+          input = FNeural ([(genMatrix nIn n1, genVector n1)
+                           ,(genMatrix n1 n2, genVector n2)]
+                          ,genVector nIn) in
+      [bench "TH" (nf (radWithTH fneural) input)
+      ,bench "ad" (nf (radWithAD fneural) input)]
     ]
   where
     blockN :: Int -> [a] -> [[a]]

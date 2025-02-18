@@ -33,6 +33,7 @@ def human_bench_name(name):
     if name == "fparticles/N1": return "particles (-N1)"
     if name == "fparticles/N2": return "particles (-N2)"
     if name == "fparticles/N4": return "particles (-N4)"
+    if name == "fneural": return "neural"
     return name
 
 Result = namedtuple("Result", ["name", "impl", "mean", "halfci"])

@@ -31,6 +31,17 @@ instance Arbitrary s => Arbitrary (Quaternion s) where arbitrary = Quaternion <$
 instance Approx s => Approx (Quaternion s) where
   approx absdelta reldelta (Quaternion a b c d) (Quaternion a' b' c' d') = approx absdelta reldelta [a,b,c,d] [a',b',c',d']
 
+-- TODO: not a list but a V.Vector?
+newtype Matrix s = Matrix [[s]]
+  deriving (Show, Functor, Foldable, Traversable)
+  deriving (Approx, Arbitrary, NFData) via [[s]]
+
+newtype Vector s = Vector [s]
+  deriving (Show, Functor, Foldable, Traversable)
+  deriving (Approx, Arbitrary, NFData) via [s]
+
+
+-- Input types for the benchmark functions.
 
 newtype FMult s = MkFMult (s, s)
   deriving (Show, Functor, Foldable, Traversable)
@@ -51,3 +62,9 @@ newtype FRotVecQuat s = FRotVecQuat (Vec3 s, Quaternion s)
 newtype FParticles s = FParticles [((s, s), (s, s))]
   deriving (Show, Functor, Foldable, Traversable)
   deriving (Approx, Arbitrary, NFData) via [((s, s), (s, s))]
+
+-- - A list of layers (weights, bias);
+-- - The input.
+newtype FNeural s = FNeural ([(Matrix s, Vector s)], Vector s)
+  deriving (Show, Functor, Foldable, Traversable)
+  deriving (Approx, Arbitrary, NFData) via ([(Matrix s, Vector s)], Vector s)
