@@ -18,7 +18,7 @@ import Data.Bifunctor (second)
 import Data.Typeable (Typeable)
 import Language.Haskell.TH (Q, Code, unsafeCodeCoerce, unTypeCode)
 
-import qualified Numeric.AD as AD
+import qualified Numeric.AD.Double as AD
 import qualified Language.Haskell.ReverseAD.TH as DR
 
 
