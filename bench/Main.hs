@@ -244,10 +244,10 @@ main = do
         ,property "frotvecquat" (\x -> radWithTH frotvecquat x ~= radWithAD frotvecquat x)
         ,changeArgs (\args -> args { maxSuccess = 5000 }) $
            property "fsummatvec" (\x -> radWithTH fsummatvec x ~= radWithAD fsummatvec x)
-        ,changeArgs (\args -> args { maxSuccess = 50 }) $
-           property "fparticles" (\x -> radWithTH fparticles x ~= radWithAD fparticles x)
         ,changeArgs (\args -> args { maxSuccess = 100 }) $
-           property "fneural" (\x -> radWithTH fneural x ~= radWithAD fneural x)]
+           property "fneural" (\x -> radWithTH fneural x ~= radWithAD fneural x)
+        ,changeArgs (\args -> args { maxSuccess = 50 }) $
+           property "fparticles" (\x -> radWithTH fparticles x ~= radWithAD fparticles x)]
 
     when (not checksOK) exitFailure
 
@@ -281,17 +281,6 @@ main = do
       let input = FRotVecQuat (Vec3 1 2 3, Quaternion 4 5 6 7) in
       [bench "TH" (nf (radWithTH frotvecquat) input)
       ,bench "ad" (nf (radWithAD frotvecquat) input)]
-    ,bgroup "fparticles" $
-      let input = FParticles [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]] in
-      [bgroup "TH"
-        [envNumCapabilities 1 $ bench "N1" (nf (radWithTH fparticles) input)
-        ,envNumCapabilities 2 $ bench "N2" (nf (radWithTH fparticles) input)
-        ,envNumCapabilities 4 $ bench "N4" (nf (radWithTH fparticles) input)]
-      ,bgroup "ad"
-        [envNumCapabilities 1 $ bench "N1" (nf (radWithAD fparticles) input)
-        ,envNumCapabilities 2 $ bench "N2" (nf (radWithAD fparticles) input)
-        ,envNumCapabilities 4 $ bench "N4" (nf (radWithAD fparticles) input)]
-      ]
     ,bgroup "fneural" $
       let genMatrix nin nout = Matrix [[sin (fromIntegral @Int (i+j)) | j <- [0..nin-1]]
                                       | i <- [0..nout-1]]
@@ -303,6 +292,17 @@ main = do
                           ,genVector nIn) in
       [bench "TH" (nf (radWithTH fneural) input)
       ,bench "ad" (nf (radWithAD fneural) input)]
+    ,bgroup "fparticles" $
+      let input = FParticles [((fromIntegral i * 0.5, 0.1), (1.0, 1.0)) | i <- [1..4::Int]] in
+      [bgroup "TH"
+        [envNumCapabilities 1 $ bench "N1" (nf (radWithTH fparticles) input)
+        ,envNumCapabilities 2 $ bench "N2" (nf (radWithTH fparticles) input)
+        ,envNumCapabilities 4 $ bench "N4" (nf (radWithTH fparticles) input)]
+      ,bgroup "ad"
+        [envNumCapabilities 1 $ bench "N1" (nf (radWithAD fparticles) input)
+        ,envNumCapabilities 2 $ bench "N2" (nf (radWithAD fparticles) input)
+        ,envNumCapabilities 4 $ bench "N4" (nf (radWithAD fparticles) input)]
+      ]
     ]
   where
     blockN :: Int -> [a] -> [[a]]
