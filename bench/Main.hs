@@ -121,8 +121,9 @@ fneural = $$(makeFunction
 
             relu x = if x >= 0.0 then x else 0.0
             safeSoftmax vec = let m = maximum' 0.0 vec
-                                  factor = sum' (map' (\z -> exp (z - m)) vec)
-                              in map' (\z -> exp (z - m) / factor) vec
+                                  exps = map' (\z -> exp (z - m)) vec
+                                  factor = sum' exps
+                              in map' (\e -> e / factor) exps
             forward [] x = safeSoftmax x
             forward ((Matrix weights, Vector bias) : lys) x =
               let x' = map' relu ((weights @. x) +. bias)
