@@ -25,8 +25,21 @@ The script `generate_table_1.py` runs the benchmarks and generates something lik
 The code in this repository is available under the MIT licence from the authors of the [paper][jfp25].
 
 ```bibtex
-@misc{ad-dualrev-th,
-  author = {Smeding, Tom and V{\'{a}}k{\'{a}}r, Matthijs},
+@article{smeding-vakar-2025-parallel-dualrev,
+  author={Smeding, Tom J. and V{\'a}k{\'a}r, Matthijs I. L.},
+  title={Parallel dual-numbers reverse {AD}},
+  volume={35},
+  doi={10.1017/S0956796825100051},
+  journal={Journal of Functional Programming},
+  year={2025},
+  pages={e16}
+}
+```
+
+To cite this implementation specifically, you may also use:
+```bibtex
+@misc{2025-ad-dualrev-th,
+  author = {Smeding, Tom J. and V{\'{a}}k{\'{a}}r, Matthijs I. L.},
   title = {Implementation of parallel dual-numbers reverse AD in Haskell},
   month = {8},
   year = {2025},
