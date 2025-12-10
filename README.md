@@ -6,7 +6,37 @@ This is an implementation of the algorithm described in [our paper at POPL '23][
 The sequential algorithm is what you get if you take standard dual-numbers reverse AD as described e.g. by [Brunel et al. (2019)][brunel] and [Huot et al. (2020, §6)][huot], as well as in [Fig. 6 of our paper][popl23], and optimise it to be efficient.
 For details on how exactly these code transformations look and what the reasoning behind them is, we refer to [our paper][jfp25].
 
-The non-parallel version of the implementation submitted as artifact for the POPL '23 paper can be found at [this commit][seqcommit].
+The non-parallel version of the implementation submitted as artifact for the POPL '23 paper can be found at [commit 88854d0f2][seqcommit].
+
+This is a reference implementation.
+While it correctly implements the algorithms, better performance can probably be obtained using basic taping as done in [ad](https://hackage.haskell.org/package/ad), although implementing the transformation at compile time (as this library does) does yield better performance in some cases, as GHC can optimise some intermediate computations.
+Any library with first-class support for arrays will be orders of magnitude faster than this library for array-heavy code.
+
+## Usage
+
+This is a normal Haskell library, to be used in the standard fashion with Cabal or Stack.
+
+The user API is exported from the `Language.Haskell.ReverseAD.TH` module.
+There is a test suite (`test`) and a Criterion benchmark suite (`bench`) included in the package.
+The script `generate_table_1.py` runs the benchmarks and generates something like Table 1 in [the paper][jfp25].
+
+## Licence and citing
+
+The code in this repository is available under the MIT licence from the authors of the [paper][jfp25].
+
+```bibtex
+@misc{ad-dualrev-th,
+  author = {Smeding, Tom and V{\'{a}}k{\'{a}}r, Matthijs},
+  title = {Implementation of parallel dual-numbers reverse AD in Haskell},
+  month = {8},
+  year = {2025},
+  url = {https://github.com/tomsmeding/ad-dualrev-th}
+}
+```
+
+In case of questions or interest, feel free to reach out to me ([tomsmeding.com](https://tomsmeding.com/)).
+
+This project received funding from NWO Veni grant number VI.Veni.202.124 and the ERC project FoRECAST.
 
 
 [popl23]: https://dl.acm.org/doi/10.1145/3571247
